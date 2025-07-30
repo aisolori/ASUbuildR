@@ -11,14 +11,6 @@ editor_options:
 ---
 
 ```{r setup, include=FALSE}
-library(shiny)
-library(flexdashboard)
-library(mapgl)
-library(tigris)
-library(sf)
-library(sfdep)
-library(tidyverse)
-library(readxl)
 
 ## ---- tigris cache ----------------------------------------------------
 ## put cached TIGER/Line ZIPs in a per-user cache folder that is always
@@ -42,8 +34,6 @@ options(tigris_use_cache = TRUE)
 # no matter where this .Rmd lives.
 if (!requireNamespace("here", quietly = TRUE))
   install.packages("here")
-
-library(here)          # <‑‑ add once
 source(here::here("R", "run_asu_original.r"))   # local = FALSE by default
 source(here::here("R", "run_tract_hunter.R"))
 
@@ -892,8 +882,7 @@ observeEvent(input$browse_dir, {
     }, error = function(e) {
       # For non-Windows systems, use tcltk
       tryCatch({
-        library(tcltk)
-        tk_choose.dir(default = save_directory(), caption = "Select Save Directory")
+        tcltk::tk_choose.dir(default = save_directory(), caption = "Select Save Directory")
       }, error = function(e2) {
         NULL
       })
