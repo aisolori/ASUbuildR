@@ -52,7 +52,7 @@ launch_ASUbuildR <- function(rmd_file = NULL,
       } else {
         # Try alternative development paths
         alt_paths <- c(
-          "inst/shiny_app/ASU Flexdashboard - mapgl.Rmd",  # Your original name
+          "inst/shiny_app/ASU_Flexdashboard_mapgl.Rmd",  # Your original name
           #"R/ASU_Flexdashboard_mapgl.Rmd",  # Current location
           "ASU_Flexdashboard_mapgl.Rmd"     # Working directory
         )

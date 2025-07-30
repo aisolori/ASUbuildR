@@ -846,7 +846,12 @@ observeEvent(input$reset, {
 })
 
 
-
+# OPTIMIZATION 7: Periodic cleanup for long sessions
+observe({
+  invalidateLater(60000)  # Every minute
+  if (exists("gc")) gc()  # Clean up memory
+}) %>% 
+bindEvent(input$update, ignoreInit = TRUE)
 
 ```
 
