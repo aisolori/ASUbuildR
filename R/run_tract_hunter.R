@@ -22,15 +22,16 @@ run_tract_hunter <- function(tract_list,
   }
 
   check_pause <- function() {
-    if (requireNamespace("later", quietly = TRUE)) {
-      later::run_now(0)
-    }
-    while (isTRUE(pause())) {
-      if (requireNamespace("later", quietly = TRUE)) {
-        later::run_now(0.1)
-      } else {
-        Sys.sleep(0.1)
+    if (isTRUE(pause())) {
+      while (isTRUE(pause())) {
+        if (requireNamespace("later", quietly = TRUE)) {
+          later::run_now(0.1)
+        } else {
+          Sys.sleep(0.1)
+        }
       }
+    } else if (requireNamespace("later", quietly = TRUE)) {
+      later::run_now(0)
     }
   }
 

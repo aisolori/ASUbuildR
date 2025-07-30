@@ -291,6 +291,15 @@ observeEvent(input$pause_hunter, {
   pause_flag(!pause_flag())
 })
 
+observe({
+  new_label <- if (isTRUE(pause_flag())) "Resume Tract Hunter" else "Pause Tract Hunter"
+  shiny::updateActionButton(
+    session = shiny::getDefaultReactiveDomain(),
+    inputId = "pause_hunter",
+    label   = new_label
+  )
+})
+
 observeEvent(input$process, {
 
   
