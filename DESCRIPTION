@@ -29,7 +29,8 @@ Imports:
     tigris,
     glue,
     igraph,
-    crayon
+    crayon,
+    later
 Suggests:
     knitr
 VignetteBuilder: knitr

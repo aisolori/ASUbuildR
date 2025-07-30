@@ -76,6 +76,13 @@ map_data_dbg <- reactiveVal(NULL)   # container
 
 highlighted_tracts <- reactiveVal(character(0))
 
+algo_log <- reactiveVal("")
+pause_requested <- reactiveVal(FALSE)
+
+observeEvent(input$pause_th, {
+  pause_requested(TRUE)
+})
+
 
 
 
@@ -215,6 +222,7 @@ conditionalPanel(
 
 
 actionButton("process", "Load Tracts and Initialize ASU")
+actionButton("pause_th", "Pause Tract Hunter")
 # ---- dynamic algorithm description ------------------------------------
 output$algo_blurb <- renderUI({
 
@@ -280,6 +288,7 @@ output$algo_blurb <- renderUI({
 uiOutput("algo_blurb")
 
 tableOutput("asu")
+verbatimTextOutput("algo_log")
 
 observeEvent(input$process, {
 
@@ -309,15 +318,20 @@ observeEvent(input$process, {
     join_flag <- isTRUE(input$join_touching)   # ← keep the flag you already built
     
     incProgress(0.05, detail = "Finding initial ASU seeds…")
-    res <- if (algo_choice == "orig") {
-      run_asu_original(tract_list, uploaded_data())      # <- no verbose here
-    } else {
-      run_tract_hunter(
-    tract_list, uploaded_data(),
-    join_touching = join_flag,   # ← this line makes the checkbox work again
-    verbose       = TRUE
-  )
-    }
+    pause_requested(FALSE)
+    console_out <- capture.output({
+      res <- if (algo_choice == "orig") {
+        run_asu_original(tract_list, uploaded_data())
+      } else {
+        run_tract_hunter(
+          tract_list, uploaded_data(),
+          join_touching = join_flag,
+          verbose       = TRUE,
+          pause_check   = function() pause_requested()
+        )
+      }
+    })
+    algo_log(paste(console_out, collapse = "\n"))
 
 
     ## 3 · Finish the bar
@@ -330,6 +344,7 @@ observeEvent(input$process, {
   asu_summary(res$asu_summary) ; map_data_dbg(res$full_data)
 
   output$asu <- renderTable( asu_summary(),digits = 3 )
+  output$algo_log <- renderText(algo_log())
   
   ## 5. (Re‑)draw the first map ----------------------------------
 

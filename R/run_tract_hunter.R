@@ -6,7 +6,8 @@ run_tract_hunter <- function(tract_list,
                              ur_thresh  = 0.0645,
                              pop_thresh = 10000,
                              join_touching  = TRUE,   # <- NEW
-                             verbose    = TRUE) {
+                             verbose    = TRUE,
+                             pause_check = NULL) {
 
 
 
@@ -17,6 +18,9 @@ run_tract_hunter <- function(tract_list,
       shiny::incProgress(amount = 0, detail = msg)   # 0 ⇒ just change the text
     } else if (isTRUE(verbose)) {
       cat("\r", msg); flush.console()
+    }
+    if (requireNamespace("later", quietly = TRUE)) {
+      later::run_now(0)
     }
   }
 
@@ -85,7 +89,13 @@ run_tract_hunter <- function(tract_list,
   }
 
   # ---- 1 · SEED‑AND‑EXPAND -------------------------------------------
+  paused <- FALSE
   repeat {
+    if (!is.null(pause_check) && isTRUE(pause_check())) {
+      paused <- TRUE
+      update_status("Pausing tract_hunter …")
+      break
+    }
     # 1) Identify all **unused** tracts with UR >= 0.0645
     all_unused <- setdiff(seq_along(ur_vec), used_indexes)
     valid_unused <- all_unused[ ur_vec[all_unused] >= .0645]
@@ -112,6 +122,11 @@ run_tract_hunter <- function(tract_list,
     asu_list <- c(starting_index)
 
     repeat {
+      if (!is.null(pause_check) && isTRUE(pause_check())) {
+        paused <- TRUE
+        update_status("Pausing tract_hunter …")
+        break
+      }
 
       # 1) Identify the ASU boundary: any neighbor of asu_list that is not in asu_list or used_indexes
       boundary_tracts <- unique(unlist(nb[asu_list]))
@@ -222,6 +237,8 @@ run_tract_hunter <- function(tract_list,
       #   "ASU not valid. pop={asu_pop}, UR={asu_ur}. Marking tract {starting_index} as tried."
       # ))
     }
+
+    if (paused) break
   }
 
 
@@ -597,21 +614,25 @@ run_tract_hunter <- function(tract_list,
     }
   }
 
-  ##### ---- 2 · INITIALIZE ASU NUMBERS -----------------------------------
+  if (!paused) {
+    ##### ---- 2 · INITIALIZE ASU NUMBERS -----------------------------------
 
-  # 0. make sure asunum is character
-  data_merge <- data_merge %>%
-    mutate(asunum = as.character(asunum))
+    # 0. make sure asunum is character
+    data_merge <- data_merge %>%
+      mutate(asunum = as.character(asunum))
 
-  # 1st pass
-  asu_pass(verbose = TRUE)
-
-  # optionally merge touching ASUs  -------------------------------
-  if (isTRUE(join_touching)) {
-    data_merge <- combine_asu_groups(data_merge, nb)
-
-    # 2nd pass
+    # 1st pass
     asu_pass(verbose = TRUE)
+
+    # optionally merge touching ASUs  -------------------------------
+    if (isTRUE(join_touching)) {
+      data_merge <- combine_asu_groups(data_merge, nb)
+
+      # 2nd pass
+      asu_pass(verbose = TRUE)
+    }
+  } else {
+    update_status("Trade/merge passes skipped: algorithm paused")
   }
 
 
