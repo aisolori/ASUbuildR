@@ -6,7 +6,8 @@ run_tract_hunter <- function(tract_list,
                              ur_thresh  = 0.0645,
                              pop_thresh = 10000,
                              join_touching  = TRUE,   # <- NEW
-                             verbose    = TRUE) {
+                             verbose    = TRUE,
+                             pause_fn   = function() FALSE) {
 
 
 
@@ -19,6 +20,8 @@ run_tract_hunter <- function(tract_list,
       cat("\r", msg); flush.console()
     }
   }
+
+  if (!is.function(pause_fn)) pause_fn <- function() FALSE
 
 
   # ---- 0 · PREP --------------------------------------------------------
@@ -85,7 +88,8 @@ run_tract_hunter <- function(tract_list,
   }
 
   # ---- 1 · SEED‑AND‑EXPAND -------------------------------------------
-  repeat {
+  while(!pause_fn()) {
+    if (pause_fn()) break
     # 1) Identify all **unused** tracts with UR >= 0.0645
     all_unused <- setdiff(seq_along(ur_vec), used_indexes)
     valid_unused <- all_unused[ ur_vec[all_unused] >= .0645]
@@ -111,7 +115,8 @@ run_tract_hunter <- function(tract_list,
     # Tracts in this ASU
     asu_list <- c(starting_index)
 
-    repeat {
+    while(!pause_fn()) {
+      if (pause_fn()) break
 
       # 1) Identify the ASU boundary: any neighbor of asu_list that is not in asu_list or used_indexes
       boundary_tracts <- unique(unlist(nb[asu_list]))
@@ -549,7 +554,7 @@ run_tract_hunter <- function(tract_list,
 
   # ---- 2 · TRADE / MERGE PASSES ---------------------------------------
   asu_pass <- function(verbose = TRUE) {
-    repeat {
+    while(!pause_fn()) {
       ## ---- 1. current state --------------------------------------
       data_merge_local <- data_merge      # it’s already in scope here
       # refresh
@@ -566,6 +571,7 @@ run_tract_hunter <- function(tract_list,
 
       ## ---- 2. loop over candidates ------------------------------
       for (i in seq_len(nrow(tracts_not_in_asu))) {
+        if (pause_fn()) break
 
         target_index <- tracts_not_in_asu$row_num[i]
 
@@ -587,8 +593,10 @@ run_tract_hunter <- function(tract_list,
           successful_update <- TRUE
           break                 # start a fresh repeat cycle
         }
+        if (pause_fn()) break
       }
 
+      if (pause_fn()) break
       ## ---- 3. nothing worked this pass --------------------------
       if (!successful_update) {
         if (verbose) cat("\nNone of the target indexes produced an update. Exiting loop.\n")

@@ -76,6 +76,8 @@ map_data_dbg <- reactiveVal(NULL)   # container
 
 highlighted_tracts <- reactiveVal(character(0))
 
+pause_requested <- reactiveVal(FALSE)
+
 
 
 
@@ -210,7 +212,8 @@ conditionalPanel(
   condition = "input.asu_algo == 'mine'",
   checkboxInput("join_touching",
                 "Include touching tracts when building ASUs",
-                value = TRUE)
+                value = TRUE),
+  actionButton("pause_process", "Pause Algorithm")
 )
 
 
@@ -283,6 +286,8 @@ tableOutput("asu")
 
 observeEvent(input$process, {
 
+  pause_requested(FALSE)
+
   
   ## 0 · Basic checks ----------------------------------------------------
   req(uploaded_data(), state(), tract_year())
@@ -314,8 +319,9 @@ observeEvent(input$process, {
     } else {
       run_tract_hunter(
     tract_list, uploaded_data(),
-    join_touching = join_flag,   # ← this line makes the checkbox work again
-    verbose       = TRUE
+    join_touching = join_flag,
+    verbose       = TRUE,
+    pause_fn      = function() pause_requested()
   )
     }
 
@@ -431,6 +437,10 @@ observeEvent(input$process, {
   })
 
 })  # ---- end observeEvent -------------------------------------------------
+
+observeEvent(input$pause_process, {
+  pause_requested(TRUE)
+})
 
 
 # ─────────────── DEBUG PANEL ───────────────
