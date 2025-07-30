@@ -19,6 +19,9 @@ library(sf)
 library(sfdep)
 library(tidyverse)
 library(readxl)
+library(promises)
+library(future)
+plan(multisession)
 
 ## ---- tigris cache ----------------------------------------------------
 ## put cached TIGER/Line ZIPs in a per-user cache folder that is always
@@ -75,6 +78,8 @@ current_selection <- reactiveVal(NULL)
 map_data_dbg <- reactiveVal(NULL)   # container
 
 highlighted_tracts <- reactiveVal(character(0))
+
+pause_flag <- reactiveVal(FALSE)
 
 
 
@@ -215,6 +220,10 @@ conditionalPanel(
 
 
 actionButton("process", "Load Tracts and Initialize ASU")
+conditionalPanel(
+  condition = "input.asu_algo == 'mine'",
+  actionButton("pause_algo", "Pause Algorithm")
+)
 # ---- dynamic algorithm description ------------------------------------
 output$algo_blurb <- renderUI({
 
@@ -283,85 +292,49 @@ tableOutput("asu")
 
 observeEvent(input$process, {
 
-  
   ## 0 · Basic checks ----------------------------------------------------
   req(uploaded_data(), state(), tract_year())
+  pause_flag(FALSE)
 
-  ## 1 · Wrap the whole long job in withProgress -------------------------
-  withProgress(message = "Running ASU initialisation…", value = 0, {
+  algo_choice <- isolate(input$asu_algo %||% "orig")
+  join_flag   <- isTRUE(input$join_touching)
 
-    ## 1a · Build tracts + neighbours (can take ~10–60 s the first time)
-    incProgress(0.10, detail = "Downloading Census shapefiles…")
-    tract_list <- tracts(state = state(), year = tract_year()) |>
-      mutate(
-        row_num    = row_number(),
-        continuous = st_contiguity(geometry)
-      )
+  store_results <- function(res) {
+    full_data(res$full_data  )   ; full_data_reset(res$full_data_reset)
+    asu_data(res$asu_data    )   ; asu_tracts(res$asu_tracts)
+    asu_summary(res$asu_summary) ; map_data_dbg(res$full_data)
 
-    ## 1b · Merge the BLS data
-    incProgress(0.05, detail = "Merging BLS unemployment data…")
-    data_merge <- tract_list |>
-      left_join(uploaded_data(), by = "GEOID")
+    output$asu <- renderTable( asu_summary(), digits = 3 )
 
-    # 2 · Run the chosen ASU algorithm ---------------------------------
-    algo_choice <- isolate(input$asu_algo %||% "orig")
-    
-    join_flag <- isTRUE(input$join_touching)   # ← keep the flag you already built
-    
-    incProgress(0.05, detail = "Finding initial ASU seeds…")
-    res <- if (algo_choice == "orig") {
-      run_asu_original(tract_list, uploaded_data())      # <- no verbose here
-    } else {
-      run_tract_hunter(
-    tract_list, uploaded_data(),
-    join_touching = join_flag,   # ← this line makes the checkbox work again
-    verbose       = TRUE
-  )
-    }
+    output$initial_map <- renderMaplibre({
 
+      req(full_data())
+      map_data <- full_data()
 
-    ## 3 · Finish the bar
-    incProgress(1, detail = "Finishing up…")
-  })  # ---- withProgress ends here  -------------------------------------
+      # ---- 6·1 geometry housekeeping ----------------------------------
+      map_data <- map_data |>
+        sf::st_make_valid() |>
+        sf::st_zm(what = "ZM", drop = TRUE) |>
+        dplyr::filter(!sf::st_is_empty(geometry)) |>
+        dplyr::mutate(geom_type = sf::st_geometry_type(geometry)) |>
+        dplyr::filter(geom_type %in% c("POLYGON", "MULTIPOLYGON")) |>
+        dplyr::select(-geom_type)
 
-  ## 4 · Store results & draw map  --------------------------------------
-  full_data(res$full_data  )   ; full_data_reset(res$full_data_reset)
-  asu_data(res$asu_data    )   ; asu_tracts(res$asu_tracts)
-  asu_summary(res$asu_summary) ; map_data_dbg(res$full_data)
+      if (nrow(map_data) == 0) {
+        return(
+          maplibre(style = carto_style("positron")) |>
+          add_control("No valid polygon geometry to display.", "top-left")
+        )
+      }
 
-  output$asu <- renderTable( asu_summary(),digits = 3 )
-  
-  ## 5. (Re‑)draw the first map ----------------------------------
+      # ---- 6·2 palette / breaks ---------------------------------------
+      map_data <- map_data |>
+        dplyr::mutate(asunum = dplyr::na_if(asunum, 0L))
 
-  output$initial_map <- renderMaplibre({
+      n_asu <- max(map_data$asunum, na.rm = TRUE)
+      n_asu <- ifelse(is.finite(n_asu), n_asu, 0L)
 
-    req(full_data())
-    map_data <- full_data()
-
-    # ---- 6·1 geometry housekeeping ----------------------------------
-    map_data <- map_data |>
-      sf::st_make_valid() |>
-      sf::st_zm(what = "ZM", drop = TRUE) |>
-      dplyr::filter(!sf::st_is_empty(geometry)) |>
-      dplyr::mutate(geom_type = sf::st_geometry_type(geometry)) |>
-      dplyr::filter(geom_type %in% c("POLYGON", "MULTIPOLYGON")) |>
-      dplyr::select(-geom_type)
-
-    if (nrow(map_data) == 0) {
-      return(
-        maplibre(style = carto_style("positron")) |>
-        add_control("No valid polygon geometry to display.", "top-left")
-      )
-    }
-
-    # ---- 6·2 palette / breaks ---------------------------------------
-    map_data <- map_data |>
-      dplyr::mutate(asunum = dplyr::na_if(asunum, 0L))
-
-    n_asu <- max(map_data$asunum, na.rm = TRUE)
-    n_asu <- ifelse(is.finite(n_asu), n_asu, 0L)
-
-    palette_logic <- function(n_asu) {
+      palette_logic <- function(n_asu) {
   if (n_asu == 0) {
     list(fill = "#808080",
          legend_vals = "(none)",
@@ -399,38 +372,75 @@ observeEvent(input$process, {
   }
 }
 
-    pal <- palette_logic(n_asu)
+      pal <- palette_logic(n_asu)
 
-    # ---- 6·3 build map ----------------------------------------------
-    maplibre(style = carto_style("positron")) |>
-      fit_bounds(map_data, animate = FALSE) |>
-      add_fill_layer(
-        id                 = "basemap",
-        source             = map_data,
-        fill_color         = pal$fill,
-        fill_opacity       = 0.5,
-        fill_outline_color = "black",
-        popup = concat(
-          "<strong>ASU Number: </strong>", get_column("asunum"), "<br>",
-          "<strong>Tract GEOID: </strong>", get_column("GEOID"),  "<br>",
-          "<strong>UR: </strong>",
-          number_format(get_column("tract_ASU_urate"),
-                        style = "decimal", maximum_fraction_digits = 2),
-          "%<br>",
-          "<strong>Unemp: </strong>",
-          number_format(get_column("tract_ASU_unemp"),
-                        style = "decimal", maximum_fraction_digits = 0), "<br>"
+      # ---- 6·3 build map ----------------------------------------------
+      maplibre(style = carto_style("positron")) |>
+        fit_bounds(map_data, animate = FALSE) |>
+        add_fill_layer(
+          id                 = "basemap",
+          source             = map_data,
+          fill_color         = pal$fill,
+          fill_opacity       = 0.5,
+          fill_outline_color = "black",
+          popup = concat(
+            "<strong>ASU Number: </strong>", get_column("asunum"), "<br>",
+            "<strong>Tract GEOID: </strong>", get_column("GEOID"),  "<br>",
+            "<strong>UR: </strong>",
+            number_format(get_column("tract_ASU_urate"),
+                          style = "decimal", maximum_fraction_digits = 2),
+            "%<br>",
+            "<strong>Unemp: </strong>",
+            number_format(get_column("tract_ASU_unemp"),
+                          style = "decimal", maximum_fraction_digits = 0), "<br>"
+          )
+        ) |>
+        add_legend(
+          "ASU Number",
+          values = pal$legend_vals,
+          colors = pal$legend_cols,
+          type   = "categorical"
         )
-      ) |>
-      add_legend(
-        "ASU Number",
-        values = pal$legend_vals,
-        colors = pal$legend_cols,
-        type   = "categorical"
+    })
+  }
+
+  if (algo_choice == "orig") {
+    withProgress(message = "Running ASU initialisation…", value = 0, {
+      incProgress(0.10, detail = "Downloading Census shapefiles…")
+      tract_list <- tracts(state = state(), year = tract_year()) |>
+        mutate(row_num = row_number(),
+               continuous = st_contiguity(geometry))
+
+      incProgress(0.05, detail = "Merging BLS unemployment data…")
+      data_merge <- tract_list |>
+        left_join(uploaded_data(), by = "GEOID")
+
+      incProgress(0.05, detail = "Finding initial ASU seeds…")
+      res <- run_asu_original(tract_list, uploaded_data())
+      incProgress(1, detail = "Finishing up…")
+    })
+
+    store_results(res)
+
+  } else {
+    future({
+      tract_list <- tracts(state = state(), year = tract_year()) |>
+        mutate(row_num = row_number(),
+               continuous = st_contiguity(geometry))
+      run_tract_hunter(
+        tract_list, uploaded_data(),
+        join_touching = join_flag,
+        verbose       = TRUE,
+        pause_check   = function() pause_flag()
       )
-  })
+    }) %...>% store_results
+  }
 
 })  # ---- end observeEvent -------------------------------------------------
+
+observeEvent(input$pause_algo, {
+  pause_flag(TRUE)
+})
 
 
 # ─────────────── DEBUG PANEL ───────────────
