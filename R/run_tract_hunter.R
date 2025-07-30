@@ -22,6 +22,9 @@ run_tract_hunter <- function(tract_list,
   }
 
   check_pause <- function() {
+    if (requireNamespace("later", quietly = TRUE)) {
+      later::run_now(0)
+    }
     while (isTRUE(pause())) {
       if (requireNamespace("later", quietly = TRUE)) {
         later::run_now(0.1)
@@ -61,6 +64,7 @@ run_tract_hunter <- function(tract_list,
     all_paths <- list()
 
     while (length(queue) > 0) {
+      check_pause()
       current <- queue[[1]]
       queue <- queue[-1]
 
@@ -149,6 +153,7 @@ run_tract_hunter <- function(tract_list,
       best_pop   <- NA
 
       for (b in boundary_tracts) {
+        check_pause()
 
         # BFS or DFS up to 2 or 3 hops from b, ignoring asu_list & used_indexes
         candidate_paths <- bfs_paths_up_to_k_hops(start = b, nb = nb,
@@ -159,6 +164,7 @@ run_tract_hunter <- function(tract_list,
         # The last node in each path is the "far" neighbor.
 
         for (path_vec in candidate_paths) {
+          check_pause()
 
           # The set of new tracts if we add path_vec to the ASU
           # (We also include bridging tracts if they're in path_vec)
@@ -401,6 +407,7 @@ run_tract_hunter <- function(tract_list,
 
     # Iterate until the updated unemployment rate meets the threshold
     while(new_ur < 0.0645) {
+      check_pause()
       # Filter candidates based on whether their unemp is less than the unemp buffer
       drop_candidates <- drop_candidates[ unemp_vec[drop_candidates] < unemp_buffer ]
       if (length(drop_candidates) == 0) return(FALSE)
@@ -580,6 +587,7 @@ run_tract_hunter <- function(tract_list,
 
       ## ---- 2. loop over candidates ------------------------------
       for (i in seq_len(nrow(tracts_not_in_asu))) {
+        check_pause()
 
         target_index <- tracts_not_in_asu$row_num[i]
 

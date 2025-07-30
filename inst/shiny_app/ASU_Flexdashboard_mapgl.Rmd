@@ -326,7 +326,7 @@ observeEvent(input$process, {
     tract_list, uploaded_data(),
     join_touching = join_flag,
     verbose       = TRUE,
-    pause         = function() pause_flag()
+    pause         = function() isolate(pause_flag())
   )
     }
 
