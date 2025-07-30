@@ -76,6 +76,8 @@ map_data_dbg <- reactiveVal(NULL)   # container
 
 highlighted_tracts <- reactiveVal(character(0))
 
+pause_flag <- reactiveVal(FALSE)
+
 
 
 
@@ -215,6 +217,10 @@ conditionalPanel(
 
 
 actionButton("process", "Load Tracts and Initialize ASU")
+conditionalPanel(
+  condition = "input.asu_algo == 'mine'",
+  actionButton("pause_hunter", "Pause/Resume Tract Hunter")
+)
 # ---- dynamic algorithm description ------------------------------------
 output$algo_blurb <- renderUI({
 
@@ -281,6 +287,10 @@ uiOutput("algo_blurb")
 
 tableOutput("asu")
 
+observeEvent(input$pause_hunter, {
+  pause_flag(!pause_flag())
+})
+
 observeEvent(input$process, {
 
   
@@ -314,8 +324,9 @@ observeEvent(input$process, {
     } else {
       run_tract_hunter(
     tract_list, uploaded_data(),
-    join_touching = join_flag,   # ← this line makes the checkbox work again
-    verbose       = TRUE
+    join_touching = join_flag,
+    verbose       = TRUE,
+    pause         = function() pause_flag()
   )
     }
 

@@ -6,7 +6,8 @@ run_tract_hunter <- function(tract_list,
                              ur_thresh  = 0.0645,
                              pop_thresh = 10000,
                              join_touching  = TRUE,   # <- NEW
-                             verbose    = TRUE) {
+                             verbose    = TRUE,
+                             pause      = function() FALSE) {
 
 
 
@@ -17,6 +18,16 @@ run_tract_hunter <- function(tract_list,
       shiny::incProgress(amount = 0, detail = msg)   # 0 ⇒ just change the text
     } else if (isTRUE(verbose)) {
       cat("\r", msg); flush.console()
+    }
+  }
+
+  check_pause <- function() {
+    while (isTRUE(pause())) {
+      if (requireNamespace("later", quietly = TRUE)) {
+        later::run_now(0.1)
+      } else {
+        Sys.sleep(0.1)
+      }
     }
   }
 
@@ -85,7 +96,8 @@ run_tract_hunter <- function(tract_list,
   }
 
   # ---- 1 · SEED‑AND‑EXPAND -------------------------------------------
-  repeat {
+  while (TRUE) {
+    check_pause()
     # 1) Identify all **unused** tracts with UR >= 0.0645
     all_unused <- setdiff(seq_along(ur_vec), used_indexes)
     valid_unused <- all_unused[ ur_vec[all_unused] >= .0645]
@@ -111,7 +123,8 @@ run_tract_hunter <- function(tract_list,
     # Tracts in this ASU
     asu_list <- c(starting_index)
 
-    repeat {
+    while (TRUE) {
+      check_pause()
 
       # 1) Identify the ASU boundary: any neighbor of asu_list that is not in asu_list or used_indexes
       boundary_tracts <- unique(unlist(nb[asu_list]))
@@ -549,7 +562,8 @@ run_tract_hunter <- function(tract_list,
 
   # ---- 2 · TRADE / MERGE PASSES ---------------------------------------
   asu_pass <- function(verbose = TRUE) {
-    repeat {
+    while (TRUE) {
+      check_pause()
       ## ---- 1. current state --------------------------------------
       data_merge_local <- data_merge      # it’s already in scope here
       # refresh
