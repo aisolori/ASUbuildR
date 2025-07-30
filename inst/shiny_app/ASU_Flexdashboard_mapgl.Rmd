@@ -362,37 +362,42 @@ observeEvent(input$process, {
     n_asu <- ifelse(is.finite(n_asu), n_asu, 0L)
 
     palette_logic <- function(n_asu) {
-      if (n_asu == 0) {
-        list(fill = "#808080", legend_vals = "(none)", legend_cols = "#808080")
-      } else if (n_asu == 1) {
-        list(
-          fill = step_expr(
-            column   = "asunum",
-            base     = "#808080",
-            stops    = "#7FC97F",
-            values   = 1,
-            na_color = "#444444"
-          ),
-          legend_vals = 1,
-          legend_cols = "#7FC97F"
-        )
-      } else {
-        n_cat  <- min(max(n_asu, 3L), 8L)
-        pal    <- RColorBrewer::brewer.pal(n_cat, "Accent")
-        breaks <- seq(1 + n_asu / n_cat, n_asu, length.out = n_cat - 1)
-        list(
-          fill = step_expr(
-            column   = "asunum",
-            base     = pal[1],
-            stops    = pal[-1],
-            values   = breaks,
-            na_color = "#444444"
-          ),
-          legend_vals = seq_len(n_asu),
-          legend_cols = pal
-        )
-      }
-    }
+  if (n_asu == 0) {
+    list(fill = "#808080",
+         legend_vals = "(none)",
+         legend_cols = "#808080")
+
+  } else if (n_asu == 1) {
+    list(
+      fill  = step_expr(column="asunum",
+                        base="#808080",
+                        stops="#7FC97F",
+                        values=1,
+                        na_color="#444444"),
+      legend_vals = 1,
+      legend_cols = "#7FC97F"
+    )
+
+  } else {
+    n_cat <- min(max(n_asu, 3L), 8L)          # 3-to-8 distinct hues
+    pal   <- RColorBrewer::brewer.pal(n_cat, "Accent")
+
+    # make colours exactly as long as the value vector
+    legend_cols <- rep_len(pal, n_asu)
+
+    breaks <- seq(1 + n_asu / n_cat, n_asu, length.out = n_cat - 1)
+
+    list(
+      fill = step_expr(column   = "asunum",
+                       base     = pal[1],
+                       stops    = pal[-1],
+                       values   = breaks,
+                       na_color = "#444444"),
+      legend_vals = seq_len(n_asu),
+      legend_cols = legend_cols
+    )
+  }
+}
 
     pal <- palette_logic(n_asu)
 
