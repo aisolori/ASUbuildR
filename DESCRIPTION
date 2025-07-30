@@ -1,26 +1,21 @@
 Package: ASUbuildR
 Type: Package
-Title: Shiny interface to help state construct Areas of Substantial Unemployment
+Title: A Shiny Interface for Constructing Areas of Substantial Unemployment
 Version: 0.1.0
 Authors@R: c(
-    person(
-      "David", "Schmidt",
-      email = "deschmidt@detr.nv.gov",
-      role = c("aut", "cre")
-    ),
-    person(
-    "Michael","Frank",
-    role = c("aut")
-    )
-  )
-Description: This provides a GUI and related tools to help maximize unemployment within ASUs.
-    Continuation lines should be indented.
+    person("David",  "Schmidt",  email = "deschmidt@detr.nv.gov", role = c("aut", "cre")),
+    person("Michael","Frank",                      role = "aut"),
+    person("Antonio","Solorio", email = "aisolorio@detr.nv.gov",  role = "ctb"))
+Description: Provides a point-and-click GUI together with helper algorithms
+    for building Areas of Substantial Unemployment (ASUs) from Census tract
+    and BLS data.  The package wraps a Shiny Flexdashboard interface plus
+    utilities for optimising tract groupings and exporting results.
 License: MIT + file LICENSE
 Encoding: UTF-8
 LazyData: true
 Roxygen: list(markdown = TRUE)
 RoxygenNote: 7.3.2
-Imports: 
+Imports:
     dplyr,
     readxl,
     flexdashboard,
@@ -31,7 +26,12 @@ Imports:
     sf,
     sfdep,
     shiny,
-    tigris
-Suggests: 
+    tigris,
+    glue,
+    igraph,
+    crayon
+Suggests:
     knitr
 VignetteBuilder: knitr
+Remotes:
+    mitchelloharawild/mapgl

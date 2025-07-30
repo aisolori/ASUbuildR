@@ -15,6 +15,10 @@ importFrom(tigris, tracts)
 importFrom(sfdep, st_contiguity)
 importFrom(RColorBrewer, brewer.pal)
 importFrom(stringr, str_remove)
+importFrom(glue, glue)
+importFrom(igraph, graph_from_adj_list, graph_from_data_frame, k_shortest_paths,
+           components, induced_subgraph, articulation_points)
+importFrom(crayon, yellow)
 
 # mapgl - import the main functions you use
 importFrom(mapgl, maplibre, maplibreOutput, renderMaplibre, maplibre_proxy,

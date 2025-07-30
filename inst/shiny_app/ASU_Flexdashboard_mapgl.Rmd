@@ -20,6 +20,41 @@ library(sfdep)
 library(tidyverse)
 library(readxl)
 
+## ---- tigris cache ----------------------------------------------------
+## put cached TIGER/Line ZIPs in a per-user cache folder that is always
+## writable, even after the package is installed read-only.
+
+# 1. choose a sensible user-cache path (rappdirs works everywhere)
+cache_dir <- rappdirs::user_cache_dir("ASUbuildR", "tigris")
+
+# 2. create it if it doesn’t exist
+if (!dir.exists(cache_dir))
+  dir.create(cache_dir, recursive = TRUE, showWarnings = FALSE)
+
+# 3. tell tigris to use it *this session*
+options(tigris_cache_dir = cache_dir)
+
+# tell tigris to look there first before re‑downloading
+options(tigris_use_cache = TRUE)
+
+# ---- resolve paths from the project root ----------------------------
+# 'here()' always points at the directory that contains ASUbuildR.Rproj
+# no matter where this .Rmd lives.
+if (!requireNamespace("here", quietly = TRUE))
+  install.packages("here")
+
+library(here)          # <‑‑ add once
+source(here::here("R", "run_asu_original.r"))   # local = FALSE by default
+source(here::here("R", "run_tract_hunter.R"))
+
+# cache every tigris download automatically
+options(
+  tigris_use_cache = TRUE,                 # turn caching on
+  tigris_class     = "sf"                  # always return sf objects
+)
+
+
+
 options(shiny.maxRequestSize = 50 * 1024^2)  # Set to 50MB or your desired limit
 
 # Initialize reactive values
@@ -36,7 +71,11 @@ selected_tracts <- reactiveVal(NULL)
 edit_table <- reactiveVal(NULL)
 edit_summary <- reactiveVal(NULL)
 current_selection <- reactiveVal(NULL)
+
+map_data_dbg <- reactiveVal(NULL)   # container
+
 highlighted_tracts <- reactiveVal(character(0))
+
 
 
 
@@ -157,205 +196,259 @@ observeEvent(input$file, {
 
 ## Controls {data-width="200"}
 
-This button will launch two processes, which will take up to 5 minutes
-to complete. For smaller states, it may take under 15 seconds.
-
-First, the application will download census shapefiles by tract for the
-appropriate state and year. Next, after combining the BLS file with
-these shapefiles, it will iteratively search for contiguous geographic
-regions until the combined unemployment rate in each region is as close
-to 6.45% as possible.
-
-When this process is complete, a map will appear to the right, and a
-summary of the created ASU regions will appear below. It is important to
-note, these will still include areas that do not qualify as an
-independent ASU (there is no check for population), but it gives the
-analyst a starting place for analysis.
-
-Once this step is done, you may proceed to the next step.
 
 ```{r}
+radioButtons(
+  "asu_algo", "Choose algorithm:",
+  choices = c("Original" = "orig",
+              "Tract Hunter" = "mine"),
+  inline  = TRUE
+)
+
+# appears only when the radio = "mine"
+conditionalPanel(
+  condition = "input.asu_algo == 'mine'",
+  checkboxInput("join_touching",
+                "Include touching tracts when building ASUs",
+                value = TRUE)
+)
+
+
 actionButton("process", "Load Tracts and Initialize ASU")
+# ---- dynamic algorithm description ------------------------------------
+output$algo_blurb <- renderUI({
+
+  if (is.null(input$asu_algo) || input$asu_algo == "orig") {
+
+    # --- ORIGINAL TEXT: leave exactly as you had it --------------------
+    HTML(
+      "<p>
+        This button will launch two processes, which will take up to 5&nbsp;minutes
+        to complete. For smaller states, it may take under 15&nbsp;seconds.
+      </p>
+      <p>
+        First, the application will download census shapefiles by tract for the
+        appropriate state and year. Next, after combining the BLS file with these
+        shapefiles, it will iteratively search for contiguous geographic regions
+        until the combined unemployment rate in each region is as close to
+        6.45 % as possible.
+      </p>
+      <p>
+        When this process is complete, a map will appear to the right, and a
+        summary of the created ASU regions will appear below. It is important to
+        note these will still include areas that do not qualify as an independent
+        ASU (there is no check for population), but it gives the analyst a
+        starting place for analysis.
+      </p>
+      <p>
+        Once this step is done, you may proceed to the next step.
+      </p>"
+    )
+
+  } else {  # ---- TRACT HUNTER TEXT ------------------------------------
+
+    HTML(
+  "<p>
+     <strong>Tract&nbsp;Hunter algorithm:</strong>
+     begins with the single tract that has the highest unemployment rate,
+     then <em>expands</em> by attaching <u>directly adjacent</u> tracts while
+     the combined rate stays&nbsp;&ge;&nbsp;6.45&nbsp;%.  If adding a
+     neighbour pulls the rate below the threshold, the routine performs a
+     <em>trade&nbsp;pass</em>&nbsp;&mdash;dropping low-unemployment tracts and
+     adding higher-unemployment neighbours&nbsp;&mdash;until the target is met
+     or no legal trade remains.
+   </p>
+   <ul>
+     <li>Every tract added or traded keeps the region contiguous.</li>
+     <li>Population may grow, but only regions &ge; 10 000 people are kept.</li>
+     <li>After the first pass, neighbouring ASUs that share a boundary are
+         merged, and a second pass sweeps up any remaining eligible tracts.</li>
+     <li>The progress bar’s detail line (<code>Targeting … Remaining …</code>)
+         comes straight from the optimisation loop.</li>
+   </ul>
+   <p>
+     Because this algorithm is more complex, it takes longer than the original
+     method, but it is more likely to produce valid ASU clusters and to capture
+     a higher total number of unemployed individuals within those clusters.
+   </p>"
+)
+
+
+  }
+})
+
+uiOutput("algo_blurb")
+
 tableOutput("asu")
 
 observeEvent(input$process, {
+
   
-  tract_list <- tracts(state = state(), year = tract_year()) %>% mutate(row_num = row_number(), continuous = st_contiguity(geometry))
-  BLS_Data <- uploaded_data()
-  data_merge <- left_join(tract_list, BLS_Data, by = "GEOID")
-  data_merge <- data_merge %>% arrange(desc(tract_ASU_urate), desc(tract_ASU_unemp))
-  
-  start <- data_merge %>% head(1)
-  existing <- start %>% st_drop_geometry() %>% pull(row_num)
-  ASU_assigned <- start[0,]
-  rate <- 100
-  asunum <- 1
-  filtered_data_merge <- data_merge
-  
-  ### Loop
-  
-  while(filtered_data_merge$tract_ASU_urate[1] > 6.45){
-    orderid <- 1
-    start <- head(filtered_data_merge, 1)
-    start$orderid <- orderid
-    combined_area <- bind_rows(start)
-    existing <- combined_area %>% pull(row_num)
-    add_tract <- TRUE
+  ## 0 · Basic checks ----------------------------------------------------
+  req(uploaded_data(), state(), tract_year())
+
+  ## 1 · Wrap the whole long job in withProgress -------------------------
+  withProgress(message = "Running ASU initialisation…", value = 0, {
+
+    ## 1a · Build tracts + neighbours (can take ~10–60 s the first time)
+    incProgress(0.10, detail = "Downloading Census shapefiles…")
+    tract_list <- tracts(state = state(), year = tract_year()) |>
+      mutate(
+        row_num    = row_number(),
+        continuous = st_contiguity(geometry)
+      )
+
+    ## 1b · Merge the BLS data
+    incProgress(0.05, detail = "Merging BLS unemployment data…")
+    data_merge <- tract_list |>
+      left_join(uploaded_data(), by = "GEOID")
+
+    # 2 · Run the chosen ASU algorithm ---------------------------------
+    algo_choice <- isolate(input$asu_algo %||% "orig")
     
-    while(rate > 6.45){
-      add_tract <- TRUE
-      neighbor_list <- combined_area %>% st_drop_geometry() %>% pull(continuous) %>% unlist()
-      neighbor_list <- neighbor_list[!neighbor_list %in% existing]
-      adjacent <- filtered_data_merge %>% filter(row_num %in% neighbor_list)
-      
-      if(nrow(adjacent) == 0){
-        add_tract <- FALSE
-        break
-      } else if(min(adjacent$tract_ASU_clf) < 1){
-        next_tract <- adjacent %>%
-          filter(tract_ASU_clf < 1) %>%
-          head(1)
+    join_flag <- isTRUE(input$join_touching)   # ← keep the flag you already built
+    
+    incProgress(0.05, detail = "Finding initial ASU seeds…")
+    res <- if (algo_choice == "orig") {
+      run_asu_original(tract_list, uploaded_data())      # <- no verbose here
+    } else {
+      run_tract_hunter(
+    tract_list, uploaded_data(),
+    join_touching = join_flag,   # ← this line makes the checkbox work again
+    verbose       = TRUE
+  )
+    }
+
+
+    ## 3 · Finish the bar
+    incProgress(1, detail = "Finishing up…")
+  })  # ---- withProgress ends here  -------------------------------------
+
+  ## 4 · Store results & draw map  --------------------------------------
+  full_data(res$full_data  )   ; full_data_reset(res$full_data_reset)
+  asu_data(res$asu_data    )   ; asu_tracts(res$asu_tracts)
+  asu_summary(res$asu_summary) ; map_data_dbg(res$full_data)
+
+  output$asu <- renderTable( asu_summary(),digits = 3 )
+  
+  ## 5. (Re‑)draw the first map ----------------------------------
+
+  output$initial_map <- renderMaplibre({
+
+    req(full_data())
+    map_data <- full_data()
+
+    # ---- 6·1 geometry housekeeping ----------------------------------
+    map_data <- map_data |>
+      sf::st_make_valid() |>
+      sf::st_zm(what = "ZM", drop = TRUE) |>
+      dplyr::filter(!sf::st_is_empty(geometry)) |>
+      dplyr::mutate(geom_type = sf::st_geometry_type(geometry)) |>
+      dplyr::filter(geom_type %in% c("POLYGON", "MULTIPOLYGON")) |>
+      dplyr::select(-geom_type)
+
+    if (nrow(map_data) == 0) {
+      return(
+        maplibre(style = carto_style("positron")) |>
+        add_control("No valid polygon geometry to display.", "top-left")
+      )
+    }
+
+    # ---- 6·2 palette / breaks ---------------------------------------
+    map_data <- map_data |>
+      dplyr::mutate(asunum = dplyr::na_if(asunum, 0L))
+
+    n_asu <- max(map_data$asunum, na.rm = TRUE)
+    n_asu <- ifelse(is.finite(n_asu), n_asu, 0L)
+
+    palette_logic <- function(n_asu) {
+      if (n_asu == 0) {
+        list(fill = "#808080", legend_vals = "(none)", legend_cols = "#808080")
+      } else if (n_asu == 1) {
+        list(
+          fill = step_expr(
+            column   = "asunum",
+            base     = "#808080",
+            stops    = "#7FC97F",
+            values   = 1,
+            na_color = "#444444"
+          ),
+          legend_vals = 1,
+          legend_cols = "#7FC97F"
+        )
       } else {
-        next_tract <- adjacent %>% 
-          arrange(desc(tract_ASU_urate),
-                  desc(tract_ASU_unemp)) %>% 
-          head(1)
+        n_cat  <- min(max(n_asu, 3L), 8L)
+        pal    <- RColorBrewer::brewer.pal(n_cat, "Accent")
+        breaks <- seq(1 + n_asu / n_cat, n_asu, length.out = n_cat - 1)
+        list(
+          fill = step_expr(
+            column   = "asunum",
+            base     = pal[1],
+            stops    = pal[-1],
+            values   = breaks,
+            na_color = "#444444"
+          ),
+          legend_vals = seq_len(n_asu),
+          legend_cols = pal
+        )
       }
-      
-      if(add_tract){
-        orderid <- orderid + 1
-        next_tract$orderid <- orderid
-        combined_area <- bind_rows(combined_area, next_tract)
-        rate <- sum(combined_area$tract_ASU_unemp) / sum(combined_area$tract_ASU_clf) * 100
-        existing <- combined_area %>% pull(row_num)
-      }
-      
     }
-    
-    if(rate < 6.45){
-      combined_area <- head(combined_area, -1)
-    }
-    preASU_assign <- cbind(combined_area, asunum)
-    ASU_assigned <- bind_rows(ASU_assigned, preASU_assign)
-    ASU_assigned_names <- ASU_assigned$name
-    asunum <- asunum + 1
-    filtered_data_merge <- data_merge %>% filter(!name %in% ASU_assigned_names)
-    filtered_data_merge <- filtered_data_merge %>% arrange(desc(tract_ASU_urate))
-    rate <- 100
-  }
-  
-  # Reactive full_data gets all tracts, merged with ASU data.
-  
-  data_merge %>%
-    select(GEOID,name,  starts_with("tract_")) %>%
-    left_join(ASU_assigned %>% st_drop_geometry() %>% select(GEOID, asunum)) %>%
-    mutate(asunum = if_else(is.na(asunum), 0, asunum),
-           asunum = as.integer(asunum),
-           tract_ASU_clf = as.integer(tract_ASU_clf),
-           tract_pop_cur = as.integer(tract_pop_cur),
-           tract_ASU_unemp = as.integer(tract_ASU_unemp)) %>%
-    full_data()
-  
-  # Reactive full_data_reset gets all tracts, merged with ASU data, saved for resetting modifications.
-  
-  data_merge %>%
-    select(GEOID,name,  starts_with("tract_")) %>%
-    left_join(ASU_assigned %>% st_drop_geometry() %>% select(GEOID, asunum)) %>%
-    mutate(asunum = if_else(is.na(asunum), 0, asunum),
-           asunum = as.integer(asunum),
-           tract_ASU_clf = as.integer(tract_ASU_clf),
-           tract_pop_cur = as.integer(tract_pop_cur),
-           tract_ASU_unemp = as.integer(tract_ASU_unemp)) %>%
-    full_data_reset()
-  
-  # Reactive asu_data contains geometry and continuity data
-  ASU_assigned %>%
-    asu_data()
-  
-  # Reactive asu_tracts contains assigned tracts without continuity column for mapping
-  ASU_assigned %>%
-    select(GEOID, name, tract_pop_cur, tract_ASU_clf, tract_ASU_unemp, tract_ASU_urate, asunum) %>%
-    asu_tracts()
-  
-  # Reactive asu_summary contains summarized ASU data for summary table    
-  ASU_assigned %>%
-    st_drop_geometry() %>%
-    select(name, tract_pop_cur, tract_ASU_clf, tract_ASU_unemp, asunum) %>%
-    group_by(asunum) %>%
-    summarize(
-      tracts = n(),
-      population = sum(tract_pop_cur, na.rm = TRUE),
-      lf = sum(tract_ASU_clf, na.rm = TRUE),
-      unemp = sum(tract_ASU_unemp, na.rm = TRUE),
-      ur = round(unemp/lf*100, 2)
-    ) %>%
-    mutate(asunum = as.integer(asunum)) %>%
-    select(asunum, tracts, population, ur) %>%
-    asu_summary()
-  
-  output$asu <- renderTable({
-    asu_summary()
+
+    pal <- palette_logic(n_asu)
+
+    # ---- 6·3 build map ----------------------------------------------
+    maplibre(style = carto_style("positron")) |>
+      fit_bounds(map_data, animate = FALSE) |>
+      add_fill_layer(
+        id                 = "basemap",
+        source             = map_data,
+        fill_color         = pal$fill,
+        fill_opacity       = 0.5,
+        fill_outline_color = "black",
+        popup = concat(
+          "<strong>ASU Number: </strong>", get_column("asunum"), "<br>",
+          "<strong>Tract GEOID: </strong>", get_column("GEOID"),  "<br>",
+          "<strong>UR: </strong>",
+          number_format(get_column("tract_ASU_urate"),
+                        style = "decimal", maximum_fraction_digits = 2),
+          "%<br>",
+          "<strong>Unemp: </strong>",
+          number_format(get_column("tract_ASU_unemp"),
+                        style = "decimal", maximum_fraction_digits = 0), "<br>"
+        )
+      ) |>
+      add_legend(
+        "ASU Number",
+        values = pal$legend_vals,
+        colors = pal$legend_cols,
+        type   = "categorical"
+      )
   })
 
-  
-# Convert to MapLibre
-output$initial_map <- renderMaplibre({
-  
-  # Prepare the data with colors
-  map_data <- full_data()
-  
-  number_asus <- max(map_data$asunum)
-  number_categories <- min(c(number_asus,8))
-  asu_per_category <- number_asus/number_categories
-  brewer_pal <- RColorBrewer::brewer.pal(number_categories, "Accent")
-  
-  map_data <- map_data %>%
-    mutate(asunum = if_else(asunum == 0, NA, asunum))
-  
-  # Create the maplibre map
-  maplibre(style = carto_style("positron")) |>
-    fit_bounds(map_data, animate = FALSE) |> 
-    add_fill_layer(
-      id = "basemap",
-      source = map_data,
-      fill_color = step_expr(
-        column = "asunum",
-        base = brewer_pal[1],
-        stops = brewer_pal[2:number_categories],
-        values = seq(1+asu_per_category,number_asus,asu_per_category),
-        na_color = "#444444"
-      ),
-      fill_opacity = 0.5,
-      fill_outline_color = "black",
-      popup = concat(
-        "<strong>ASU Number: </strong>",get_column("asunum"), "<br>",
-        "<strong>Tract GEOID: </strong>",get_column("GEOID"),"<br>",
-        "<strong>Tract Population: </strong>",number_format(get_column("tract_ASU_unemp"), style = "decimal", maximum_fraction_digits = 0),"<br>",
-        "<strong>Tract Unemployment Rate: </strong>",number_format(get_column("tract_ASU_urate"), style = "decimal", maximum_fraction_digits = 2),"%<br>",
-        "<strong>Tract Unemployment: </strong>",number_format(get_column("tract_ASU_unemp"), style = "decimal", maximum_fraction_digits = 0),"<br>")
-    ) |>
-    add_legend(
-      "ASU Number",
-      values = round(seq(1,number_asus,asu_per_category)),
-      colors = brewer_pal,
-      type = "categorical"
-    )
-
-})  
+})  # ---- end observeEvent -------------------------------------------------
 
 
+# ─────────────── DEBUG PANEL ───────────────
+output$map_data_preview <- renderPrint({
+  # show something only after the ASU routine ran
+  req(map_data_dbg())
+
+  # ▸ just a quick glimpse – change to str() or summary() if you prefer
+  cat("----- head(map_data_dbg()) -----\n")
+  print(
+    map_data_dbg() |>
+      sf::st_drop_geometry() |>      # geometry is noisy in a console print
+      dplyr::slice_head(n = 10)
+  )
+  cat("\nRows :", nrow(map_data_dbg()),
+      "   Cols :", ncol(map_data_dbg()), "\n")
 })
-
-
-
-
 
 ```
 
 ## Output {data-width="800"}
 
 ```{r}
-
 maplibreOutput("initial_map", height = "100vh")
 
 ```
@@ -387,7 +480,10 @@ renderUI(HTML("<hr>"))
 
 # Show Data for Selection
 actionButton("preview", "Show Data for Selected Tracts")
-asu_choices <- reactive(full_data() %>% pull(asunum) %>% unique() %>% sort())
+asu_choices <- reactive({
+  req(full_data())                     # only run after full_data exists
+  full_data() |> pull(asunum) |> unique() |> sort()
+})
 
 renderUI(HTML("<hr>"))
 
@@ -479,7 +575,7 @@ output$edit_map <- renderMaplibre({
       tooltip = concat(
         "<strong>ASU Number: </strong>",get_column("asunum"), "<br>",
         "<strong>Tract GEOID: </strong>",get_column("GEOID"),"<br>",
-        "<strong>Tract Population: </strong>",number_format(get_column("tract_ASU_unemp"), style = "decimal", maximum_fraction_digits = 0),"<br>",
+        "<strong>Tract Population: </strong>",number_format(get_column("tract_pop_cur"), style = "decimal", maximum_fraction_digits = 0),"<br>",
         "<strong>Tract Unemployment Rate: </strong>",number_format(get_column("tract_ASU_urate"), style = "decimal", maximum_fraction_digits = 2),"%<br>",
         "<strong>Tract Unemployment: </strong>",number_format(get_column("tract_ASU_unemp"), style = "decimal", maximum_fraction_digits = 0),"<br>")
     )
@@ -529,7 +625,7 @@ observeEvent(input$edit_map_feature_click, {
   # Update the selection table
   output$selection_table <- renderTable({
     selected_tracts()
-  })
+  }, digits = 3)
 })
 
 # Clear Selected Tracts on Button Click
@@ -1191,6 +1287,13 @@ observeEvent(input$review_txt, {
 
 ```
 
+
+Debugging
+=======================================
+```{r}
+verbatimTextOutput("map_data_preview")
+```
+=======
 # How to Use ASUbuildR
 
 **About ASUloadR**
@@ -1391,3 +1494,4 @@ upload to LSS directly once the ASUs are completed. The Summary CSV file
 provides a handy output of all selected tracts and a useful tool to
 review the selections for high-unemployment tracts that were not
 included.
+
