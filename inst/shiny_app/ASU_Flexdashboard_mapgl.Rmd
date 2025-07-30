@@ -1287,13 +1287,6 @@ observeEvent(input$review_txt, {
 
 ```
 
-
-Debugging
-=======================================
-```{r}
-verbatimTextOutput("map_data_preview")
-```
-=======
 # How to Use ASUbuildR
 
 **About ASUloadR**
