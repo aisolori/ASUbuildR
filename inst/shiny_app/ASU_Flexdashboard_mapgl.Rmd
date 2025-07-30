@@ -76,6 +76,8 @@ map_data_dbg <- reactiveVal(NULL)   # container
 
 highlighted_tracts <- reactiveVal(character(0))
 
+pause_flag <- reactiveVal(FALSE)
+
 
 
 
@@ -210,7 +212,8 @@ conditionalPanel(
   condition = "input.asu_algo == 'mine'",
   checkboxInput("join_touching",
                 "Include touching tracts when building ASUs",
-                value = TRUE)
+                value = TRUE),
+  actionButton("pause_run", "Pause ASU Run")
 )
 
 
@@ -281,6 +284,10 @@ uiOutput("algo_blurb")
 
 tableOutput("asu")
 
+observeEvent(input$pause_run, {
+  pause_flag(TRUE)
+})
+
 observeEvent(input$process, {
 
   
@@ -309,20 +316,26 @@ observeEvent(input$process, {
     join_flag <- isTRUE(input$join_touching)   # ← keep the flag you already built
     
     incProgress(0.05, detail = "Finding initial ASU seeds…")
+    pause_flag(FALSE)
     res <- if (algo_choice == "orig") {
       run_asu_original(tract_list, uploaded_data())      # <- no verbose here
     } else {
       run_tract_hunter(
-    tract_list, uploaded_data(),
-    join_touching = join_flag,   # ← this line makes the checkbox work again
-    verbose       = TRUE
-  )
+        tract_list, uploaded_data(),
+        join_touching = join_flag,   # ← this line makes the checkbox work again
+        verbose       = TRUE,
+        pause_check   = function() pause_flag()
+      )
     }
+    pause_flag(FALSE)
 
 
     ## 3 · Finish the bar
     incProgress(1, detail = "Finishing up…")
   })  # ---- withProgress ends here  -------------------------------------
+
+  paused <- pause_flag()
+  pause_flag(FALSE)
 
   ## 4 · Store results & draw map  --------------------------------------
   full_data(res$full_data  )   ; full_data_reset(res$full_data_reset)
@@ -330,6 +343,10 @@ observeEvent(input$process, {
   asu_summary(res$asu_summary) ; map_data_dbg(res$full_data)
 
   output$asu <- renderTable( asu_summary(),digits = 3 )
+
+  if (paused) {
+    showNotification("ASU run paused - partial results saved.", type = "message")
+  }
   
   ## 5. (Re‑)draw the first map ----------------------------------
 

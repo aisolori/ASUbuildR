@@ -6,7 +6,8 @@ run_tract_hunter <- function(tract_list,
                              ur_thresh  = 0.0645,
                              pop_thresh = 10000,
                              join_touching  = TRUE,   # <- NEW
-                             verbose    = TRUE) {
+                             verbose    = TRUE,
+                             pause_check = function() FALSE) {
 
 
 
@@ -40,6 +41,40 @@ run_tract_hunter <- function(tract_list,
   used_indexes           <- integer(0)
   tried_starting_indexes <- integer(0)
   asu_groups             <- list()
+
+  assemble_results <- function() {
+    data_merge$asunum[is.na(data_merge$asunum)] <- 0
+    full_data <- data_merge %>%
+      select(-continuous) %>%
+      st_as_sf() %>%
+      st_cast("MULTIPOLYGON", warn = FALSE) %>%
+      mutate(
+        ur     = ur * 100,
+        asunum = as.integer(asunum)
+      )
+
+    asu_tracts <- full_data %>% filter(asunum > 0)
+
+    asu_summary <- asu_tracts %>%
+      st_drop_geometry() %>%
+      group_by(asunum) %>%
+      summarise(
+        tracts     = n(),
+        population = sum(tract_pop_cur,   na.rm = TRUE),
+        unemp      = sum(tract_ASU_unemp, na.rm = TRUE),
+        emp        = sum(tract_ASU_emp,   na.rm = TRUE),
+        ur         = round(unemp / (unemp + emp) * 100, 5),
+        .groups = "drop"
+      )
+
+    list(
+      full_data       = full_data,
+      asu_tracts      = asu_tracts,
+      asu_summary     = asu_summary,
+      full_data_reset = full_data,
+      asu_data        = asu_tracts
+    )
+  }
 
   # ---- helper: BFS paths (unchanged) ----------------------------------
   # BFS to get *all* paths up to k hops
@@ -86,6 +121,7 @@ run_tract_hunter <- function(tract_list,
 
   # ---- 1 · SEED‑AND‑EXPAND -------------------------------------------
   repeat {
+    if (pause_check()) return(assemble_results())
     # 1) Identify all **unused** tracts with UR >= 0.0645
     all_unused <- setdiff(seq_along(ur_vec), used_indexes)
     valid_unused <- all_unused[ ur_vec[all_unused] >= .0645]
@@ -112,6 +148,7 @@ run_tract_hunter <- function(tract_list,
     asu_list <- c(starting_index)
 
     repeat {
+      if (pause_check()) return(assemble_results())
 
       # 1) Identify the ASU boundary: any neighbor of asu_list that is not in asu_list or used_indexes
       boundary_tracts <- unique(unlist(nb[asu_list]))
@@ -550,6 +587,7 @@ run_tract_hunter <- function(tract_list,
   # ---- 2 · TRADE / MERGE PASSES ---------------------------------------
   asu_pass <- function(verbose = TRUE) {
     repeat {
+      if (pause_check()) return(FALSE)
       ## ---- 1. current state --------------------------------------
       data_merge_local <- data_merge      # it’s already in scope here
       # refresh
@@ -566,6 +604,7 @@ run_tract_hunter <- function(tract_list,
 
       ## ---- 2. loop over candidates ------------------------------
       for (i in seq_len(nrow(tracts_not_in_asu))) {
+        if (pause_check()) return(FALSE)
 
         target_index <- tracts_not_in_asu$row_num[i]
 
@@ -604,14 +643,14 @@ run_tract_hunter <- function(tract_list,
     mutate(asunum = as.character(asunum))
 
   # 1st pass
-  asu_pass(verbose = TRUE)
+  if (isFALSE(asu_pass(verbose = TRUE))) return(assemble_results())
 
   # optionally merge touching ASUs  -------------------------------
   if (isTRUE(join_touching)) {
     data_merge <- combine_asu_groups(data_merge, nb)
 
     # 2nd pass
-    asu_pass(verbose = TRUE)
+    if (isFALSE(asu_pass(verbose = TRUE))) return(assemble_results())
   }
 
 
@@ -624,34 +663,5 @@ run_tract_hunter <- function(tract_list,
 
 
   # ---- 3 · RETURN OBJECTS --------------------------------------------
-  data_merge$asunum[is.na(data_merge$asunum)] <- 0
-
-  full_data <- data_merge %>%
-    select(-continuous) %>%
-    st_as_sf() %>%
-    st_cast("MULTIPOLYGON", warn = FALSE) %>%
-    mutate(ur = ur*100,
-           asunum = as.integer(asunum))
-
-  asu_tracts <- full_data %>% filter(asunum > 0)
-
-  asu_summary <- asu_tracts %>%
-    st_drop_geometry() %>%
-    group_by(asunum) %>%
-    summarise(
-      tracts     = n(),
-      population = sum(tract_pop_cur,   na.rm = TRUE),
-      unemp      = sum(tract_ASU_unemp, na.rm = TRUE),
-      emp        = sum(tract_ASU_emp,   na.rm = TRUE),
-      ur         = round(unemp/(unemp+emp)*100, 5),
-      .groups = "drop"
-    )
-
-  list(
-    full_data       = full_data,
-    asu_tracts      = asu_tracts,
-    asu_summary     = asu_summary,
-    full_data_reset = full_data,
-    asu_data        = asu_tracts
-  )
+  assemble_results()
 }
