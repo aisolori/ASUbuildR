@@ -318,11 +318,16 @@ observeEvent(input$process, {
         row_num    = row_number(),
         continuous = st_contiguity(geometry)
       )
-
-    ## 1b · Merge the BLS data
-    incProgress(0.05, detail = "Merging BLS unemployment data…")
-    data_merge <- tract_list |>
-      left_join(uploaded_data(), by = "GEOID")
+    
+    
+    
+    
+    # ## 1b · Merge the BLS data
+    # incProgress(0.05, detail = "Merging BLS unemployment data…")
+    # data_merge <- tract_list |>
+    #   left_join(uploaded_data(), by = "GEOID")
+    
+    
 
     # 2 · Run the chosen ASU algorithm ---------------------------------
     algo_choice <- isolate(input$asu_algo %||% "orig")

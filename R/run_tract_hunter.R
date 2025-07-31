@@ -30,6 +30,23 @@ tract_hunter_seed <- function(tract_list,
       row_num = if_else(!is.na(row_num), row_num, row_number())
     )
 
+  # Check for tracts with no neighbors and tract_ASU_clf == 0
+  empty_tracts <- data_merge |>
+    mutate(
+      n_neighbors = lengths(continuous)
+    )%>%
+    filter(n_neighbors == 1)|>
+    rowwise()%>%
+    mutate(
+      neighbors = toString(continuous)
+    )%>%
+    filter(neighbors == "0" & tract_ASU_clf == 0)|>
+    pull(GEOID)
+
+  # Removing bad tracts
+  data_merge <- data_merge|>
+    filter(!GEOID %in% empty_tracts)
+
   nb <- data_merge$continuous
   g  <- igraph::graph_from_adj_list(nb)
 
@@ -190,6 +207,15 @@ tract_hunter_asu_pass <- function(state, verbose = TRUE) {
     found_neighbors <- current_neighbors[current_neighbors %in% asu_indexes]
 
     if (length(found_neighbors) == 0) {
+      message(glue::glue("Tract {target_index} has no reachable ASU neighbors"))
+      return(list(
+        new_tracts = integer(0),
+        neighbors  = integer(0),
+        full_path  = integer(0)
+      ))
+    }
+
+    if (length(found_neighbors) == 0) {
       visited <- target_index
       current_level <- current_neighbors
       while (length(found_neighbors) == 0 && length(current_level) > 0) {
@@ -219,7 +245,14 @@ tract_hunter_asu_pass <- function(state, verbose = TRUE) {
       cands_ur <- c(cands_ur, path_ur)
     }
 
-    if (length(cands_ur) == 0) break
+    if (length(cands_ur) == 0) {
+      message(glue::glue("No path candidates for target {target_index}"))
+      return(list(
+        new_tracts = integer(0),
+        neighbors  = found_neighbors,
+        full_path  = integer(0)
+      ))
+    }
 
     full_path_to_target <- all_paths[[which.max(cands_ur)]]
 
@@ -234,9 +267,16 @@ tract_hunter_asu_pass <- function(state, verbose = TRUE) {
     all_asu_indexes <- which(!is.na(data_merge$asunum))
 
     path_finder <- find_boundary_path(target_index, asu_indexes = data_merge$row_num[all_asu_indexes])
+    # if full_path is empty, bail out
+    if (length(path_finder$full_path) < 1) {
+      return(FALSE)
+    }
+
     new_indexes  <- path_finder$new_tracts
 
-    asu_being_processed <- data_merge$asunum[as.numeric(path_finder$full_path[[1]])]
+    new_indexes  <- path_finder$new_tracts
+    first_path   <- as.numeric(path_finder$full_path[[1]])
+    asu_being_processed <- data_merge$asunum[first_path]
     asu_indexes <- which(data_merge$asunum == asu_being_processed)
 
     union_indexes <- sort(c(asu_indexes, new_indexes))
