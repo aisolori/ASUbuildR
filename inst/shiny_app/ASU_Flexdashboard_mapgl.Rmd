@@ -77,6 +77,11 @@ edit_table <- reactiveVal(NULL)
 edit_summary <- reactiveVal(NULL)
 current_selection <- reactiveVal(NULL)
 
+# Tract Hunter staged state -----------------------------------------
+th_state <- reactiveVal(NULL)
+th_tract_list <- reactiveVal(NULL)
+th_bls_df <- reactiveVal(NULL)
+
 map_data_dbg <- reactiveVal(NULL)   # container
 
 highlighted_tracts <- reactiveVal(character(0))
@@ -218,6 +223,13 @@ conditionalPanel(
                 value = TRUE)
 )
 
+conditionalPanel(
+  condition = "input.asu_algo == 'mine'",
+  actionButton("th_seed", "Seed & Expand"),
+  actionButton("th_pass", "Run ASU Pass"),
+  actionButton("th_combine", "Combine ASU Groups")
+)
+
 
 actionButton("process", "Load Tracts and Initialize ASU")
 # ---- dynamic algorithm description ------------------------------------
@@ -314,14 +326,13 @@ observeEvent(input$process, {
     join_flag <- isTRUE(input$join_touching)   # ← keep the flag you already built
     
     incProgress(0.05, detail = "Finding initial ASU seeds…")
-    res <- if (algo_choice == "orig") {
-      run_asu_original(tract_list, uploaded_data())      # <- no verbose here
+    if (algo_choice == "orig") {
+      res <- run_asu_original(tract_list, uploaded_data())
     } else {
-      run_tract_hunter(
-    tract_list, uploaded_data(),
-    join_touching = join_flag,   # ← this line makes the checkbox work again
-    verbose       = TRUE
-  )
+      th_tract_list(tract_list)
+      th_bls_df(uploaded_data())
+      th_state(NULL)
+      res <- NULL
     }
 
 
@@ -330,13 +341,14 @@ observeEvent(input$process, {
   })  # ---- withProgress ends here  -------------------------------------
 
   ## 4 · Store results & draw map  --------------------------------------
-  full_data(res$full_data  )   ; full_data_reset(res$full_data_reset)
-  asu_data(res$asu_data    )   ; asu_tracts(res$asu_tracts)
-  asu_summary(res$asu_summary) ; map_data_dbg(res$full_data)
+  if (!is.null(res)) {
+    full_data(res$full_data  )   ; full_data_reset(res$full_data_reset)
+    asu_data(res$asu_data    )   ; asu_tracts(res$asu_tracts)
+    asu_summary(res$asu_summary) ; map_data_dbg(res$full_data)
 
-  output$asu <- renderTable( asu_summary(),digits = 3 )
-  
-  ## 5. (Re‑)draw the first map ----------------------------------
+    output$asu <- renderTable( asu_summary(),digits = 3 )
+
+    ## 5. (Re‑)draw the first map ----------------------------------
 
   output$initial_map <- renderMaplibre({
 
@@ -435,7 +447,194 @@ observeEvent(input$process, {
       )
   })
 
+}
+
 })  # ---- end observeEvent -------------------------------------------------
+
+# ---- staged Tract Hunter buttons ---------------------------------------
+observeEvent(input$th_seed, {
+  req(th_tract_list(), th_bls_df())
+  withProgress(message = "Seeding & expanding…", value = 0, {
+    st <- tract_hunter_seed(th_tract_list(), th_bls_df(), verbose = TRUE)
+  })
+  th_state(st)
+  res <- tract_hunter_finalize(st)
+  full_data(res$full_data  )   ; full_data_reset(res$full_data_reset)
+  asu_data(res$asu_data    )   ; asu_tracts(res$asu_tracts)
+  asu_summary(res$asu_summary) ; map_data_dbg(res$full_data)
+  output$asu <- renderTable( asu_summary(),digits = 3 )
+  output$initial_map <- renderMaplibre({
+    req(full_data())
+    map_data <- full_data()
+    map_data <- map_data |>
+      sf::st_make_valid() |>
+      sf::st_zm(what = "ZM", drop = TRUE) |>
+      dplyr::filter(!sf::st_is_empty(geometry)) |>
+      dplyr::mutate(geom_type = sf::st_geometry_type(geometry)) |>
+      dplyr::filter(geom_type %in% c("POLYGON", "MULTIPOLYGON")) |>
+      dplyr::select(-geom_type)
+    if (nrow(map_data) == 0) {
+      return(
+        maplibre(style = carto_style("positron")) |>
+        add_control("No valid polygon geometry to display.", "top-left")
+      )
+    }
+    map_data <- map_data |>
+      dplyr::mutate(asunum = dplyr::na_if(asunum, 0L))
+    n_asu <- max(map_data$asunum, na.rm = TRUE)
+    n_asu <- ifelse(is.finite(n_asu), n_asu, 0L)
+    palette_logic <- function(n_asu) {
+  if (n_asu == 0) {
+    list(fill = "#808080",
+         legend_vals = "(none)",
+         legend_cols = "#808080")
+
+  } else if (n_asu == 1) {
+    list(
+      fill  = step_expr(column="asunum",
+                        base="#808080",
+                        stops="#7FC97F",
+                        values=1,
+                        na_color="#444444"),
+      legend_vals = 1,
+      legend_cols = "#7FC97F"
+    )
+
+  } else {
+    n_cat <- min(max(n_asu, 3L), 8L)
+    pal   <- RColorBrewer::brewer.pal(n_cat, "Accent")
+    legend_cols <- rep_len(pal, n_asu)
+    breaks <- seq(1 + n_asu / n_cat, n_asu, length.out = n_cat - 1)
+    list(
+      fill = step_expr(column   = "asunum",
+                       base     = pal[1],
+                       stops    = pal[-1],
+                       values   = breaks,
+                       na_color = "#444444"),
+      legend_vals = seq_len(n_asu),
+      legend_cols = legend_cols
+    )
+  }
+}
+    pal <- palette_logic(n_asu)
+    maplibre(style = carto_style("positron")) |>
+      fit_bounds(map_data, animate = FALSE) |>
+      add_fill_layer(
+        id                 = "basemap",
+        source             = map_data,
+        fill_color         = pal$fill,
+        fill_opacity       = 0.5,
+        fill_outline_color = "black",
+        popup = concat(
+          "<strong>ASU Number: </strong>", get_column("asunum"), "<br>",
+          "<strong>Tract GEOID: </strong>", get_column("GEOID"),  "<br>",
+          "<strong>UR: </strong>",
+          number_format(get_column("tract_ASU_urate"),
+                        style = "decimal", maximum_fraction_digits = 2),
+          "%<br>",
+          "<strong>Unemp: </strong>",
+          number_format(get_column("tract_ASU_unemp"),
+                        style = "decimal", maximum_fraction_digits = 0), "<br>"
+        )
+      ) |>
+      add_legend(
+        "ASU Number",
+        values = pal$legend_vals,
+        colors = pal$legend_cols,
+        type   = "categorical"
+      )
+  })
+})
+
+observeEvent(input$th_pass, {
+  req(th_state())
+  withProgress(message = "Running ASU pass…", value = 0, {
+    st <- tract_hunter_asu_pass(th_state(), verbose = TRUE)
+  })
+  th_state(st)
+  res <- tract_hunter_finalize(st)
+  full_data(res$full_data  )   ; full_data_reset(res$full_data_reset)
+  asu_data(res$asu_data    )   ; asu_tracts(res$asu_tracts)
+  asu_summary(res$asu_summary) ; map_data_dbg(res$full_data)
+  output$asu <- renderTable( asu_summary(),digits = 3 )
+  maplibre_proxy("initial_map") %>% clear_layer("basemap")
+  output$initial_map <- renderMaplibre({
+    req(full_data())
+    map_data <- full_data()
+    map_data <- map_data |>
+      sf::st_make_valid() |>
+      sf::st_zm(what = "ZM", drop = TRUE) |>
+      dplyr::filter(!sf::st_is_empty(geometry)) |>
+      dplyr::mutate(geom_type = sf::st_geometry_type(geometry)) |>
+      dplyr::filter(geom_type %in% c("POLYGON", "MULTIPOLYGON")) |>
+      dplyr::select(-geom_type)
+    if (nrow(map_data) == 0) {
+      return(
+        maplibre(style = carto_style("positron")) |>
+        add_control("No valid polygon geometry to display.", "top-left")
+      )
+    }
+    map_data <- map_data |>
+      dplyr::mutate(asunum = dplyr::na_if(asunum, 0L))
+    n_asu <- max(map_data$asunum, na.rm = TRUE)
+    n_asu <- ifelse(is.finite(n_asu), n_asu, 0L)
+    pal <- palette_logic(n_asu)
+    maplibre(style = carto_style("positron")) |>
+      fit_bounds(map_data, animate = FALSE) |>
+      add_fill_layer(
+        id                 = "basemap",
+        source             = map_data,
+        fill_color         = pal$fill,
+        fill_opacity       = 0.5,
+        fill_outline_color = "black"
+      )
+  })
+})
+
+observeEvent(input$th_combine, {
+  req(th_state())
+  withProgress(message = "Combining ASUs…", value = 0, {
+    st <- tract_hunter_combine_groups(th_state())
+  })
+  th_state(st)
+  res <- tract_hunter_finalize(st)
+  full_data(res$full_data  )   ; full_data_reset(res$full_data_reset)
+  asu_data(res$asu_data    )   ; asu_tracts(res$asu_tracts)
+  asu_summary(res$asu_summary) ; map_data_dbg(res$full_data)
+  output$asu <- renderTable( asu_summary(),digits = 3 )
+  maplibre_proxy("initial_map") %>% clear_layer("basemap")
+  output$initial_map <- renderMaplibre({
+    req(full_data())
+    map_data <- full_data()
+    map_data <- map_data |>
+      sf::st_make_valid() |>
+      sf::st_zm(what = "ZM", drop = TRUE) |>
+      dplyr::filter(!sf::st_is_empty(geometry)) |>
+      dplyr::mutate(geom_type = sf::st_geometry_type(geometry)) |>
+      dplyr::filter(geom_type %in% c("POLYGON", "MULTIPOLYGON")) |>
+      dplyr::select(-geom_type)
+    if (nrow(map_data) == 0) {
+      return(
+        maplibre(style = carto_style("positron")) |>
+        add_control("No valid polygon geometry to display.", "top-left")
+      )
+    }
+    map_data <- map_data |>
+      dplyr::mutate(asunum = dplyr::na_if(asunum, 0L))
+    n_asu <- max(map_data$asunum, na.rm = TRUE)
+    n_asu <- ifelse(is.finite(n_asu), n_asu, 0L)
+    pal <- palette_logic(n_asu)
+    maplibre(style = carto_style("positron")) |>
+      fit_bounds(map_data, animate = FALSE) |>
+      add_fill_layer(
+        id                 = "basemap",
+        source             = map_data,
+        fill_color         = pal$fill,
+        fill_opacity       = 0.5,
+        fill_outline_color = "black"
+      )
+  })
+})
 
 
 # ─────────────── DEBUG PANEL ───────────────
@@ -1132,7 +1331,21 @@ observeEvent(input$run_asu_summary, {
       pop_qualified = if_else(population >= input$asu_pop, TRUE, FALSE),
       asu_qualified = ur_qualified & pop_qualified
     )
-  
+
+  ## ----- contiguity check -----------------------------------------
+  nb <- sfdep::st_contiguity(full_data())
+  g  <- igraph::graph_from_adj_list(nb)
+  contig_vec <- vapply(summary_table$asu_num, function(id) {
+    ids <- full_data()$row_num[full_data()$asunum == id]
+    if (length(ids) <= 1) {
+      TRUE
+    } else {
+      igraph::is.connected(igraph::induced_subgraph(g, ids))
+    }
+  }, logical(1))
+
+  summary_table <- mutate(summary_table, contiguous = contig_vec)
+
   summarized_asu(summary_table)
 })
 
