@@ -1,4 +1,6 @@
 export(launch_ASUbuildR)
+useDynLib(ASUbuildR, .registration = TRUE)
+importFrom(Rcpp, sourceCpp)
 
 # Core Shiny ecosystem - import everything to avoid issues
 import(shiny)
