@@ -291,36 +291,30 @@ run_tract_hunter <- function(tract_list,
     # Display the found neighbors in asu_indexes (for diagnostic purposes).
     #cat("Found neighbor(s) in asu_indexes:", found_neighbors, "\n")
 
-    # --- Step 2: Find All Simple Paths ---
-    # Using igraph's all_simple_paths() to get all paths from each found neighbor to the target.
-    all_paths <- list()  # container for candidate paths
-    for (nbr in found_neighbors) {
-      # Using a cutoff (here 5) to limit path length. Adjust the cutoff as needed.
-      paths_temp <- igraph::k_shortest_paths(g, from = nbr, to = target_index, mode = "out", k = 50)
-      all_paths <- c(all_paths, paths_temp$vpath)
-    }
+    # --- Step 2: Find shortest paths from all boundary neighbors ---
+    # Compute the shortest path from each boundary neighbor to the target tract
+    # in a single igraph call for efficiency.
+    all_paths <- igraph::shortest_paths(
+      graph = g,
+      from  = found_neighbors,
+      to    = target_index,
+      mode  = "out",
+      output = "vpath"
+    )$vpath
 
 
 
     # --- Step 3: Compute the Candidate Unemployment Ratio for Each Path ---
-    cands_ur <- c()  # container for candidate unemployment rates
-    for (path in all_paths) {
-      # Convert vertex sequence to a vector of vertex IDs
-      path_ids <- as.numeric(path)
-      # Remove asu indexes from the path
+    cands_ur <- vapply(all_paths, function(path) {
+      path_ids  <- as.numeric(path)
       new_tracts <- setdiff(path_ids, asu_indexes)
+      (sum(unemp_vec[new_tracts]) + asu_unemp) /
+        (sum(unemp_vec[new_tracts]) + sum(emp_vec[new_tracts]) + asu_emp + asu_unemp)
+    }, numeric(1))
 
-      # Compute the unemployment rate for the path.
-      # (Assumes unemp_vec and emp_vec have been defined and are indexed similarly to the graph.)
-      path_ur <- (sum(unemp_vec[new_tracts])+asu_unemp) / (sum(unemp_vec[new_tracts]) + sum(emp_vec[new_tracts])+asu_emp+asu_unemp)
-
-      cands_ur <- c(cands_ur, path_ur)
-    }
-
-    # Check if any paths were found.
+    # Check if any paths were found; if none, return NULL
     if (length(cands_ur) == 0) {
-      #stop("No candidate paths found that connect the target to asu_indexes")
-      break
+      return(NULL)
     }
 
     # Get the full path (as a vertex sequence) corresponding to the maximum unemployment ratio.
