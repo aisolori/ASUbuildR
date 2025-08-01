@@ -208,7 +208,7 @@ tract_hunter_asu_pass <- function(state, verbose = TRUE) {
 
   update_status <- function(msg) {
     if (requireNamespace("shiny", quietly = TRUE) && shiny::isRunning()) {
-      shiny::incProgress(amount = 0, detail = msg)
+      shiny::incProgress(amount = 0.00001, detail = msg)
     } else if (isTRUE(verbose)) {
       cat("\r", msg); flush.console()
     }

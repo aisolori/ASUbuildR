@@ -21,9 +21,18 @@ library(tidyverse)
 library(readxl)
 library(Rcpp)
 
-sourceCpp("../../src/choose_best_neighbor.cpp")
-sourceCpp("../../src/build_edges.cpp")
-sourceCpp("../../src/choose_best_drop.cpp")
+#––– Only re-compile when you’re running the app straight from the repo –––#
+# if (interactive()) {
+# 
+#   if (!exists("choose_best_neighbor", mode = "function"))
+#     Rcpp::sourceCpp("src/choose_best_neighbor.cpp")
+# 
+#   if (!exists("build_edges", mode = "function"))
+#     Rcpp::sourceCpp("src/build_edges.cpp")
+# 
+#   if (!exists("choose_best_drop", mode = "function"))
+#     Rcpp::sourceCpp("src/choose_best_drop.cpp")
+# }
 
 ## ---- tigris cache ----------------------------------------------------
 ## put cached TIGER/Line ZIPs in a per-user cache folder that is always
