@@ -20,10 +20,7 @@ library(sfdep)
 library(tidyverse)
 library(readxl)
 library(Rcpp)
-
-sourceCpp("../../src/choose_best_neighbor.cpp")
-sourceCpp("../../src/build_edges.cpp")
-sourceCpp("../../src/choose_best_drop.cpp")
+library(ASUbuildR)
 
 ## ---- tigris cache ----------------------------------------------------
 ## put cached TIGER/Line ZIPs in a per-user cache folder that is always
@@ -42,15 +39,7 @@ options(tigris_cache_dir = cache_dir)
 # tell tigris to look there first before re‑downloading
 options(tigris_use_cache = TRUE)
 
-# ---- resolve paths from the project root ----------------------------
-# 'here()' always points at the directory that contains ASUbuildR.Rproj
-# no matter where this .Rmd lives.
-if (!requireNamespace("here", quietly = TRUE))
-  install.packages("here")
-
-library(here)          # <‑‑ add once
-source(here::here("R", "run_asu_original.r"))   # local = FALSE by default
-source(here::here("R", "run_tract_hunter.R"))
+# Use package functions directly
 
 # cache every tigris download automatically
 options(
