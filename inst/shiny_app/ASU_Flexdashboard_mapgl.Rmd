@@ -111,8 +111,16 @@ shiny::outputOptions(output, "is_new_england", suspendWhenHidden = FALSE)
 th_state <- shiny::reactiveVal(NULL)
 th_tract_list <- shiny::reactiveVal(NULL)
 th_bls_df <- shiny::reactiveVal(NULL)
-
-map_data_dbg <- shiny::reactiveVal(NULL)   # container
+prep_map_data <- function(map_data) {
+  map_data |>
+    sf::st_make_valid() |>
+    sf::st_zm(what = "ZM", drop = TRUE) |>
+    dplyr::filter(!sf::st_is_empty(geometry)) |>
+    dplyr::mutate(geom_type = sf::st_geometry_type(geometry)) |>
+    dplyr::filter(geom_type %in% c("POLYGON", "MULTIPOLYGON")) |>
+    dplyr::select(-geom_type)
+}
+map_geom <- shiny::reactiveVal(NULL)
 
 highlighted_tracts <- shiny::reactiveVal(character(0))
 
@@ -446,7 +454,7 @@ shiny::observeEvent(input$process, {
   if (!is.null(res)) {
     full_data(res$full_data  )   ; full_data_reset(res$full_data_reset)
     asu_data(res$asu_data    )   ; asu_tracts(res$asu_tracts)
-    asu_summary(res$asu_summary) ; map_data_dbg(res$full_data)
+    asu_summary(res$asu_summary) ; map_geom(prep_map_data(res$full_data))
 
     output$asu <- shiny::renderTable( asu_summary(),digits = 3 )
 
@@ -454,17 +462,8 @@ shiny::observeEvent(input$process, {
 
   output$initial_map <- mapgl::renderMaplibre({
 
-    shiny::req(full_data())
-    map_data <- full_data()
-
-    # ---- 6·1 geometry housekeeping ----------------------------------
-    map_data <- map_data |>
-      sf::st_make_valid() |>
-      sf::st_zm(what = "ZM", drop = TRUE) |>
-      dplyr::filter(!sf::st_is_empty(geometry)) |>
-      dplyr::mutate(geom_type = sf::st_geometry_type(geometry)) |>
-      dplyr::filter(geom_type %in% c("POLYGON", "MULTIPOLYGON")) |>
-      dplyr::select(-geom_type)
+    shiny::req(map_geom())
+    map_data <- map_geom()
 
     if (nrow(map_data) == 0) {
       return(
@@ -524,19 +523,12 @@ shiny::observeEvent(input$th_pass, {
   res <- tract_hunter_finalize(st)
   full_data(res$full_data  )   ; full_data_reset(res$full_data_reset)
   asu_data(res$asu_data    )   ; asu_tracts(res$asu_tracts)
-  asu_summary(res$asu_summary) ; map_data_dbg(res$full_data)
+  asu_summary(res$asu_summary) ; map_geom(prep_map_data(res$full_data))
   output$asu <- shiny::renderTable( asu_summary(),digits = 3 )
   mapgl::maplibre_proxy("initial_map") |> mapgl::clear_layer("basemap")
   output$initial_map <- mapgl::renderMaplibre({
-    shiny::req(full_data())
-    map_data <- full_data()
-    map_data <- map_data |>
-      sf::st_make_valid() |>
-      sf::st_zm(what = "ZM", drop = TRUE) |>
-      dplyr::filter(!sf::st_is_empty(geometry)) |>
-      dplyr::mutate(geom_type = sf::st_geometry_type(geometry)) |>
-      dplyr::filter(geom_type %in% c("POLYGON", "MULTIPOLYGON")) |>
-      dplyr::select(-geom_type)
+    shiny::req(map_geom())
+    map_data <- map_geom()
     if (nrow(map_data) == 0) {
       return(
         mapgl::maplibre(style = mapgl::carto_style("positron")) |>
@@ -587,19 +579,12 @@ shiny::observeEvent(input$th_combine, {
   res <- tract_hunter_finalize(st)
   full_data(res$full_data  )   ; full_data_reset(res$full_data_reset)
   asu_data(res$asu_data    )   ; asu_tracts(res$asu_tracts)
-  asu_summary(res$asu_summary) ; map_data_dbg(res$full_data)
+  asu_summary(res$asu_summary) ; map_geom(prep_map_data(res$full_data))
   output$asu <- shiny::renderTable( asu_summary(),digits = 3 )
   mapgl::maplibre_proxy("initial_map") |> mapgl::clear_layer("basemap")
   output$initial_map <- mapgl::renderMaplibre({
-    shiny::req(full_data())
-    map_data <- full_data()
-    map_data <- map_data |>
-      sf::st_make_valid() |>
-      sf::st_zm(what = "ZM", drop = TRUE) |>
-      dplyr::filter(!sf::st_is_empty(geometry)) |>
-      dplyr::mutate(geom_type = sf::st_geometry_type(geometry)) |>
-      dplyr::filter(geom_type %in% c("POLYGON", "MULTIPOLYGON")) |>
-      dplyr::select(-geom_type)
+    shiny::req(map_geom())
+    map_data <- map_geom()
     if (nrow(map_data) == 0) {
       return(
         mapgl::maplibre(style = mapgl::carto_style("positron")) |>
@@ -736,10 +721,10 @@ shiny::actionButton("reset", "Reset to Initial Data")
   mapgl::maplibreOutput("edit_map", height = "100vh")
   
 output$edit_map <- mapgl::renderMaplibre({
-  
-  shiny::req(full_data())
-  
-  number_asus <- max(full_data()$asunum)
+
+  shiny::req(map_geom())
+
+  number_asus <- max(map_geom()$asunum)
   number_categories <- min(c(number_asus, 8))
   asu_per_category <- number_asus/number_categories
   
@@ -756,10 +741,10 @@ output$edit_map <- mapgl::renderMaplibre({
   }
 
   mapgl::maplibre(style = mapgl::carto_style("positron")) |>
-    mapgl::fit_bounds(full_data(), animate = FALSE) |> 
+    mapgl::fit_bounds(map_geom(), animate = FALSE) |>
     mapgl::add_fill_layer(
       id = "basemap",
-      source = full_data(),
+      source = map_geom(),
       fill_color = mapgl::step_expr(
         column = "asunum",
         base = "#E0E0E0",
@@ -799,45 +784,33 @@ output$edit_map <- mapgl::renderMaplibre({
 shiny::observeEvent(input$edit_map_feature_click, {
   click <- input$edit_map_feature_click
   current_selection <- selected_tracts()
-  
+
   clicked_geoid <- click$properties$GEOID
-  
-  if (is.null(clicked_geoid) || length(clicked_geoid) == 0 || is.na(clicked_geoid)) {
-    return()
-  }
-  
-  # Add or remove the selected tract
+  if (is.null(clicked_geoid) || length(clicked_geoid) == 0 || is.na(clicked_geoid)) return()
+
+  # toggle selection
   if (clicked_geoid %in% current_selection) {
     current_selection <- setdiff(current_selection, clicked_geoid)
   } else {
     current_selection <- c(current_selection, clicked_geoid)
   }
-  
   selected_tracts(current_selection)
-  
-  # OPTIMIZATION: Use set_filter instead of clear_layer + add_line_layer
+
+  # Build filter expression and apply
   if (length(current_selection) > 0 && !any(is.na(current_selection))) {
-    # Create filter expression for selected tracts
-    if (length(current_selection) == 1) {
-      filter_expr <- list("==", c("get", "GEOID"), as.character(current_selection[1]))
+    filter_expr <- if (length(current_selection) == 1) {
+      list("==", c("get", "GEOID"), as.character(current_selection[1]))
     } else {
-      # For multiple values, use "any" with "in" operator
-      filter_expr <- list("in", c("get", "GEOID"), list("literal", as.character(current_selection)))
+      list("in", c("get", "GEOID"), list("literal", as.character(current_selection)))
     }
-    
-    mapgl::maplibre_proxy("edit_map") |>
-      mapgl::set_filter("selected", filter_expr)
+    mapgl::maplibre_proxy("edit_map") |> mapgl::set_filter("selected", filter_expr)
   } else {
-    # Hide all features in selection layer
-    mapgl::maplibre_proxy("edit_map") |>
-      mapgl::set_filter("selected", list("==", c("get", "GEOID"), "__NONE__"))
+    mapgl::maplibre_proxy("edit_map") |> mapgl::set_filter("selected", list("==", c("get", "GEOID"), "__NONE__"))
   }
-  
-  # Update the selection table
-  output$selection_table <- shiny::renderTable({
-    selected_tracts()
-  }, digits = 3)
+
+  output$selection_table <- shiny::renderTable({ selected_tracts() }, digits = 3)
 })
+
 
 # OPTIMIZATION 2: Debounce rapid interactions
 clear_selection_debounced <- shiny::debounce(shiny::reactive({
@@ -857,134 +830,112 @@ shiny::observeEvent(clear_selection_debounced(), {
 
 # OPTIMIZATION 3: Efficient ASU selection with set_filter
 shiny::observeEvent(input$select_asunum, {
-  shiny::req(full_data())
-  
+  shiny::req(map_geom())
+
   if (input$select_asunum == "None") {
     selected_tracts(NULL)
     mapgl::maplibre_proxy("edit_map") |>
       mapgl::set_filter("selected", list("==", c("get", "GEOID"), "__NONE__"))
     return()
   }
-  
-  # Get all tracts with the selected ASU number
-  selected_tract_ids <- full_data() |>
+
+  selected_tract_ids <- map_geom() |>
     dplyr::filter(asunum == as.numeric(input$select_asunum)) |>
     dplyr::pull(GEOID)
-  
-  # Ensure we have valid tract IDs
+
   if (length(selected_tract_ids) == 0) {
     selected_tracts(NULL)
     mapgl::maplibre_proxy("edit_map") |>
       mapgl::set_filter("selected", list("==", c("get", "GEOID"), "__NONE__"))
     return()
   }
-  
+
   selected_tracts(selected_tract_ids)
-  
-  # Use set_filter for performance
-  if (length(selected_tract_ids) == 1) {
-    filter_expr <- list("==", c("get", "GEOID"), as.character(selected_tract_ids[1]))
+
+  filter_expr <- if (length(selected_tract_ids) == 1) {
+    list("==", c("get", "GEOID"), as.character(selected_tract_ids[1]))
   } else {
-    filter_expr <- list("in", c("get", "GEOID"), list("literal", as.character(selected_tract_ids)))
+    list("in", c("get", "GEOID"), list("literal", as.character(selected_tract_ids)))
   }
-  
+
   mapgl::maplibre_proxy("edit_map") |>
     mapgl::set_filter("selected", filter_expr) |>
     mapgl::fit_bounds(subset(full_data(), GEOID %in% selected_tract_ids), animate = TRUE)
 })
 
+
 # Manual GEOID selection with set_filter
 shiny::observeEvent(input$select_geoid, {
-  shiny::req(full_data())
-  
-  selected_tract <- full_data() |>
+  shiny::req(map_geom())
+
+  selected_tract <- map_geom() |>
     dplyr::filter(GEOID == input$manual_geoid)
-  
+
   if (nrow(selected_tract) > 0) {
-    # Reset ASU dropdown to "None" FIRST
     shiny::updateSelectInput(session, "select_asunum", selected = "None")
-    
-    # THEN update the map and selection
+
     mapgl::maplibre_proxy("edit_map") |>
       mapgl::set_filter("selected", list("==", c("get", "GEOID"), as.character(input$manual_geoid))) |>
       mapgl::fit_bounds(selected_tract, animate = TRUE)
-    
+
     selected_tracts(selected_tract$GEOID)
   }
 })
 
+
 # OPTIMIZATION 4: Memoize expensive calculations
+# Memoized filter of selected tracts by percentile
 filtered_tracts_memo <- shiny::reactive({
   shiny::req(input$percentile, input$unemployment_filter, full_data(), selected_tracts())
-  
-  # Use a cache key for memoization
-  cache_key <- paste(
-    paste(selected_tracts(), collapse = ","),
-    input$percentile,
-    input$unemployment_filter,
-    sep = "_"
-  )
-  
+
   potential_highlights <- full_data() |>
     dplyr::filter(GEOID %in% selected_tracts(),
-           tract_pop_cur > 0, tract_ASU_clf > 0)
+                  tract_pop_cur > 0, tract_ASU_clf > 0)
 
-  
-if (input$unemployment_filter == "low") {
-  
-  # Remove tracts where tract_ASU_clf is 0
+  if (nrow(potential_highlights) == 0) return(character(0))
 
-  # Calculate dynamic threshold from eligible tracts
-  threshold <- stats::quantile(potential_highlights$tract_ASU_urate, input$percentile / 100)
-  
-  filtered_selected <- potential_highlights |>
-    dplyr::filter(tract_ASU_urate <= threshold) |>
-    dplyr::pull(GEOID)
-  
-} else {
-
-  threshold <- stats::quantile(potential_highlights$tract_ASU_urate, 1 - (input$percentile / 100))
-  
-  filtered_selected <- potential_highlights |>
-    dplyr::filter(tract_ASU_urate >= threshold) |>
-    dplyr::pull(GEOID)
-}
-  
-  return(filtered_selected)
-}) |> 
-  # Add memoization with cache invalidation
+  if (input$unemployment_filter == "low") {
+    threshold <- stats::quantile(potential_highlights$tract_ASU_urate, input$percentile / 100)
+    potential_highlights |>
+      dplyr::filter(tract_ASU_urate <= threshold) |>
+      dplyr::pull(GEOID)
+  } else {
+    threshold <- stats::quantile(potential_highlights$tract_ASU_urate, 1 - (input$percentile / 100))
+    potential_highlights |>
+      dplyr::filter(tract_ASU_urate >= threshold) |>
+      dplyr::pull(GEOID)
+  }
+}) |>
   shiny::bindCache(input$percentile, input$unemployment_filter, selected_tracts(), full_data())
 
-# OPTIMIZATION 5: Debounced filtering with set_filter
+# Debounced apply
 filter_debounced <- shiny::debounce(shiny::reactive({
   list(input$filter_percentile, input$unemployment_filter)
-}), 250)  # 250ms delay
+}), 250)
 
 shiny::observeEvent(filter_debounced(), {
   filtered_selected <- filtered_tracts_memo()
   highlighted_tracts(filtered_selected)
-  
-  # Use set_filter instead of clear + add
+
   if (length(filtered_selected) > 0 && !any(is.na(filtered_selected))) {
-    if (length(filtered_selected) == 1) {
-      filter_expr <- list("==", c("get", "GEOID"), as.character(filtered_selected[1]))
+    filter_expr <- if (length(filtered_selected) == 1) {
+      list("==", c("get", "GEOID"), as.character(filtered_selected[1]))
     } else {
-      filter_expr <- list("in", c("get", "GEOID"), list("literal", as.character(filtered_selected)))
+      list("in", c("get", "GEOID"), list("literal", as.character(filtered_selected)))
     }
-    
-    mapgl::maplibre_proxy("edit_map") |>
-      mapgl::set_filter("highlighted", filter_expr)
+    mapgl::maplibre_proxy("edit_map") |> mapgl::set_filter("highlighted", filter_expr)
   } else {
     mapgl::maplibre_proxy("edit_map") |>
       mapgl::set_filter("highlighted", list("==", c("get", "GEOID"), "__NONE__"))
   }
 })
 
-# Clear highlights with set_filter
+# Clear highlights when requested or when ASU selection changes
 shiny::observeEvent(list(input$clear_percentile, input$select_asunum), {
   mapgl::maplibre_proxy("edit_map") |>
     mapgl::set_filter("highlighted", list("==", c("get", "GEOID"), "__NONE__"))
-})
+}, ignoreInit = TRUE)
+
 
 # Helper function to calculate color scheme
 calculate_color_scheme <- function(data) {
@@ -1198,6 +1149,7 @@ preview_data <- shiny::reactive({
       ur = round(unemp/lf*100, 5)
     )
   
+
   list(data = replacement_data, summary = summary_data)
 }) |>
   shiny::bindCache(selected_tracts(), full_data())
@@ -1215,6 +1167,7 @@ shiny::observeEvent(input$preview, {
   } else {
     shiny::showNotification("No tracts selected", type = "warning")
   }
+
 })
 
 # Conditional display based on selection
@@ -1224,7 +1177,7 @@ shiny::conditionalPanel(
   
   shiny::h3(" Summary of Selected Tracts"),
   shiny::hr(),
-  
+
   # Summary statistics
   shiny::div(
     style = "background-color: #f8f9fa; padding: 15px; border-radius: 5px; margin-bottom: 15px; flex-shrink: 0;",
