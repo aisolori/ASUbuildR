@@ -22,6 +22,8 @@ Imports:
     RColorBrewer,
     mapgl,
     rmarkdown,
+    rappdirs,
+    scales,
     stringr,
     sf,
     sfdep,

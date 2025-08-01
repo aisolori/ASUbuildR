@@ -1,6 +1,16 @@
 export(launch_ASUbuildR)
+export(run_asu_original)
+export(tract_hunter_seed)
+export(tract_hunter_asu_pass)
+export(tract_hunter_combine_groups)
+export(tract_hunter_finalize)
 useDynLib(ASUbuildR, .registration = TRUE)
-importFrom(Rcpp, sourceCpp)
+
+# Additional imports used in the flexdashboard
+importFrom(rappdirs, user_cache_dir)
+importFrom(scales, comma)
+importFrom(utils, choose.dir)
+importFrom(tcltk, tk_choose.dir)
 
 # Core Shiny ecosystem - import everything to avoid issues
 import(shiny)
