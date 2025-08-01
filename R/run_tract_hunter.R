@@ -30,8 +30,42 @@ tract_hunter_seed <- function(tract_list,
       row_num = if_else(!is.na(row_num), row_num, row_number())
     )
 
+  data_merge$continuous <- lapply(data_merge$continuous, function(x) {
+    # If it's scalar 0, replace with integer(0)
+    if (length(x) == 1 && x == 0) return(integer(0))
+    as.integer(x)
+  })
+
+
+
+
+
   nb <- data_merge$continuous
   g  <- igraph::graph_from_adj_list(nb)
+
+  comps <- igraph::components(g)
+  main_component_id <- which.max(comps$csize)
+  main_indices <- which(comps$membership == main_component_id)
+  island_indices <- which(comps$membership != main_component_id)
+
+  coords <- data.frame(
+    INTPTLAT = as.numeric(data_merge$INTPTLAT),
+    INTPTLON = as.numeric(data_merge$INTPTLON)
+  )
+
+  island_component_ids <- setdiff(unique(comps$membership), main_component_id)
+
+  for (island_id in island_component_ids) {
+    island_members <- which(comps$membership == island_id)
+    # For all members of this island component, get distances to all in main
+    combis <- expand.grid(island= island_members, main= main_indices)
+    combis$dist <- sqrt(
+      (coords$INTPTLAT[combis$island] - coords$INTPTLAT[combis$main])^2 +
+        (coords$INTPTLON[combis$island] - coords$INTPTLON[combis$main])^2
+    )
+    closest <- combis[which.min(combis$dist), ]
+    g <- igraph::add_edges(g, c(closest$island, closest$main))
+  }
 
   emp_vec        <- data_merge$tract_ASU_emp
   unemp_vec      <- data_merge$tract_ASU_unemp
@@ -185,7 +219,6 @@ tract_hunter_asu_pass <- function(state, verbose = TRUE) {
   }
 
   find_boundary_path <- function(target_index, asu_indexes) {
-
     current_neighbors <- unlist(nb[target_index])
     found_neighbors <- current_neighbors[current_neighbors %in% asu_indexes]
 
@@ -207,21 +240,33 @@ tract_hunter_asu_pass <- function(state, verbose = TRUE) {
     all_paths <- list()
     for (nbr in found_neighbors) {
       paths_temp <- igraph::k_shortest_paths(g, from = nbr, to = target_index, mode = "out", k = 5)
-      all_paths <- c(all_paths, paths_temp$vpath)
+      # Defensive: add only non-empty paths
+      all_paths <- c(all_paths, Filter(function(x) length(x) > 0, paths_temp$vpath))
+    }
+
+    if (length(all_paths) == 0) {
+      return(NULL)
     }
 
     cands_ur <- c()
     for (path in all_paths) {
       path_ids <- as.numeric(path)
       new_tracts <- setdiff(path_ids, asu_indexes)
+      # Defensive: skip empty new_tracts to avoid sum(numeric(0)) issues
+      if (length(new_tracts) == 0) next
       path_ur <- (sum(unemp_vec[new_tracts]) + asu_unemp) /
         (sum(unemp_vec[new_tracts]) + sum(emp_vec[new_tracts]) + asu_emp + asu_unemp)
       cands_ur <- c(cands_ur, path_ur)
     }
 
-    if (length(cands_ur) == 0) break
+    # Defensive: after filtering, cands_ur may be empty
+    if (length(cands_ur) == 0) {
+      return(NULL)
+    }
 
-    full_path_to_target <- all_paths[[which.max(cands_ur)]]
+    # Select best candidate
+    best_idx <- which.max(cands_ur)
+    full_path_to_target <- all_paths[[best_idx]]
 
     list(
       new_tracts = setdiff(as.numeric(full_path_to_target), asu_indexes),
@@ -230,10 +275,15 @@ tract_hunter_asu_pass <- function(state, verbose = TRUE) {
     )
   }
 
+
   update_tract_data <- function(target_index) {
     all_asu_indexes <- which(!is.na(data_merge$asunum))
 
     path_finder <- find_boundary_path(target_index, asu_indexes = data_merge$row_num[all_asu_indexes])
+    # 1) If no path was found, bail out:
+    if (is.null(path_finder) || length(path_finder$new_tracts) == 0) {
+      return(FALSE)
+    }
     new_indexes  <- path_finder$new_tracts
 
     asu_being_processed <- data_merge$asunum[as.numeric(path_finder$full_path[[1]])]
@@ -253,8 +303,13 @@ tract_hunter_asu_pass <- function(state, verbose = TRUE) {
     remaining_unemp <- sum(unemp_vec[remaining_indexes], na.rm = TRUE)
     remaining_emp   <- sum(emp_vec[remaining_indexes],   na.rm = TRUE)
 
-    new_ur <- (remaining_unemp + total_new_unemp) /
-      (remaining_unemp + total_new_unemp + remaining_emp + total_new_emp)
+    denom <- remaining_unemp + total_new_unemp + remaining_emp + total_new_emp
+    if (denom <= 0) {
+      # no population/labor in either group — can't improve UR
+      return(FALSE)
+    }
+
+    new_ur <- (remaining_unemp + total_new_unemp) / denom
 
     if (new_ur >= ur_thresh) {
       flush.console()
@@ -267,7 +322,6 @@ tract_hunter_asu_pass <- function(state, verbose = TRUE) {
     unemp_buffer    <- total_new_unemp
 
     while (new_ur < ur_thresh) {
-      drop_candidates <- drop_candidates[ unemp_vec[drop_candidates] < unemp_buffer ]
       if (length(drop_candidates) == 0) return(FALSE)
 
       drop_res <- choose_best_drop_candidate(drop_candidates,
@@ -285,8 +339,13 @@ tract_hunter_asu_pass <- function(state, verbose = TRUE) {
 
       if (sum(unemp_vec[dropped_indexes], na.rm = TRUE) > unemp_buffer) return(FALSE)
 
-      new_ur <- (remaining_unemp + total_new_unemp) /
-        (remaining_unemp + total_new_unemp + remaining_emp + total_new_emp)
+      denom <- remaining_unemp + total_new_unemp + remaining_emp + total_new_emp
+      if (denom <= 0) {
+        # no population/labor in either group — can't improve UR
+        return(FALSE)
+      }
+
+      new_ur <- (remaining_unemp + total_new_unemp) /denom
 
       if (new_ur >= ur_thresh) {
         trade_complete <- TRUE
@@ -299,7 +358,6 @@ tract_hunter_asu_pass <- function(state, verbose = TRUE) {
       cut_verts <- if (length(cp) > 0) union_indexes[cp] else integer(0)
       invalid_drop_ids <- c(cut_verts, new_indexes)
       drop_candidates <- setdiff(remaining_indexes, invalid_drop_ids)
-      drop_candidates <- drop_candidates[ unemp_vec[drop_candidates] < unemp_buffer ]
       if (length(drop_candidates) == 0) return(FALSE)
     }
 
@@ -337,7 +395,7 @@ tract_hunter_asu_pass <- function(state, verbose = TRUE) {
 
       if (verbose && (i %% 500L == 1L || i == n_can)) {
         update_status(
-          glue::glue("Targeting: {target_index} | Remaining: {n_can - i} | Unemployed: {unemp_tot}")
+          glue::glue("Remaining: {n_can - i} | Unemployed: {unemp_tot}")
         )
       }
 
