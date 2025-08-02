@@ -96,6 +96,12 @@ run_asu_original <- function(tract_sf, bls_df) {
 # ------------------------------ helpers ------------------------------
 # Convert algorithm output to the shape the dashboard wants
 # R/reshape.R
+#' Reshape algorithm output for the dashboard
+#'
+#' @param all_tr sf object of all tracts
+#' @param asu_sf sf object of ASU tracts
+#' @return A named list used by the dashboard
+#' @export
 reshape_for_dashboard <- function(all_tr, asu_sf) {
   # Drop list-columns and preserve sf structure
   full_tbl <- all_tr %>%

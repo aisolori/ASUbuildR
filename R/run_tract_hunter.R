@@ -7,6 +7,17 @@
 # individually.  `run_tract_hunter()` still executes the full
 # pipeline for backwards compatibility.
 
+#' Initialize Tract Hunter state
+#'
+#' Sets up data structures required by the Tract Hunter algorithm.
+#'
+#' @param tract_list List of tract data with contiguity information
+#' @param bls_df BLS data frame
+#' @param ur_thresh Unemployment rate threshold
+#' @param pop_thresh Population threshold
+#' @param verbose Logical, print progress messages
+#' @return A list representing the algorithm state
+#' @export
 tract_hunter_seed <- function(tract_list,
                               bls_df,
                               ur_thresh  = 0.0645,
@@ -151,7 +162,14 @@ tract_hunter_seed <- function(tract_list,
     pop_thresh      = pop_thresh
   )
 }
-
+#' Combine touching ASU groups
+#'
+#' Internal helper that merges adjacent ASU groups into one.
+#'
+#' @param tract_data Tract data with asunum assignments
+#' @param nb Neighbor list of contiguity
+#' @return Updated tract data with merged groups
+#' @export
 combine_asu_groups_internal <- function(tract_data, nb) {
   assigned <- tract_data %>% filter(!is.na(asunum))
   asu_vec  <- as.integer(tract_data$asunum)
@@ -197,6 +215,14 @@ combine_asu_groups_internal <- function(tract_data, nb) {
   }
 }
 
+#' Execute a single ASU building pass
+#'
+#' Internal helper that grows ASUs until no high unemployment tracts remain.
+#'
+#' @param state Internal state list from `tract_hunter_seed`
+#' @param verbose Logical, print progress messages
+#' @return Updated state list
+#' @export
 tract_hunter_asu_pass <- function(state, verbose = TRUE) {
 
   data_merge <- state$data_merge
@@ -415,11 +441,21 @@ tract_hunter_asu_pass <- function(state, verbose = TRUE) {
   state
 }
 
+#' Merge touching ASU groups and update state
+#'
+#' @param state Internal state list from `tract_hunter_seed`
+#' @return Updated state list
+#' @export
 tract_hunter_combine_groups <- function(state) {
   state$data_merge <- combine_asu_groups_internal(state$data_merge, state$nb)
   state
 }
 
+#' Finalize Tract Hunter results
+#'
+#' @param state Internal state list from `tract_hunter_seed`
+#' @return List of objects for the dashboard
+#' @export
 tract_hunter_finalize <- function(state) {
   data_merge <- state$data_merge
   unemp_vec  <- state$unemp_vec
@@ -456,6 +492,19 @@ tract_hunter_finalize <- function(state) {
   )
 }
 
+#' Execute the Tract Hunter algorithm
+#'
+#' This is a wrapper that runs all stages of the Tract Hunter algorithm
+#' and returns the final results used by the dashboard.
+#'
+#' @param tract_list List of tract data with contiguity information
+#' @param bls_df BLS data frame
+#' @param ur_thresh Unemployment rate threshold
+#' @param pop_thresh Population threshold
+#' @param join_touching Logical, join touching ASUs after first pass
+#' @param verbose Logical, print progress messages
+#' @return A list of results similar to `run_asu_original()`
+#' @export
 run_tract_hunter <- function(tract_list,
                              bls_df,
                              ur_thresh  = 0.0645,

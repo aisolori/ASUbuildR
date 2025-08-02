@@ -21,18 +21,46 @@ library(tidyverse)
 library(readxl)
 library(Rcpp)
 
-#––– Only re-compile when you’re running the app straight from the repo –––#
-# if (interactive()) {
-# 
-#   if (!exists("choose_best_neighbor", mode = "function"))
-#     Rcpp::sourceCpp("src/choose_best_neighbor.cpp")
-# 
-#   if (!exists("build_edges", mode = "function"))
-#     Rcpp::sourceCpp("src/build_edges.cpp")
-# 
-#   if (!exists("choose_best_drop", mode = "function"))
-#     Rcpp::sourceCpp("src/choose_best_drop.cpp")
-# }
+if (!requireNamespace("here", quietly = TRUE))
+  install.packages("here")
+
+## ---- dev-or-installed switch -------------------------------------------
+# 1. Try the *installed* version first
+have_pkg <- requireNamespace("ASUbuildR", quietly = TRUE)
+
+# 2. Decide if we're in a dev checkout:
+#    This is TRUE when *either* the package is not installed
+#    *or* we detect a .git/ folder (meaning "inside a repo").
+in_dev  <- !have_pkg || file.exists(here::here(".git"))
+
+if (have_pkg && !in_dev) {
+  # Installed package is good enough – just load it
+  library(ASUbuildR)
+
+} else {
+  # Development mode  ────────────────
+  # a) Load all R/ code in place (no need to source one file at a time)
+  if (requireNamespace("pkgload", quietly = TRUE)) {
+    pkgload::load_all(here::here())          # brings in R/ and compiled DLLs
+  } else {
+    # fallback: source the key scripts manually
+    source(here::here("R", "run_asu_original.r"))
+    source(here::here("R", "run_tract_hunter.R"))
+  }
+
+  # b) Re-compile the C++ helpers only if the functions aren't already loaded
+  maybe_sourceCpp <- function(fun_name, path) {
+    if (!exists(fun_name, mode = "function") && file.exists(path))
+      Rcpp::sourceCpp(path)
+  }
+
+  maybe_sourceCpp("choose_best_neighbor",
+                  here::here("src", "choose_best_neighbor.cpp"))
+  maybe_sourceCpp("build_edges",
+                  here::here("src", "build_edges.cpp"))
+  maybe_sourceCpp("choose_best_drop",
+                  here::here("src", "choose_best_drop.cpp"))
+}
 
 ## ---- tigris cache ----------------------------------------------------
 ## put cached TIGER/Line ZIPs in a per-user cache folder that is always
@@ -54,12 +82,6 @@ options(tigris_use_cache = TRUE)
 # ---- resolve paths from the project root ----------------------------
 # 'here()' always points at the directory that contains ASUbuildR.Rproj
 # no matter where this .Rmd lives.
-if (!requireNamespace("here", quietly = TRUE))
-  install.packages("here")
-
-library(here)          # <‑‑ add once
-source(here::here("R", "run_asu_original.r"))   # local = FALSE by default
-source(here::here("R", "run_tract_hunter.R"))
 
 # cache every tigris download automatically
 options(
