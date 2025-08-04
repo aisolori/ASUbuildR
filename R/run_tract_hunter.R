@@ -53,7 +53,6 @@ tract_hunter_seed <- function(tract_list,
   comps <- igraph::components(g)
   main_component_id <- which.max(comps$csize)
   main_indices <- which(comps$membership == main_component_id)
-  island_indices <- which(comps$membership != main_component_id)
 
   coords <- data.frame(
     INTPTLAT = as.numeric(data_merge$INTPTLAT),
