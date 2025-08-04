@@ -446,6 +446,72 @@ tract_hunter_combine_groups <- function(state) {
   state
 }
 
+#' Drop ASUs by unemployment-rate quantile
+#'
+#' Removes entire ASU groups whose unemployment rate falls within the top
+#' fraction specified by `quantile`.
+#'
+#' @param state Internal state list from `tract_hunter_seed`
+#' @param quantile Numeric value between 0 and 1 indicating the fraction of
+#'   ASUs to drop (e.g., `0.1` drops the top 10% with the highest unemployment
+#'   rates)
+#' @return Updated state list
+#' @keywords internal
+tract_hunter_dropout <- function(state, quantile = 0) {
+
+  data_merge <- state$data_merge
+  g          <- state$g
+  pop_thresh <- state$pop_thresh
+
+  asu_summary <- data_merge |>
+    dplyr::filter(!is.na(asunum)) |>
+    dplyr::group_by(asunum) |>
+    dplyr::summarise(
+      Unemployment = sum(tract_ASU_unemp, na.rm = TRUE),
+      Employed     = sum(tract_ASU_emp,   na.rm = TRUE),
+      .groups      = "drop"
+    ) |>
+    dplyr::mutate(ur = ifelse(Unemployment + Employed == 0,
+                              0, Unemployment / (Unemployment + Employed)))
+
+  n_asu <- nrow(asu_summary)
+  n_drop <- ceiling(quantile * n_asu)
+
+  if (n_asu > 0 && n_drop > 0) {
+    drop_ids <- asu_summary |>
+      dplyr::arrange(dplyr::desc(ur)) |>
+      dplyr::slice(seq_len(n_drop)) |>
+      dplyr::pull(asunum)
+
+    data_merge$asunum[data_merge$asunum %in% drop_ids] <- NA
+  }
+
+  remaining_asu <- sort(unique(stats::na.omit(data_merge$asunum)))
+
+  valid_components <- list()
+  for (asu in remaining_asu) {
+    asu_vertices <- data_merge$row_num[data_merge$asunum == asu]
+    subg <- igraph::induced_subgraph(g, vids = asu_vertices)
+    comps <- igraph::components(subg)
+    for (comp_id in seq_len(comps$no)) {
+      comp_vertices <- asu_vertices[comps$membership == comp_id]
+      comp_rows <- match(comp_vertices, data_merge$row_num)
+      comp_pop <- sum(data_merge$tract_pop_cur[comp_rows], na.rm = TRUE)
+      if (comp_pop >= pop_thresh) {
+        valid_components[[length(valid_components) + 1]] <- comp_rows
+      }
+    }
+  }
+
+  data_merge$asunum <- NA
+  for (i in seq_along(valid_components)) {
+    data_merge$asunum[valid_components[[i]]] <- i
+  }
+
+  state$data_merge <- data_merge
+  state
+}
+
 #' Finalize Tract Hunter results
 #'
 #' @param state Internal state list from `tract_hunter_seed`
