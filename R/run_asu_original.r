@@ -1,7 +1,7 @@
 # ------------------------------
 # run_asu_original.R
 # ------------------------------
-# Your colleague’s original contiguity‑driven algorithm, wrapped in a single
+# Your colleague's original contiguity‑driven algorithm, wrapped in a single
 # function so the flex‑dashboard (or any other caller) can invoke it.
 #
 # It returns the four objects that the dashboard expects inside a list:
@@ -20,13 +20,13 @@
 #' @param bls_df    Data frame read from the BLS Excel file (column names must
 #'        match the `excel_names` vector in the dashboard).
 #' @return A named list (see details above).
-#' @export
+#' @keywords internal
 run_asu_original <- function(tract_sf, bls_df) {
 
   # ------------------------------------------------------------------
   # 0. merge shapefile & BLS data, then sort by unemployment
   # ------------------------------------------------------------------
-  data_merge <- dplyr::left_join(tract_sf, bls_df, by = "GEOID") %>%
+  data_merge <- dplyr::left_join(tract_sf, bls_df, by = "GEOID") |>
     dplyr::arrange(dplyr::desc(tract_ASU_urate), dplyr::desc(tract_ASU_unemp))
 
   # objects we build along the way
@@ -35,7 +35,7 @@ run_asu_original <- function(tract_sf, bls_df) {
   asunum              <- 1L
 
   # ------------------------------------------------------------------
-  # 1. keep creating ASUs until the highest‑UR unassigned tract < 6.45 %
+  # 1. keep creating ASUs until the highest‑UR unassigned tract < 6.45 %
   # ------------------------------------------------------------------
   while (filtered_data_merge$tract_ASU_urate[1] > 6.45) {
 
@@ -47,19 +47,19 @@ run_asu_original <- function(tract_sf, bls_df) {
 
     # ------------------------------ inner expansion loop -------------
     while (rate > 6.45) {
-      neighbor_list <- combined_area %>%
-        sf::st_drop_geometry() %>%
-        dplyr::pull(continuous) %>% unlist() %>%
+      neighbor_list <- combined_area |>
+        sf::st_drop_geometry() |>
+        dplyr::pull(continuous) |> unlist() |>
         setdiff(existing)
 
-      adjacent <- filtered_data_merge %>% dplyr::filter(row_num %in% neighbor_list)
+      adjacent <- filtered_data_merge |> dplyr::filter(row_num %in% neighbor_list)
       if (nrow(adjacent) == 0) break
 
       if (min(adjacent$tract_ASU_clf) < 1) {
-        next_tract <- adjacent %>% dplyr::filter(tract_ASU_clf < 1) %>% dplyr::slice(1)
+        next_tract <- adjacent |> dplyr::filter(tract_ASU_clf < 1) |> dplyr::slice(1)
       } else {
-        next_tract <- adjacent %>%
-          dplyr::arrange(dplyr::desc(tract_ASU_urate), dplyr::desc(tract_ASU_unemp)) %>%
+        next_tract <- adjacent |>
+          dplyr::arrange(dplyr::desc(tract_ASU_urate), dplyr::desc(tract_ASU_unemp)) |>
           dplyr::slice(1)
       }
 
@@ -68,7 +68,7 @@ run_asu_original <- function(tract_sf, bls_df) {
       combined_area <- dplyr::bind_rows(combined_area, next_tract)
 
       rate <- sum(combined_area$tract_ASU_unemp) /
-              sum(combined_area$tract_ASU_clf) * 100
+        sum(combined_area$tract_ASU_clf) * 100
       existing <- combined_area$row_num
     }
 
@@ -82,8 +82,8 @@ run_asu_original <- function(tract_sf, bls_df) {
 
     asunum              <- asunum + 1L
     assigned_names      <- ASU_assigned$name
-    filtered_data_merge <- data_merge %>%
-      dplyr::filter(!name %in% assigned_names) %>%
+    filtered_data_merge <- data_merge |>
+      dplyr::filter(!name %in% assigned_names) |>
       dplyr::arrange(dplyr::desc(tract_ASU_urate))
   }
 
@@ -96,17 +96,23 @@ run_asu_original <- function(tract_sf, bls_df) {
 # ------------------------------ helpers ------------------------------
 # Convert algorithm output to the shape the dashboard wants
 # R/reshape.R
+#' Reshape algorithm output for the dashboard
+#'
+#' @param all_tr sf object of all tracts
+#' @param asu_sf sf object of ASU tracts
+#' @return A named list used by the dashboard
+#' @keywords internal
 reshape_for_dashboard <- function(all_tr, asu_sf) {
   # Drop list-columns and preserve sf structure
-  full_tbl <- all_tr %>%
+  full_tbl <- all_tr |>
     # Clean join: drop list-columns like `continuous` before join
-    dplyr::select(where(~ !is.list(.))) %>%
-    left_join(
-      asu_sf %>%
-        sf::st_drop_geometry() %>%
+    dplyr::select(dplyr::where(~ !is.list(.))) |>
+    dplyr::left_join(
+      asu_sf |>
+        sf::st_drop_geometry() |>
         dplyr::select(GEOID, asunum),
       by = "GEOID"
-    ) %>%
+    ) |>
     dplyr::mutate(
       asunum = dplyr::coalesce(as.integer(asunum), 0L),
       dplyr::across(c(tract_ASU_clf, tract_pop_cur, tract_ASU_unemp), as.integer)
@@ -117,13 +123,13 @@ reshape_for_dashboard <- function(all_tr, asu_sf) {
     full_tbl <- sf::st_as_sf(full_tbl)
   }
 
-  asu_tbl <- asu_sf %>%
+  asu_tbl <- asu_sf |>
     dplyr::select(GEOID, name, tract_pop_cur,
                   tract_ASU_clf, tract_ASU_unemp, tract_ASU_urate, asunum)
 
-  summary_tbl <- asu_sf %>%
-    sf::st_drop_geometry() %>%
-    dplyr::group_by(asunum) %>%
+  summary_tbl <- asu_sf |>
+    sf::st_drop_geometry() |>
+    dplyr::group_by(asunum) |>
     dplyr::summarise(
       tracts     = dplyr::n(),
       population = sum(tract_pop_cur,   na.rm = TRUE),
@@ -141,5 +147,3 @@ reshape_for_dashboard <- function(all_tr, asu_sf) {
     asu_summary     = summary_tbl
   )
 }
-
-

@@ -11,19 +11,47 @@ editor_options:
 ---
 
 ```{r setup, include=FALSE}
-library(shiny)
-library(flexdashboard)
-library(mapgl)
-library(tigris)
-library(sf)
-library(sfdep)
-library(tidyverse)
-library(readxl)
-library(Rcpp)
+# Figure out full paths to src/ C++ files, going up two levels
+src_cpp_files <- c("choose_best_neighbor.cpp",
+                   "build_edges.cpp",
+                   "choose_best_drop.cpp")
 
-sourceCpp("../../src/choose_best_neighbor.cpp")
-sourceCpp("../../src/build_edges.cpp")
-sourceCpp("../../src/choose_best_drop.cpp")
+src_paths <- normalizePath(file.path("..", "..", "src", src_cpp_files),
+                           winslash = "/", mustWork = FALSE)
+
+# Check that all source files are there
+in_repo <- all(file.exists(src_paths))
+
+maybe_sourceCpp <- function(fun, path) {
+  if (!exists(fun, mode = "function") && file.exists(path)) {
+    message("Compiling ", basename(path))
+    Rcpp::sourceCpp(path)
+  }
+}
+
+if (in_repo) {
+  message("→ Dev mode: compiling C++ helpers from src/")
+  maybe_sourceCpp("choose_best_neighbor", src_paths[1])
+  maybe_sourceCpp("build_edges",          src_paths[2])
+  maybe_sourceCpp("choose_best_drop",     src_paths[3])
+} else {
+  message("→ Installed package mode (shared library already loaded)")
+
+}
+
+# ---- dev mode: source helper functions relative to this file ----------
+is_dev_mode <- file.exists("../../DESCRIPTION") && dir.exists("../../R")
+
+if (is_dev_mode) {
+  message("→ Dev mode: sourcing from ../../R/")
+  r_dir <- normalizePath("../../R", winslash = "/", mustWork = TRUE)
+
+  source(file.path(r_dir, "run_tract_hunter.R"))
+  source(file.path(r_dir, "run_asu_original.r"))
+} else {
+  message("→ Installed package mode: functions should already be available")
+}
+
 
 ## ---- tigris cache ----------------------------------------------------
 ## put cached TIGER/Line ZIPs in a per-user cache folder that is always
@@ -32,7 +60,7 @@ sourceCpp("../../src/choose_best_drop.cpp")
 # 1. choose a sensible user-cache path (rappdirs works everywhere)
 cache_dir <- rappdirs::user_cache_dir("ASUbuildR", "tigris")
 
-# 2. create it if it doesn’t exist
+# 2. create it if it doesn't exist
 if (!dir.exists(cache_dir))
   dir.create(cache_dir, recursive = TRUE, showWarnings = FALSE)
 
@@ -42,15 +70,6 @@ options(tigris_cache_dir = cache_dir)
 # tell tigris to look there first before re‑downloading
 options(tigris_use_cache = TRUE)
 
-# ---- resolve paths from the project root ----------------------------
-# 'here()' always points at the directory that contains ASUbuildR.Rproj
-# no matter where this .Rmd lives.
-if (!requireNamespace("here", quietly = TRUE))
-  install.packages("here")
-
-library(here)          # <‑‑ add once
-source(here::here("R", "run_asu_original.r"))   # local = FALSE by default
-source(here::here("R", "run_tract_hunter.R"))
 
 # cache every tigris download automatically
 options(
@@ -58,37 +77,31 @@ options(
   tigris_class     = "sf"                  # always return sf objects
 )
 
-
-
 options(shiny.maxRequestSize = 50 * 1024^2)  # Set to 50MB or your desired limit
 
 # Initialize reactive values
-uploaded_data <- reactiveVal(NULL)
-state <- reactiveVal(NULL)
-tract_year <- reactiveVal(NULL)
-tract_data <- reactiveVal(NULL)
-asu_data <- reactiveVal(NULL)
-asu_tracts <- reactiveVal(NULL)
-asu_summary <- reactiveVal(NULL)
-full_data <- reactiveVal(NULL)
-full_data_reset <- reactiveVal()
-selected_tracts <- reactiveVal(NULL)
-edit_table <- reactiveVal(NULL)
-edit_summary <- reactiveVal(NULL)
-current_selection <- reactiveVal(NULL)
+uploaded_data <- shiny::reactiveVal(NULL)
+state <- shiny::reactiveVal(NULL)
+tract_year <- shiny::reactiveVal(NULL)
+tract_data <- shiny::reactiveVal(NULL)
+asu_data <- shiny::reactiveVal(NULL)
+asu_tracts <- shiny::reactiveVal(NULL)
+asu_summary <- shiny::reactiveVal(NULL)
+full_data <- shiny::reactiveVal(NULL)
+full_data_reset <- shiny::reactiveVal()
+selected_tracts <- shiny::reactiveVal(NULL)
+edit_table <- shiny::reactiveVal(NULL)
+edit_summary <- shiny::reactiveVal(NULL)
+current_selection <- shiny::reactiveVal(NULL)
 
 # Tract Hunter staged state -----------------------------------------
-th_state <- reactiveVal(NULL)
-th_tract_list <- reactiveVal(NULL)
-th_bls_df <- reactiveVal(NULL)
+th_state <- shiny::reactiveVal(NULL)
+th_tract_list <- shiny::reactiveVal(NULL)
+th_bls_df <- shiny::reactiveVal(NULL)
 
-map_data_dbg <- reactiveVal(NULL)   # container
+map_data_dbg <- shiny::reactiveVal(NULL)   # container
 
-highlighted_tracts <- reactiveVal(character(0))
-
-
-
-
+highlighted_tracts <- shiny::reactiveVal(character(0))
 
 # Load static data
 excel_names <- c("record",
@@ -119,8 +132,6 @@ excel_names <- c("record",
                  "tract_ASU_emp",
                  "tract_ASU_unemp",
                  "tract_ASU_urate")
-
-
 ```
 
 # Data Initialization
@@ -136,27 +147,24 @@ Once the file is loaded, a preview of the data will appear on the right, the sta
 Note: at this time, ASUbuildR assumes a state is using county-based census tracts.  If a state uses another geography such as NECTAs as the basis for its ASU tract file, this process will require some modification.
 
 ```{r}
-fileInput("file", "Choose Excel File", accept = c(".xls", ".xlsx"))
+shiny::fileInput("file", "Choose Excel File", accept = c(".xls", ".xlsx"))
 
-textOutput("selected_state")
+shiny::textOutput("selected_state")
 
-textOutput("selected_year")
-
-
+shiny::textOutput("selected_year")
 ```
 
 ## Output {data-width="850"}
 
 ```{r}
+shiny::tableOutput("data_preview")
 
-tableOutput("data_preview")
-
-observeEvent(input$file, {
-  req(input$file)
-  df <- read_excel(input$file$datapath, range = "A2:AB25000", col_names = excel_names) %>%
-    filter(!is.na(geoid)) %>%
-    mutate(GEOID = str_remove(geoid, "14000US")) %>%
-    select(GEOID,
+shiny::observeEvent(input$file, {
+  shiny::req(input$file)
+  df <- readxl::read_excel(input$file$datapath, range = "A2:AB25000", col_names = excel_names) |>
+    dplyr::filter(!is.na(geoid)) |>
+    dplyr::mutate(GEOID = stringr::str_remove(geoid, "14000US")) |>
+    dplyr::select(GEOID,
            st_fips,
            cnty_fips,
            tract_fips,
@@ -169,42 +177,37 @@ observeEvent(input$file, {
   
   uploaded_data(df)
   
-  uploaded_data() %>%
-    pull(st_fips) %>%
-    unique() %>%
+  uploaded_data() |>
+    dplyr::pull(st_fips) |>
+    unique() |>
     state()
   
-  read_excel(input$file$datapath, range = "H1:H1", col_names = "year") %>%
-    pull(year) %>%
-    str_remove("tract_pop") %>%
+  readxl::read_excel(input$file$datapath, range = "H1:H1", col_names = "year") |>
+    dplyr::pull(year) |>
+    stringr::str_remove("tract_pop") |>
     tract_year()
   
-  output$data_preview <- renderTable({
+  output$data_preview <- shiny::renderTable({
     head(uploaded_data(),50)
-    
   })
   
-  output$selected_state <- renderText({
+  output$selected_state <- shiny::renderText({
     paste0("Selected FIPS is: ", state())
   })
   
-    output$selected_year <- renderText({
+  output$selected_year <- shiny::renderText({
     paste0("Tract Population Year is: ", tract_year())
   })
-  
 })
-
-
 ```
 
 # Load Initial ASU
 
 ## Controls {data-width="200"}
 
-
 ```{r}
 # ---- algorithm picker -------------------------------------------------
-radioButtons(
+shiny::radioButtons(
   inputId = "asu_algo",
   label   = "Choose algorithm",
   choices = c("Original"      = "orig",
@@ -213,9 +216,9 @@ radioButtons(
 )
 
 # -----------------------------------------------------------------------
-# main “Run” button (always visible)
-div(style = "margin-top: 0.5rem;",
-    actionButton(
+# main "Run" button (always visible)
+shiny::div(style = "margin-top: 0.5rem;",
+    shiny::actionButton(
       inputId = "process",
       label   = "Load tracts & initialise",
       class   = "btn-primary"
@@ -224,25 +227,25 @@ div(style = "margin-top: 0.5rem;",
 
 # -----------------------------------------------------------------------
 # extra Tract-Hunter controls (only when algo == 'mine')
-conditionalPanel(
+shiny::conditionalPanel(
   condition = "input.asu_algo === 'mine'",
-  tagList(
-    hr(style = "margin: 0.8rem 0;"),
-    div(
+  shiny::tagList(
+    shiny::hr(style = "margin: 0.8rem 0;"),
+    shiny::div(
       class = "btn-group",           # keep them on one line
       style = "width: 100%;",
-      actionButton("th_pass",    "Run Hunter",     class = "btn-secondary"),
-      actionButton("th_combine", "Combine Groups",   class = "btn-secondary")
+      shiny::actionButton("th_pass",    "Run Hunter",     class = "btn-secondary"),
+      shiny::actionButton("th_combine", "Combine Groups",   class = "btn-secondary")
     )
   )
 )
 
 # ---- dynamic algorithm description -----------------------------------
-output$algo_blurb <- renderUI({
+output$algo_blurb <- shiny::renderUI({
 
   if (is.null(input$asu_algo) || input$asu_algo == "orig") {
     ## ───────── ORIGINAL METHOD ─────────
-    HTML(
+    shiny::HTML(
       "<p>
         This button will launch two processes, which will take up to 5&nbsp;minutes
         to complete. For smaller states, it may take under 15&nbsp;seconds.
@@ -268,7 +271,7 @@ output$algo_blurb <- renderUI({
 
   } else {
     ## ───────── TRACT-HUNTER METHOD ─────────
-    HTML(
+    shiny::HTML(
       "<p><strong>Tract Hunter pipeline</strong></p>
        <p>Because Tract Hunter works in stages, the interface exposes those
           stages as separate buttons:</p>
@@ -293,47 +296,42 @@ output$algo_blurb <- renderUI({
   }
 })
 
+shiny::uiOutput("algo_blurb")
 
-uiOutput("algo_blurb")
+shiny::htmlOutput("total_unemp")
+shiny::tableOutput("asu")
 
-
-htmlOutput("total_unemp")
-tableOutput("asu")
-
-
-
-observeEvent(input$process, {
-
+shiny::observeEvent(input$process, {
   
   ## 0 · Basic checks ----------------------------------------------------
-  req(uploaded_data(), state(), tract_year())
+  shiny::req(uploaded_data(), state(), tract_year())
 
   ## 1 · Wrap the whole long job in withProgress -------------------------
-  withProgress(message = "Running ASU initialisation…", value = 0, {
+  shiny::withProgress(message = "Running ASU initialisation…", value = 0, {
 
     ## 1a · Build tracts + neighbours (can take ~10–60 s the first time)
-    incProgress(0.10, detail = "Downloading Census shapefiles…")
-    tract_list <- tracts(state = state(), year = tract_year()) |>
-      mutate(
-        row_num    = row_number(),
-        continuous = st_contiguity(geometry)
+    shiny::incProgress(0.10, detail = "Downloading Census shapefiles…")
+    tract_list <- tigris::tracts(state = state(), year = tract_year()) |>
+      dplyr::mutate(
+        row_num    = dplyr::row_number(),
+        continuous = sfdep::st_contiguity(geometry)
       )
 
     ## 1b · Merge the BLS data
-    incProgress(0.05, detail = "Merging BLS unemployment data…")
+    shiny::incProgress(0.05, detail = "Merging BLS unemployment data…")
     data_merge <- tract_list |>
-      left_join(uploaded_data(), by = "GEOID")
+      dplyr::left_join(uploaded_data(), by = "GEOID")
 
     # 2 · Run the chosen ASU algorithm ---------------------------------
-    algo_choice <- isolate(input$asu_algo %||% "orig")
+    algo_choice <- shiny::isolate(input$asu_algo %||% "orig")
     
     join_flag <- isTRUE(input$join_touching)   # ← keep the flag you already built
     
-    incProgress(0.05, detail = "Finding initial ASU seeds…")
+    shiny::incProgress(0.05, detail = "Finding initial ASU seeds…")
     if (algo_choice == "orig") {
       res <- run_asu_original(tract_list, uploaded_data())
     } else {
-      withProgress(message = "Seeding & expanding…", value = 0, {
+      shiny::withProgress(message = "Seeding & expanding…", value = 0, {
         th_tract_list(tract_list)
         th_bls_df(uploaded_data())
         st <- tract_hunter_seed(th_tract_list(), th_bls_df(), verbose = TRUE)})
@@ -341,9 +339,8 @@ observeEvent(input$process, {
       res <- tract_hunter_finalize(st)
     }
 
-
     ## 3 · Finish the bar
-    incProgress(1, detail = "Finishing up…")
+    shiny::incProgress(1, detail = "Finishing up…")
   })  # ---- withProgress ends here  -------------------------------------
 
   ## 4 · Store results & draw map  --------------------------------------
@@ -352,13 +349,13 @@ observeEvent(input$process, {
     asu_data(res$asu_data    )   ; asu_tracts(res$asu_tracts)
     asu_summary(res$asu_summary) ; map_data_dbg(res$full_data)
 
-    output$asu <- renderTable( asu_summary(),digits = 3 )
+    output$asu <- shiny::renderTable( asu_summary(),digits = 3 )
 
     ## 5. (Re‑)draw the first map ----------------------------------
 
-  output$initial_map <- renderMaplibre({
+  output$initial_map <- mapgl::renderMaplibre({
 
-    req(full_data())
+    shiny::req(full_data())
     map_data <- full_data()
 
     # ---- 6·1 geometry housekeeping ----------------------------------
@@ -372,8 +369,8 @@ observeEvent(input$process, {
 
     if (nrow(map_data) == 0) {
       return(
-        maplibre(style = carto_style("positron")) |>
-        add_control("No valid polygon geometry to display.", "top-left")
+        mapgl::maplibre(style = mapgl::carto_style("positron")) |>
+        mapgl::add_control("No valid polygon geometry to display.", "top-left")
       )
     }
 
@@ -392,7 +389,7 @@ observeEvent(input$process, {
 
   } else if (n_asu == 1) {
     list(
-      fill  = step_expr(column="asunum",
+      fill  = mapgl::step_expr(column="asunum",
                         base="#808080",
                         stops="#7FC97F",
                         values=1,
@@ -411,7 +408,7 @@ observeEvent(input$process, {
     breaks <- seq(1 + n_asu / n_cat, n_asu, length.out = n_cat - 1)
 
     list(
-      fill = step_expr(column   = "asunum",
+      fill = mapgl::step_expr(column   = "asunum",
                        base     = pal[1],
                        stops    = pal[-1],
                        values   = breaks,
@@ -425,27 +422,27 @@ observeEvent(input$process, {
     pal <- palette_logic(n_asu)
 
     # ---- 6·3 build map ----------------------------------------------
-    maplibre(style = carto_style("positron")) |>
-      fit_bounds(map_data, animate = FALSE) |>
-      add_fill_layer(
+    mapgl::maplibre(style = mapgl::carto_style("positron")) |>
+      mapgl::fit_bounds(map_data, animate = FALSE) |>
+      mapgl::add_fill_layer(
         id                 = "basemap",
         source             = map_data,
         fill_color         = pal$fill,
         fill_opacity       = 0.5,
         fill_outline_color = "black",
-        tooltip = concat(
-          "<strong>ASU Number: </strong>", get_column("asunum"), "<br>",
-          "<strong>Tract GEOID: </strong>", get_column("GEOID"),  "<br>",
+        tooltip = mapgl::concat(
+          "<strong>ASU Number: </strong>", mapgl::get_column("asunum"), "<br>",
+          "<strong>Tract GEOID: </strong>", mapgl::get_column("GEOID"),  "<br>",
           "<strong>UR: </strong>",
-          number_format(get_column("tract_ASU_urate"),
+          mapgl::number_format(mapgl::get_column("tract_ASU_urate"),
                         style = "decimal", maximum_fraction_digits = 2),
           "%<br>",
           "<strong>Unemp: </strong>",
-          number_format(get_column("tract_ASU_unemp"),
+          mapgl::number_format(mapgl::get_column("tract_ASU_unemp"),
                         style = "decimal", maximum_fraction_digits = 0), "<br>"
         )
       ) |>
-      add_legend(
+      mapgl::add_legend(
         "ASU Number",
         values = pal$legend_vals,
         colors = pal$legend_cols,
@@ -457,9 +454,9 @@ observeEvent(input$process, {
 
 })  # ---- end observeEvent -------------------------------------------------
 
-observeEvent(input$th_pass, {
-  req(th_state())
-  withProgress(message = "Running ASU pass…", value = 0, {
+shiny::observeEvent(input$th_pass, {
+  shiny::req(th_state())
+  shiny::withProgress(message = "Running ASU pass…", value = 0, {
     st <- tract_hunter_asu_pass(th_state(), verbose = TRUE)
   })
   th_state(st)
@@ -467,10 +464,10 @@ observeEvent(input$th_pass, {
   full_data(res$full_data  )   ; full_data_reset(res$full_data_reset)
   asu_data(res$asu_data    )   ; asu_tracts(res$asu_tracts)
   asu_summary(res$asu_summary) ; map_data_dbg(res$full_data)
-  output$asu <- renderTable( asu_summary(),digits = 3 )
-  maplibre_proxy("initial_map") %>% clear_layer("basemap")
-  output$initial_map <- renderMaplibre({
-    req(full_data())
+  output$asu <- shiny::renderTable( asu_summary(),digits = 3 )
+  mapgl::maplibre_proxy("initial_map") |> mapgl::clear_layer("basemap")
+  output$initial_map <- mapgl::renderMaplibre({
+    shiny::req(full_data())
     map_data <- full_data()
     map_data <- map_data |>
       sf::st_make_valid() |>
@@ -481,8 +478,8 @@ observeEvent(input$th_pass, {
       dplyr::select(-geom_type)
     if (nrow(map_data) == 0) {
       return(
-        maplibre(style = carto_style("positron")) |>
-        add_control("No valid polygon geometry to display.", "top-left")
+        mapgl::maplibre(style = mapgl::carto_style("positron")) |>
+        mapgl::add_control("No valid polygon geometry to display.", "top-left")
       )
     }
     map_data <- map_data |>
@@ -498,7 +495,7 @@ observeEvent(input$th_pass, {
 
   } else if (n_asu == 1) {
     list(
-      fill  = step_expr(column="asunum",
+      fill  = mapgl::step_expr(column="asunum",
                         base="#808080",
                         stops="#7FC97F",
                         values=1,
@@ -517,7 +514,7 @@ observeEvent(input$th_pass, {
     breaks <- seq(1 + n_asu / n_cat, n_asu, length.out = n_cat - 1)
 
     list(
-      fill = step_expr(column   = "asunum",
+      fill = mapgl::step_expr(column   = "asunum",
                        base     = pal[1],
                        stops    = pal[-1],
                        values   = breaks,
@@ -529,9 +526,9 @@ observeEvent(input$th_pass, {
 }
     
     pal <- palette_logic(n_asu)
-    maplibre(style = carto_style("positron")) |>
-      fit_bounds(map_data, animate = FALSE) |>
-      add_fill_layer(
+    mapgl::maplibre(style = mapgl::carto_style("positron")) |>
+      mapgl::fit_bounds(map_data, animate = FALSE) |>
+      mapgl::add_fill_layer(
         id                 = "basemap",
         source             = map_data,
         fill_color         = pal$fill,
@@ -541,9 +538,9 @@ observeEvent(input$th_pass, {
   })
 })
 
-observeEvent(input$th_combine, {
-  req(th_state())
-  withProgress(message = "Combining ASUs…", value = 0, {
+shiny::observeEvent(input$th_combine, {
+  shiny::req(th_state())
+  shiny::withProgress(message = "Combining ASUs…", value = 0, {
     st <- tract_hunter_combine_groups(th_state())
   })
   th_state(st)
@@ -551,10 +548,10 @@ observeEvent(input$th_combine, {
   full_data(res$full_data  )   ; full_data_reset(res$full_data_reset)
   asu_data(res$asu_data    )   ; asu_tracts(res$asu_tracts)
   asu_summary(res$asu_summary) ; map_data_dbg(res$full_data)
-  output$asu <- renderTable( asu_summary(),digits = 3 )
-  maplibre_proxy("initial_map") %>% clear_layer("basemap")
-  output$initial_map <- renderMaplibre({
-    req(full_data())
+  output$asu <- shiny::renderTable( asu_summary(),digits = 3 )
+  mapgl::maplibre_proxy("initial_map") |> mapgl::clear_layer("basemap")
+  output$initial_map <- mapgl::renderMaplibre({
+    shiny::req(full_data())
     map_data <- full_data()
     map_data <- map_data |>
       sf::st_make_valid() |>
@@ -565,8 +562,8 @@ observeEvent(input$th_combine, {
       dplyr::select(-geom_type)
     if (nrow(map_data) == 0) {
       return(
-        maplibre(style = carto_style("positron")) |>
-        add_control("No valid polygon geometry to display.", "top-left")
+        mapgl::maplibre(style = mapgl::carto_style("positron")) |>
+        mapgl::add_control("No valid polygon geometry to display.", "top-left")
       )
     }
     map_data <- map_data |>
@@ -582,7 +579,7 @@ observeEvent(input$th_combine, {
 
   } else if (n_asu == 1) {
     list(
-      fill  = step_expr(column="asunum",
+      fill  = mapgl::step_expr(column="asunum",
                         base="#808080",
                         stops="#7FC97F",
                         values=1,
@@ -601,7 +598,7 @@ observeEvent(input$th_combine, {
     breaks <- seq(1 + n_asu / n_cat, n_asu, length.out = n_cat - 1)
 
     list(
-      fill = step_expr(column   = "asunum",
+      fill = mapgl::step_expr(column   = "asunum",
                        base     = pal[1],
                        stops    = pal[-1],
                        values   = breaks,
@@ -613,9 +610,9 @@ observeEvent(input$th_combine, {
 }
     
     pal <- palette_logic(n_asu)
-    maplibre(style = carto_style("positron")) |>
-      fit_bounds(map_data, animate = FALSE) |>
-      add_fill_layer(
+    mapgl::maplibre(style = mapgl::carto_style("positron")) |>
+      mapgl::fit_bounds(map_data, animate = FALSE) |>
+      mapgl::add_fill_layer(
         id                 = "basemap",
         source             = map_data,
         fill_color         = pal$fill,
@@ -626,28 +623,26 @@ observeEvent(input$th_combine, {
 })
 
 #-------Total Unemployment Box --------------------------------
-total_unemp <- reactive({
-  req(full_data())                                  # wait until available
+total_unemp <- shiny::reactive({
+  shiny::req(full_data())                                  # wait until available
   full_data() |>
     dplyr::filter(asunum > 0) |>
     dplyr::summarise(unemp = sum(tract_ASU_unemp, na.rm = TRUE)) |>
     dplyr::pull(unemp)
 })
 
-output$total_unemp <- renderUI({
-  HTML(
+output$total_unemp <- shiny::renderUI({
+  shiny::HTML(
     paste0("<strong>Total Unemployment in ASUs:</strong> ",
            scales::comma(total_unemp()))
   )
 })
-
 ```
 
 ## Output {data-width="800"}
 
 ```{r}
-maplibreOutput("initial_map", height = "100vh")
-
+mapgl::maplibreOutput("initial_map", height = "100vh")
 ```
 
 # Modify ASU Selections
@@ -658,84 +653,64 @@ These tools allow you to select, inspect, and change ASU designations for indivi
 
 ```{r}
 # Select an ASU
-asu_selection_ui <- reactive({
-  selectInput("select_asunum", "Select ASU Number:",
+asu_selection_ui <- shiny::reactive({
+  shiny::selectInput("select_asunum", "Select ASU Number:",
               choices = c("None", asu_choices()),
               selected = "None")
 })
-renderUI(asu_selection_ui())
-renderUI(HTML("<hr>"))
+shiny::renderUI(asu_selection_ui())
+shiny::renderUI(shiny::HTML("<hr>"))
 
 # Change ASU
-numericInput("new_asu", "Change ASU Value:", value = 0, min = 0)
-actionButton("update", "Update Selected Tracts")
-renderUI(HTML("<hr>"))
+shiny::numericInput("new_asu", "Change ASU Value:", value = 0, min = 0)
+shiny::actionButton("update", "Update Selected Tracts")
+shiny::renderUI(shiny::HTML("<hr>"))
 
 # Clear Selected Tracts
-actionButton("clear", "Clear Selected Tracts")
-renderUI(HTML("<hr>"))
+shiny::actionButton("clear", "Clear Selected Tracts")
+shiny::renderUI(shiny::HTML("<hr>"))
 
 # Show Data for Selection
-actionButton("preview", "Show Data for Selected Tracts")
-asu_choices <- reactive({
-  req(full_data())                     # only run after full_data exists
-  full_data() |> pull(asunum) |> unique() |> sort()
+shiny::actionButton("preview", "Show Data for Selected Tracts")
+asu_choices <- shiny::reactive({
+  shiny::req(full_data())                     # only run after full_data exists
+  full_data() |> dplyr::pull(asunum) |> unique() |> sort()
 })
 
-renderUI(HTML("<hr>"))
-
+shiny::renderUI(shiny::HTML("<hr>"))
 
 # Show Lowest UR Tracts in Selection
-selectInput("unemployment_filter", 
+shiny::selectInput("unemployment_filter", 
              "Highlight selected tracts with:",
              choices = list("Low unemployment" = "low", 
                            "High unemployment" = "high"),
              selected = "low")
-numericInput("percentile", "Percentile Threshold:", value = 5, min = 1, max = 100, step = 1)
-actionButton("filter_percentile", "Highlight Tracts")
-actionButton("clear_percentile", "Clear Highlights")
-renderUI(HTML("<hr>"))
+shiny::numericInput("percentile", "Percentile Threshold:", value = 5, min = 1, max = 100, step = 1)
+shiny::actionButton("filter_percentile", "Highlight Tracts")
+shiny::actionButton("clear_percentile", "Clear Highlights")
+shiny::renderUI(shiny::HTML("<hr>"))
 
 # Single GROID Selection
-textInput("manual_geoid", "Enter a GEOID:", placeholder = "32031990000")
-actionButton("select_geoid", "Select a Single Tract")
-renderUI(HTML("<hr>"))
+shiny::textInput("manual_geoid", "Enter a GEOID:", placeholder = "32031990000")
+shiny::actionButton("select_geoid", "Select a Single Tract")
+shiny::renderUI(shiny::HTML("<hr>"))
 
 # Reset to Initial Load
-actionButton("reset", "Reset to Initial Data")
-
-
-
-### Need to add new inputs / outputs
-# Add table of currently selected tracts
-# ensure basemap includes all tracts, not just those with an ASU assigned
-
-
+shiny::actionButton("reset", "Reset to Initial Data")
 ```
 
 ## Output {data-width="850"}
 
 ```{r}
+mapgl::maplibreOutput("edit_map", height = "90vh")
 
-# 
-# edit_table <- reactiveVal(data.frame(GEOID = character(),
-#                                      tract_pop_cur = numeric(),
-#                                      tract_ASU_clf = numeric(),
-#                                      tract_ASU_unemp = numeric(),
-#                                      tract_ASU_urate = numeric(),
-#                                      stringsAsFactors = FALSE))
+shiny::tableOutput("selection_data")
 
-maplibreOutput("edit_map", height = "90vh")
+shiny::tableOutput("selection_summary")
 
-tableOutput("selection_data")
-
-tableOutput("selection_summary")
-
-
-
-output$edit_map <- renderMaplibre({
+output$edit_map <- mapgl::renderMaplibre({
   
-  req(full_data())
+  shiny::req(full_data())
   
   number_asus <- max(full_data()$asunum)
   number_categories <- min(c(number_asus, 8))
@@ -755,12 +730,12 @@ output$edit_map <- renderMaplibre({
     brewer_pal <- full_brewer_pal[1:number_categories]  # Take only what we need
   }
 
-  maplibre(style = carto_style("positron")) |>
-    fit_bounds(full_data(), animate = FALSE) |> 
-    add_fill_layer(
+  mapgl::maplibre(style = mapgl::carto_style("positron")) |>
+    mapgl::fit_bounds(full_data(), animate = FALSE) |> 
+    mapgl::add_fill_layer(
       id = "basemap",
       source = full_data(),
-      fill_color = step_expr(
+      fill_color = mapgl::step_expr(
         column = "asunum",
         base = "#808080",  # Grey for asunum == 0 (and anything < first break)
         stops = brewer_pal,
@@ -769,18 +744,18 @@ output$edit_map <- renderMaplibre({
       ),
       fill_opacity = 0.5,
       fill_outline_color = "black",
-      tooltip = concat(
-        "<strong>ASU Number: </strong>",get_column("asunum"), "<br>",
-        "<strong>Tract GEOID: </strong>",get_column("GEOID"),"<br>",
-        "<strong>Tract Population: </strong>",number_format(get_column("tract_pop_cur"), style = "decimal", maximum_fraction_digits = 0),"<br>",
-                "<strong>Tract Labor Force: </strong>",number_format(get_column("tract_ASU_clf"), style = "decimal", maximum_fraction_digits = 0),"<br>",
-        "<strong>Tract Unemployment Rate: </strong>",number_format(get_column("tract_ASU_urate"), style = "decimal", maximum_fraction_digits = 2),"%<br>",
-        "<strong>Tract Unemployment: </strong>",number_format(get_column("tract_ASU_unemp"), style = "decimal", maximum_fraction_digits = 0),"<br>")
+      tooltip = mapgl::concat(
+        "<strong>ASU Number: </strong>",mapgl::get_column("asunum"), "<br>",
+        "<strong>Tract GEOID: </strong>",mapgl::get_column("GEOID"),"<br>",
+        "<strong>Tract Population: </strong>",mapgl::number_format(mapgl::get_column("tract_pop_cur"), style = "decimal", maximum_fraction_digits = 0),"<br>",
+                "<strong>Tract Labor Force: </strong>",mapgl::number_format(mapgl::get_column("tract_ASU_clf"), style = "decimal", maximum_fraction_digits = 0),"<br>",
+        "<strong>Tract Unemployment Rate: </strong>",mapgl::number_format(mapgl::get_column("tract_ASU_urate"), style = "decimal", maximum_fraction_digits = 2),"%<br>",
+        "<strong>Tract Unemployment: </strong>",mapgl::number_format(mapgl::get_column("tract_ASU_unemp"), style = "decimal", maximum_fraction_digits = 0),"<br>")
     )
 })
 
 # Select or Unselect tracts on click
-observeEvent(input$edit_map_feature_click, {
+shiny::observeEvent(input$edit_map_feature_click, {
   click <- input$edit_map_feature_click
   current_selection <- selected_tracts()
   
@@ -805,9 +780,9 @@ observeEvent(input$edit_map_feature_click, {
   if (length(current_selection) > 0) {
     selected_data <- subset(full_data(), GEOID %in% selected_tracts())
     
-    maplibre_proxy("edit_map") %>%
-      clear_layer("selected") %>%
-      add_line_layer(
+    mapgl::maplibre_proxy("edit_map") |>
+      mapgl::clear_layer("selected") |>
+      mapgl::add_line_layer(
         id = "selected",
         source = selected_data,
         line_color = "red",
@@ -816,43 +791,43 @@ observeEvent(input$edit_map_feature_click, {
       )
   } else {
     # Clear the selection layer if no tracts are selected
-    maplibre_proxy("edit_map") %>%
-      clear_layer("selected")
+    mapgl::maplibre_proxy("edit_map") |>
+      mapgl::clear_layer("selected")
   }
   
   # Update the selection table
-  output$selection_table <- renderTable({
+  output$selection_table <- shiny::renderTable({
     selected_tracts()
   }, digits = 3)
 })
 
 # Clear Selected Tracts on Button Click
-observeEvent(input$clear, {
+shiny::observeEvent(input$clear, {
   
   selected_tracts(NULL)
   
   # Update the map highlighting
-    maplibre_proxy("edit_map") %>%
-      clear_layer("selected")
+    mapgl::maplibre_proxy("edit_map") |>
+      mapgl::clear_layer("selected")
     return()
 })
 
 # Select tracts in an ASU from dropdown
-observeEvent(input$select_asunum, {
-  req(full_data())
+shiny::observeEvent(input$select_asunum, {
+  shiny::req(full_data())
   
   # Skip if "None" is selected
   if (input$select_asunum == "None") {
     selected_tracts(NULL)
-    maplibre_proxy("edit_map") %>%
-      clear_layer("selected")
+    mapgl::maplibre_proxy("edit_map") |>
+      mapgl::clear_layer("selected")
     return()
   }
   
   # Get all tracts with the selected ASU number
-  selected_tract_ids <- full_data() %>%
-    filter(asunum == as.numeric(input$select_asunum)) %>%
-    pull(GEOID)
+  selected_tract_ids <- full_data() |>
+    dplyr::filter(asunum == as.numeric(input$select_asunum)) |>
+    dplyr::pull(GEOID)
   
   # Update the selected_tracts reactive value
   selected_tracts(selected_tract_ids)
@@ -861,154 +836,138 @@ observeEvent(input$select_asunum, {
   selected_data <- subset(full_data(), GEOID %in% selected_tract_ids)
   
   # Highlight the selected tracts on the map using maplibre proxy
-  maplibre_proxy("edit_map") %>%
-    clear_layer("selected") %>%
-    add_line_layer(
+  mapgl::maplibre_proxy("edit_map") |>
+    mapgl::clear_layer("selected") |>
+    mapgl::add_line_layer(
       id = "selected",
       source = selected_data,
       line_color = "red",
       line_width = 3,
       line_opacity = 1
     ) |> 
-    fit_bounds(selected_data, animate = TRUE)
+    mapgl::fit_bounds(selected_data, animate = TRUE)
 })
 
 # Select a single tract given a GEOID
-observeEvent(input$select_geoid, {
-  req(full_data())
+shiny::observeEvent(input$select_geoid, {
+  shiny::req(full_data())
   
   # Get the selected tract's data
-  selected_tract <- full_data() %>%
-    filter(GEOID == input$manual_geoid)
+  selected_tract <- full_data() |>
+    dplyr::filter(GEOID == input$manual_geoid)
   
   # If the tract exists, highlight it and fit bounds
   if (nrow(selected_tract) > 0) {
     # Highlight the selected tract on the map using maplibre proxy
-    maplibre_proxy("edit_map") %>%
-      clear_layer("selected") %>%
-      add_line_layer(
+    mapgl::maplibre_proxy("edit_map") |>
+      mapgl::clear_layer("selected") |>
+      mapgl::add_line_layer(
         id = "selected",
         source = selected_tract,
         line_color = "red",
         line_width = 3,
         line_opacity = 1
-      ) %>%
-      fit_bounds(selected_tract, animate = TRUE)
+      ) |>
+      mapgl::fit_bounds(selected_tract, animate = TRUE)
     
     # Update the selected_tracts reactive value
     selected_tracts(selected_tract$GEOID)
   }
 })
 
-
-
 # Create a reactive expression that handles the filtering logic
-filtered_tracts <- reactive({
-  req(input$percentile, input$unemployment_filter, full_data(), selected_tracts())
+filtered_tracts <- shiny::reactive({
+  shiny::req(input$percentile, input$unemployment_filter, full_data(), selected_tracts())
   
-  # selected_data <- full_data() %>%
-  #   filter(GEOID %in% selected_tracts())
-  
-  potential_lighlights <- full_data() %>%
-    filter(GEOID %in% selected_tracts(),
+  potential_lighlights <- full_data() |>
+    dplyr::filter(GEOID %in% selected_tracts(),
            tract_pop_cur > 0)
-  
-  #threshold <- quantile(potential_lighlights$tract_ASU_urate, input$percentile/100)
   
   if (input$unemployment_filter == "low") {
     
-    threshold <- quantile(potential_lighlights$tract_ASU_urate, input$percentile/100)
+    threshold <- stats::quantile(potential_lighlights$tract_ASU_urate, input$percentile/100)
     
-    filtered_selected <- potential_lighlights %>%
-      filter(tract_ASU_urate <= threshold,
-             tract_ASU_urate > 0) %>%
-      pull(GEOID)
+    filtered_selected <- potential_lighlights |>
+      dplyr::filter(tract_ASU_urate <= threshold,
+             tract_ASU_urate > 0) |>
+      dplyr::pull(GEOID)
   } else {
     
-    threshold <- quantile(potential_lighlights$tract_ASU_urate, 1-(input$percentile/100))
+    threshold <- stats::quantile(potential_lighlights$tract_ASU_urate, 1-(input$percentile/100))
     
-    filtered_selected <- potential_lighlights %>%
-      filter(tract_ASU_urate >= threshold,
-             tract_ASU_urate > 0) %>%
-      pull(GEOID)
+    filtered_selected <- potential_lighlights |>
+      dplyr::filter(tract_ASU_urate >= threshold,
+             tract_ASU_urate > 0) |>
+      dplyr::pull(GEOID)
   }
   
   return(filtered_selected)
 })
 
 # Single observer that responds to changes in either input
-observeEvent(list(input$filter_percentile, input$unemployment_filter), {
+shiny::observeEvent(list(input$filter_percentile, input$unemployment_filter), {
   
   filtered_selected <- filtered_tracts()
   highlighted_tracts(filtered_selected)
   
   filtered_data <- subset(full_data(), GEOID %in% filtered_selected)
   
-  maplibre_proxy("edit_map") %>%
-    clear_layer("highlighted") %>%
-    add_fill_layer(
+  mapgl::maplibre_proxy("edit_map") |>
+    mapgl::clear_layer("highlighted") |>
+    mapgl::add_fill_layer(
       id = "highlighted",
       source = filtered_data,
       fill_color = "black",
       fill_opacity = 0.8
     )
-  
-  # output$selection_table <- renderTable({
-  #   filtered_selected
-  # })
-  
 })
-
 
 # Clear highlights with button click or when changing ASU selection
-
-observeEvent(list(input$clear_percentile, input$select_asunum), {
+shiny::observeEvent(list(input$clear_percentile, input$select_asunum), {
   
-  maplibre_proxy("edit_map") %>%
-    clear_layer("highlighted")
+  mapgl::maplibre_proxy("edit_map") |>
+    mapgl::clear_layer("highlighted")
   
 })
 
-
 # Calculate and display a table of data for selected tracts
-observeEvent(input$preview, {
-  req(selected_tracts())
+shiny::observeEvent(input$preview, {
+  shiny::req(selected_tracts())
 
-  replacement_data <- full_data() %>%
-    st_drop_geometry() %>%
+  replacement_data <- full_data() |>
+    sf::st_drop_geometry() |>
     subset(GEOID %in% selected_tracts())
 
   edit_table(replacement_data)
 
-  edit_table() %>%
-    ungroup() %>%
-    summarize(
-      tracts = n(),
+  edit_table() |>
+    dplyr::ungroup() |>
+    dplyr::summarize(
+      tracts = dplyr::n(),
       population = sum(tract_pop_cur, na.rm = TRUE),
       lf = sum(tract_ASU_clf, na.rm = TRUE),
       unemp = sum(tract_ASU_unemp, na.rm = TRUE),
       ur = round(unemp/lf*100, 5)
-    ) %>%
+    ) |>
     edit_summary()
 
   # Show Preview of Selected Tracts
-  output$selection_summary <- renderTable({
+  output$selection_summary <- shiny::renderTable({
     edit_summary()
   })
-
 })
 
 # Update selected tracts to new ASU number.
-observeEvent(input$update, {
-  req(selected_tracts(), full_data())
+shiny::observeEvent(input$update, {
+  shiny::req(selected_tracts(), full_data())
   
   # Update the full_data reactive value
-  updated_data <- full_data() %>%
-    filter(GEOID %in% selected_tracts()) %>%
-    mutate(asunum = as.numeric(input$new_asu)) %>%
+  updated_data <- full_data() |>
+    dplyr::filter(GEOID %in% selected_tracts()) |>
+    dplyr::mutate(asunum = as.numeric(input$new_asu)) |>
     rbind(
-      full_data() %>%
-        filter(!(GEOID %in% selected_tracts()))
+      full_data() |>
+        dplyr::filter(!(GEOID %in% selected_tracts()))
     )
   
   # Update the reactive value
@@ -1018,14 +977,13 @@ observeEvent(input$update, {
   selected_tracts(NULL)
   
   # Update map to remove highlight on selected tracts
-  maplibre_proxy("edit_map") %>%
-    clear_layer("selected")
+  mapgl::maplibre_proxy("edit_map") |>
+    mapgl::clear_layer("selected")
 })
 
-
 # Reset data to initial data load from Excel input
-observeEvent(input$reset, {
-  req(full_data_reset(), full_data())
+shiny::observeEvent(input$reset, {
+  shiny::req(full_data_reset(), full_data())
   
   # Reset the full_data reactive value
   full_data(full_data_reset())
@@ -1034,18 +992,16 @@ observeEvent(input$reset, {
   selected_tracts(NULL)
   
   # Update map to remove highlight on selected tracts
-  maplibre_proxy("edit_map") %>%
-    clear_layer("selected")
+  mapgl::maplibre_proxy("edit_map") |>
+    mapgl::clear_layer("selected")
 })
 
-
 # OPTIMIZATION 7: Periodic cleanup for long sessions
-observe({
-  invalidateLater(60000)  # Every minute
+shiny::observe({
+  shiny::invalidateLater(60000)  # Every minute
   if (exists("gc")) gc()  # Clean up memory
-}) %>% 
-bindEvent(input$update, ignoreInit = TRUE)
-
+}) |> 
+shiny::bindEvent(input$update, ignoreInit = TRUE)
 ```
 
 # Save and Load Data
@@ -1060,25 +1016,24 @@ directory. After loading data, you can go directly to the ASU
 Modification tab to continue making edits.
 
 ```{r}
-
 # Directory selection - Simple text input approach
-textInput("save_dir_path", "Save Directory Path:", value = getwd(), width = "100%")
-br()
-actionButton("browse_dir", "Browse for Directory")
-br()
-br()
-textOutput("current_save_dir")
-textOutput("dir_status")
-br()
+shiny::textInput("save_dir_path", "Save Directory Path:", value = getwd(), width = "100%")
+shiny::br()
+shiny::actionButton("browse_dir", "Browse for Directory")
+shiny::br()
+shiny::br()
+shiny::textOutput("current_save_dir")
+shiny::textOutput("dir_status")
+shiny::br()
 
-actionButton("save_data", "Save Data")
-fileInput("load_data", "Load Data", accept = c(".rds"))
+shiny::actionButton("save_data", "Save Data")
+shiny::fileInput("load_data", "Load Data", accept = c(".rds"))
 
 # Reactive value to store the selected directory
-save_directory <- reactiveVal(getwd())  # Default to current working directory
+save_directory <- shiny::reactiveVal(getwd())  # Default to current working directory
 
 # Observer to handle directory path changes
-observeEvent(input$save_dir_path, {
+shiny::observeEvent(input$save_dir_path, {
   if (!is.null(input$save_dir_path) && input$save_dir_path != "") {
     if (dir.exists(input$save_dir_path)) {
       save_directory(input$save_dir_path)
@@ -1087,28 +1042,27 @@ observeEvent(input$save_dir_path, {
 })
 
 # Alternative browse button (opens file dialog for directory selection)
-observeEvent(input$browse_dir, {
+shiny::observeEvent(input$browse_dir, {
   # This will work in RStudio or desktop R
   if (interactive()) {
     selected_dir <- tryCatch({
-      choose.dir(default = save_directory(), caption = "Select Save Directory")
+      utils::choose.dir(default = save_directory(), caption = "Select Save Directory")
     }, error = function(e) {
       # For non-Windows systems, use tcltk
       tryCatch({
-        library(tcltk)
-        tk_choose.dir(default = save_directory(), caption = "Select Save Directory")
+        tcltk::tk_choose.dir(default = save_directory(), caption = "Select Save Directory")
       }, error = function(e2) {
         NULL
       })
     })
     
     if (!is.null(selected_dir) && selected_dir != "") {
-      updateTextInput(session, "save_dir_path", value = selected_dir)
+      shiny::updateTextInput(session, "save_dir_path", value = selected_dir)
       save_directory(selected_dir)
     }
   } else {
     # In web-deployed apps, show instruction
-    showModal(modalDialog(
+    shiny::showModal(shiny::modalDialog(
       title = "Directory Selection",
       "In web-deployed apps, please manually enter the directory path in the text field above.",
       easyClose = TRUE
@@ -1117,12 +1071,12 @@ observeEvent(input$browse_dir, {
 })
 
 # Display current save directory
-output$current_save_dir <- renderText({
+output$current_save_dir <- shiny::renderText({
   paste("Current save directory: ", save_directory())
 })
 
 # Display directory status
-output$dir_status <- renderText({
+output$dir_status <- shiny::renderText({
   if (dir.exists(save_directory())) {
     "✓ Directory exists and is accessible"
   } else {
@@ -1131,8 +1085,8 @@ output$dir_status <- renderText({
 })
 
 # Observer for saving the data
-observeEvent(input$save_data, {
-  req(full_data())
+shiny::observeEvent(input$save_data, {
+  shiny::req(full_data())
   
   # Use the selected directory
   save_path <- file.path(save_directory(), "saved_data.rds")
@@ -1147,13 +1101,13 @@ observeEvent(input$save_data, {
     saveRDS(full_data(), save_path)
     
     # Provide feedback to the user
-    showModal(modalDialog(
+    shiny::showModal(shiny::modalDialog(
       title = "Data Saved",
       paste("Your data has been saved to:", save_path),
       easyClose = TRUE
     ))
   }, error = function(e) {
-    showModal(modalDialog(
+    shiny::showModal(shiny::modalDialog(
       title = "Error Saving Data",
       paste("Failed to save data:", e$message),
       easyClose = TRUE
@@ -1162,14 +1116,14 @@ observeEvent(input$save_data, {
 })
 
 # Observer for loading the data
-observeEvent(input$load_data, {
-  req(input$load_data)
+shiny::observeEvent(input$load_data, {
+  shiny::req(input$load_data)
   
   # Read the RDS file into a data frame
   loaded_data <- tryCatch({
     readRDS(input$load_data$datapath)
   }, error = function(e) {
-    showModal(modalDialog(
+    shiny::showModal(shiny::modalDialog(
       title = "Error Loading Data",
       "Failed to load the data. Please check the file format.",
       easyClose = TRUE
@@ -1178,11 +1132,11 @@ observeEvent(input$load_data, {
   })
   
   # If loaded_data is NULL (failed to load), exit the observer
-  req(!is.null(loaded_data))
+  shiny::req(!is.null(loaded_data))
   
   # Ensure the loaded data is an sf object
   if (!inherits(loaded_data, "sf")) {
-    showModal(modalDialog(
+    shiny::showModal(shiny::modalDialog(
       title = "Error Loading Data",
       "The loaded data is not a valid sf object.",
       easyClose = TRUE
@@ -1194,7 +1148,7 @@ observeEvent(input$load_data, {
   full_data(loaded_data)
   
   # Provide feedback to the user
-  showModal(modalDialog(
+  shiny::showModal(shiny::modalDialog(
     title = "Data Loaded",
     "Your data has been successfully loaded.",
     easyClose = TRUE
@@ -1220,12 +1174,12 @@ observeEvent(input$load_data, {
   }
   
   # Update the map using maplibre_proxy
-  maplibre_proxy("edit_map") |>
-    clear_layer("basemap") |>
-    add_fill_layer(
+  mapgl::maplibre_proxy("edit_map") |>
+    mapgl::clear_layer("basemap") |>
+    mapgl::add_fill_layer(
       id = "basemap",
       source = full_data(),
-      fill_color = step_expr(
+      fill_color = mapgl::step_expr(
         column = "asunum",
         base = "#808080",  # Grey for asunum == 0 (and anything < first break)
         stops = brewer_pal,
@@ -1234,22 +1188,21 @@ observeEvent(input$load_data, {
       ),
       fill_opacity = 0.5,
       fill_outline_color = "black",
-      tooltip = concat(
-        "<strong>ASU Number: </strong>", get_column("asunum"), "<br>",
-        "<strong>Tract GEOID: </strong>", get_column("GEOID"), "<br>",
-        "<strong>Tract Unemployment Rate: </strong>", number_format(get_column("tract_ASU_urate"), style = "decimal", maximum_fraction_digits = 2), "%<br>",
-        "<strong>Tract Unemployment: </strong>", number_format(get_column("tract_ASU_unemp"), style = "decimal", maximum_fraction_digits = 0), "<br>"
+      tooltip = mapgl::concat(
+        "<strong>ASU Number: </strong>", mapgl::get_column("asunum"), "<br>",
+        "<strong>Tract GEOID: </strong>", mapgl::get_column("GEOID"), "<br>",
+        "<strong>Tract Unemployment Rate: </strong>", mapgl::number_format(mapgl::get_column("tract_ASU_urate"), style = "decimal", maximum_fraction_digits = 2), "%<br>",
+        "<strong>Tract Unemployment: </strong>", mapgl::number_format(mapgl::get_column("tract_ASU_unemp"), style = "decimal", maximum_fraction_digits = 0), "<br>"
       )
     ) |>
-    fit_bounds(full_data(), animate = TRUE)
+    mapgl::fit_bounds(full_data(), animate = TRUE)
 })
-
 ```
 
 ## Output {data-width="850"}
 
 ```{r}
-
+# Empty output section
 ```
 
 # ASU Review and Finalization
@@ -1272,79 +1225,76 @@ When ready to create an output file, the *Generate LSS .txt File* button
 will create a formatted batch file for upload to LSS.
 
 ```{r}
+shiny::numericInput("asu_ur", "ASU Unemployment Rate Threshold:", value = 6.45, min = 0)
 
-numericInput("asu_ur", "ASU Unemployment Rate Threshold:", value = 6.45, min = 0)
+shiny::numericInput("asu_pop", "ASU Population Threshold:", value = 10000, min = 0)
 
-numericInput("asu_pop", "ASU Population Threshold:", value = 10000, min = 0)
+shiny::actionButton("run_asu_summary", "Generate ASU Summary")
+shiny::renderUI(shiny::HTML("<hr>"))
 
-actionButton("run_asu_summary", "Generate ASU Summary")
-renderUI(HTML("<hr>"))
+shiny::textOutput("current_save_dir")
+shiny::renderUI(shiny::HTML("<hr>"))
 
-textOutput("current_save_dir")
-renderUI(HTML("<hr>"))
+shiny::actionButton("lss_txt", "Generate LSS .txt File")
+shiny::renderUI(shiny::HTML("<hr>"))
 
-actionButton("lss_txt", "Generate LSS .txt File")
-renderUI(HTML("<hr>"))
-
-actionButton("review_txt", "Create Summary CSV")
-
+shiny::actionButton("review_txt", "Create Summary CSV")
 ```
 
 ## Output {data-width="850"}
 
 ```{r}
+shiny::tableOutput("asu_review")
 
-tableOutput("asu_review")
+summarized_asu <- shiny::reactiveVal(NULL)
 
-summarized_asu <- reactiveVal(NULL)
-
-observeEvent(input$run_asu_summary, {
+shiny::observeEvent(input$run_asu_summary, {
   
-  req(full_data())
+  shiny::req(full_data())
   
-  summary_table <- full_data() %>%
-    st_drop_geometry() %>%
-    group_by(asunum) %>%
-    filter(asunum > 0.5) %>%
-    summarize(
-      Tracts = n(),
+  summary_table <- full_data() |>
+    sf::st_drop_geometry() |>
+    dplyr::group_by(asunum) |>
+    dplyr::filter(asunum > 0.5) |>
+    dplyr::summarize(
+      Tracts = dplyr::n(),
       Population = sum(tract_pop_cur, na.rm = TRUE),
       `Labor Force` = sum(tract_ASU_clf, na.rm = TRUE),
       Unemployment = sum(tract_ASU_unemp, na.rm = TRUE),
       `Unemployment Rate` = round(Unemployment/`Labor Force`*100, 5)
-    ) %>%
-    ungroup() %>%
-    mutate(
-      ur_qualified = if_else(`Unemployment Rate` >= input$asu_ur, TRUE, FALSE),
-      pop_qualified = if_else(Population >= input$asu_pop, TRUE, FALSE),
+    ) |>
+    dplyr::ungroup() |>
+    dplyr::mutate(
+      ur_qualified = dplyr::if_else(`Unemployment Rate` >= input$asu_ur, TRUE, FALSE),
+      pop_qualified = dplyr::if_else(Population >= input$asu_pop, TRUE, FALSE),
       asu_qualified = ur_qualified & pop_qualified
     )
   
   summarized_asu(summary_table)
 })
 
-output$asu_review <- renderTable({
+output$asu_review <- shiny::renderTable({
   summarized_asu()
 })
 
-observeEvent(input$lss_txt, {
+shiny::observeEvent(input$lss_txt, {
   
-  req(full_data())
+  shiny::req(full_data())
 
   # Function to generate text content
   generate_txt <- function() {
-    df <- full_data() %>%
-      st_drop_geometry() %>%
-      select(GEOID, asunum) %>%
-      filter(asunum > 0) %>%
-      mutate(asunum = as.integer(asunum),
+    df <- full_data() |>
+      sf::st_drop_geometry() |>
+      dplyr::select(GEOID, asunum) |>
+      dplyr::filter(asunum > 0) |>
+      dplyr::mutate(asunum = as.integer(asunum),
              GEOID = paste0("14000US", GEOID),
              asunum = paste0("SU", state(), sprintf("%04d", asunum)),
-             GEOID = paste(asunum, GEOID, sep = " + ")) %>% 
-      arrange(asunum, GEOID) %>%
-      select(-asunum)
+             GEOID = paste(asunum, GEOID, sep = " + ")) |> 
+      dplyr::arrange(asunum, GEOID) |>
+      dplyr::select(-asunum)
 
-    txt_content <- capture.output(write.table(df, quote=FALSE, row.names=FALSE, col.names = FALSE))
+    txt_content <- utils::capture.output(utils::write.table(df, quote=FALSE, row.names=FALSE, col.names = FALSE))
     txt_content <- paste(txt_content, collapse="\n")
     return(txt_content)
   }
@@ -1354,7 +1304,7 @@ observeEvent(input$lss_txt, {
   
   # Validate directory path
   if (is.null(current_dir) || current_dir == "") {
-    showModal(modalDialog(
+    shiny::showModal(shiny::modalDialog(
       title = "No Directory Selected",
       "Please select a save directory first in the Save and Load Data tab.",
       easyClose = TRUE
@@ -1373,7 +1323,7 @@ observeEvent(input$lss_txt, {
     tryCatch({
       dir.create(current_dir, recursive = TRUE)
     }, error = function(e) {
-      showModal(modalDialog(
+      shiny::showModal(shiny::modalDialog(
         title = "Directory Error",
         paste("Cannot create directory:", current_dir, "\nError:", e$message),
         easyClose = TRUE
@@ -1387,9 +1337,9 @@ observeEvent(input$lss_txt, {
     writeLines(txt_content, filePath)
     
     # Show success message with file location
-    showModal(modalDialog(
+    shiny::showModal(shiny::modalDialog(
       title = "File Created Successfully",
-      HTML(paste0(
+      shiny::HTML(paste0(
         "<strong>LSS batch file has been saved to:</strong><br>",
         "<code>", filePath, "</code>"
       )),
@@ -1397,7 +1347,7 @@ observeEvent(input$lss_txt, {
     ))
     
   }, error = function(e) {
-    showModal(modalDialog(
+    shiny::showModal(shiny::modalDialog(
       title = "Error Creating File",
       paste("Failed to create LSS file:", e$message),
       easyClose = TRUE
@@ -1405,15 +1355,15 @@ observeEvent(input$lss_txt, {
   })
 })
 
-observeEvent(input$review_txt, {
+shiny::observeEvent(input$review_txt, {
 
-  req(full_data())
+  shiny::req(full_data())
 
   # Function to generate CSV content
   generate_csv <- function() {
-    df <- full_data() %>%
-      st_drop_geometry() %>%
-      arrange(asunum, GEOID)
+    df <- full_data() |>
+      sf::st_drop_geometry() |>
+      dplyr::arrange(asunum, GEOID)
     
     return(df)
   }
@@ -1423,7 +1373,7 @@ observeEvent(input$review_txt, {
   
   # Validate directory path
   if (is.null(current_dir) || current_dir == "") {
-    showModal(modalDialog(
+    shiny::showModal(shiny::modalDialog(
       title = "No Directory Selected",
       "Please select a save directory first in the Save and Load Data tab.",
       easyClose = TRUE
@@ -1442,7 +1392,7 @@ observeEvent(input$review_txt, {
     tryCatch({
       dir.create(current_dir, recursive = TRUE)
     }, error = function(e) {
-      showModal(modalDialog(
+      shiny::showModal(shiny::modalDialog(
         title = "Directory Error",
         paste("Cannot create directory:", current_dir, "\nError:", e$message),
         easyClose = TRUE
@@ -1453,12 +1403,12 @@ observeEvent(input$review_txt, {
   
   tryCatch({
     # Write the CSV file
-    write.csv(df, filePath, row.names = FALSE)
+    utils::write.csv(df, filePath, row.names = FALSE)
     
     # Show success message with file location
-    showModal(modalDialog(
+    shiny::showModal(shiny::modalDialog(
       title = "File Created Successfully",
-      HTML(paste0(
+      shiny::HTML(paste0(
         "<strong>ASU Review CSV has been saved to:</strong><br>",
         "<code>", filePath, "</code>"
       )),
@@ -1466,14 +1416,13 @@ observeEvent(input$review_txt, {
     ))
     
   }, error = function(e) {
-    showModal(modalDialog(
+    shiny::showModal(shiny::modalDialog(
       title = "Error Creating File",
       paste("Failed to create CSV file:", e$message),
       easyClose = TRUE
     ))
   })
 })
-
 
 ####################
 ## Future Development
@@ -1485,8 +1434,6 @@ observeEvent(input$review_txt, {
 # Check for contiguity of selected ASUs after manual edits.
 # Export high-resolution images of ASUs for review.
 # Use reactlog package to monitor reactive interactions in the code for cleanup. https://mastering-shiny.org/reactive-graph.html
-
-
 ```
 
 # How to Use ASUbuildR

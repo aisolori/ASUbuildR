@@ -4,9 +4,9 @@
 \name{ASUbuildR-package}
 \alias{ASUbuildR}
 \alias{ASUbuildR-package}
-\title{ASUbuildR: Shiny interface to help state construct Areas of Substantial Unemployment}
+\title{ASUbuildR: A Shiny Interface for Constructing Areas of Substantial Unemployment}
 \description{
-This provides a GUI and related tools to help maximize unemployment within ASUs. Continuation lines should be indented.
+Provides a point-and-click GUI together with helper algorithms for building Areas of Substantial Unemployment (ASUs) from Census tract and BLS data. The package wraps a Shiny Flexdashboard interface plus utilities for optimising tract groupings and exporting results.
 }
 \author{
 \strong{Maintainer}: David Schmidt \email{deschmidt@detr.nv.gov}
@@ -14,6 +14,11 @@ This provides a GUI and related tools to help maximize unemployment within ASUs.
 Authors:
 \itemize{
   \item Michael Frank
+}
+
+Other contributors:
+\itemize{
+  \item Antonio Solorio \email{aisolorio@detr.nv.gov} [contributor]
 }
 
 }
