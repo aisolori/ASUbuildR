@@ -98,8 +98,16 @@ current_selection <- shiny::reactiveVal(NULL)
 th_state <- shiny::reactiveVal(NULL)
 th_tract_list <- shiny::reactiveVal(NULL)
 th_bls_df <- shiny::reactiveVal(NULL)
-
-map_data_dbg <- shiny::reactiveVal(NULL)   # container
+prep_map_data <- function(map_data) {
+  map_data |>
+    sf::st_make_valid() |>
+    sf::st_zm(what = "ZM", drop = TRUE) |>
+    dplyr::filter(!sf::st_is_empty(geometry)) |>
+    dplyr::mutate(geom_type = sf::st_geometry_type(geometry)) |>
+    dplyr::filter(geom_type %in% c("POLYGON", "MULTIPOLYGON")) |>
+    dplyr::select(-geom_type)
+}
+map_geom <- shiny::reactiveVal(NULL)
 
 highlighted_tracts <- shiny::reactiveVal(character(0))
 
@@ -347,7 +355,7 @@ shiny::observeEvent(input$process, {
   if (!is.null(res)) {
     full_data(res$full_data  )   ; full_data_reset(res$full_data_reset)
     asu_data(res$asu_data    )   ; asu_tracts(res$asu_tracts)
-    asu_summary(res$asu_summary) ; map_data_dbg(res$full_data)
+    asu_summary(res$asu_summary) ; map_geom(prep_map_data(res$full_data))
 
     output$asu <- shiny::renderTable( asu_summary(),digits = 3 )
 
@@ -355,17 +363,8 @@ shiny::observeEvent(input$process, {
 
   output$initial_map <- mapgl::renderMaplibre({
 
-    shiny::req(full_data())
-    map_data <- full_data()
-
-    # ---- 6·1 geometry housekeeping ----------------------------------
-    map_data <- map_data |>
-      sf::st_make_valid() |>
-      sf::st_zm(what = "ZM", drop = TRUE) |>
-      dplyr::filter(!sf::st_is_empty(geometry)) |>
-      dplyr::mutate(geom_type = sf::st_geometry_type(geometry)) |>
-      dplyr::filter(geom_type %in% c("POLYGON", "MULTIPOLYGON")) |>
-      dplyr::select(-geom_type)
+    shiny::req(map_geom())
+    map_data <- map_geom()
 
     if (nrow(map_data) == 0) {
       return(
@@ -463,19 +462,12 @@ shiny::observeEvent(input$th_pass, {
   res <- tract_hunter_finalize(st)
   full_data(res$full_data  )   ; full_data_reset(res$full_data_reset)
   asu_data(res$asu_data    )   ; asu_tracts(res$asu_tracts)
-  asu_summary(res$asu_summary) ; map_data_dbg(res$full_data)
+  asu_summary(res$asu_summary) ; map_geom(prep_map_data(res$full_data))
   output$asu <- shiny::renderTable( asu_summary(),digits = 3 )
   mapgl::maplibre_proxy("initial_map") |> mapgl::clear_layer("basemap")
   output$initial_map <- mapgl::renderMaplibre({
-    shiny::req(full_data())
-    map_data <- full_data()
-    map_data <- map_data |>
-      sf::st_make_valid() |>
-      sf::st_zm(what = "ZM", drop = TRUE) |>
-      dplyr::filter(!sf::st_is_empty(geometry)) |>
-      dplyr::mutate(geom_type = sf::st_geometry_type(geometry)) |>
-      dplyr::filter(geom_type %in% c("POLYGON", "MULTIPOLYGON")) |>
-      dplyr::select(-geom_type)
+    shiny::req(map_geom())
+    map_data <- map_geom()
     if (nrow(map_data) == 0) {
       return(
         mapgl::maplibre(style = mapgl::carto_style("positron")) |>
@@ -547,19 +539,12 @@ shiny::observeEvent(input$th_combine, {
   res <- tract_hunter_finalize(st)
   full_data(res$full_data  )   ; full_data_reset(res$full_data_reset)
   asu_data(res$asu_data    )   ; asu_tracts(res$asu_tracts)
-  asu_summary(res$asu_summary) ; map_data_dbg(res$full_data)
+  asu_summary(res$asu_summary) ; map_geom(prep_map_data(res$full_data))
   output$asu <- shiny::renderTable( asu_summary(),digits = 3 )
   mapgl::maplibre_proxy("initial_map") |> mapgl::clear_layer("basemap")
   output$initial_map <- mapgl::renderMaplibre({
-    shiny::req(full_data())
-    map_data <- full_data()
-    map_data <- map_data |>
-      sf::st_make_valid() |>
-      sf::st_zm(what = "ZM", drop = TRUE) |>
-      dplyr::filter(!sf::st_is_empty(geometry)) |>
-      dplyr::mutate(geom_type = sf::st_geometry_type(geometry)) |>
-      dplyr::filter(geom_type %in% c("POLYGON", "MULTIPOLYGON")) |>
-      dplyr::select(-geom_type)
+    shiny::req(map_geom())
+    map_data <- map_geom()
     if (nrow(map_data) == 0) {
       return(
         mapgl::maplibre(style = mapgl::carto_style("positron")) |>
@@ -709,10 +694,10 @@ shiny::tableOutput("selection_data")
 shiny::tableOutput("selection_summary")
 
 output$edit_map <- mapgl::renderMaplibre({
-  
-  shiny::req(full_data())
-  
-  number_asus <- max(full_data()$asunum)
+
+  shiny::req(map_geom())
+
+  number_asus <- max(map_geom()$asunum)
   number_categories <- min(c(number_asus, 8))
   asu_per_category <- number_asus/number_categories
   
@@ -731,10 +716,10 @@ output$edit_map <- mapgl::renderMaplibre({
   }
 
   mapgl::maplibre(style = mapgl::carto_style("positron")) |>
-    mapgl::fit_bounds(full_data(), animate = FALSE) |> 
+    mapgl::fit_bounds(map_geom(), animate = FALSE) |>
     mapgl::add_fill_layer(
       id = "basemap",
-      source = full_data(),
+      source = map_geom(),
       fill_color = mapgl::step_expr(
         column = "asunum",
         base = "#808080",  # Grey for asunum == 0 (and anything < first break)
@@ -778,7 +763,7 @@ shiny::observeEvent(input$edit_map_feature_click, {
   
   # Update the map highlighting
   if (length(current_selection) > 0) {
-    selected_data <- subset(full_data(), GEOID %in% selected_tracts())
+    selected_data <- subset(map_geom(), GEOID %in% selected_tracts())
     
     mapgl::maplibre_proxy("edit_map") |>
       mapgl::clear_layer("selected") |>
@@ -814,7 +799,7 @@ shiny::observeEvent(input$clear, {
 
 # Select tracts in an ASU from dropdown
 shiny::observeEvent(input$select_asunum, {
-  shiny::req(full_data())
+  shiny::req(map_geom())
   
   # Skip if "None" is selected
   if (input$select_asunum == "None") {
@@ -825,7 +810,7 @@ shiny::observeEvent(input$select_asunum, {
   }
   
   # Get all tracts with the selected ASU number
-  selected_tract_ids <- full_data() |>
+  selected_tract_ids <- map_geom() |>
     dplyr::filter(asunum == as.numeric(input$select_asunum)) |>
     dplyr::pull(GEOID)
   
@@ -833,7 +818,7 @@ shiny::observeEvent(input$select_asunum, {
   selected_tracts(selected_tract_ids)
   
   # Get the filtered data for selected tracts
-  selected_data <- subset(full_data(), GEOID %in% selected_tract_ids)
+  selected_data <- subset(map_geom(), GEOID %in% selected_tract_ids)
   
   # Highlight the selected tracts on the map using maplibre proxy
   mapgl::maplibre_proxy("edit_map") |>
@@ -850,10 +835,10 @@ shiny::observeEvent(input$select_asunum, {
 
 # Select a single tract given a GEOID
 shiny::observeEvent(input$select_geoid, {
-  shiny::req(full_data())
-  
+  shiny::req(map_geom())
+
   # Get the selected tract's data
-  selected_tract <- full_data() |>
+  selected_tract <- map_geom() |>
     dplyr::filter(GEOID == input$manual_geoid)
   
   # If the tract exists, highlight it and fit bounds
@@ -877,9 +862,9 @@ shiny::observeEvent(input$select_geoid, {
 
 # Create a reactive expression that handles the filtering logic
 filtered_tracts <- shiny::reactive({
-  shiny::req(input$percentile, input$unemployment_filter, full_data(), selected_tracts())
-  
-  potential_lighlights <- full_data() |>
+  shiny::req(input$percentile, input$unemployment_filter, map_geom(), selected_tracts())
+
+  potential_lighlights <- map_geom() |>
     dplyr::filter(GEOID %in% selected_tracts(),
            tract_pop_cur > 0)
   
@@ -910,7 +895,7 @@ shiny::observeEvent(list(input$filter_percentile, input$unemployment_filter), {
   filtered_selected <- filtered_tracts()
   highlighted_tracts(filtered_selected)
   
-  filtered_data <- subset(full_data(), GEOID %in% filtered_selected)
+  filtered_data <- subset(map_geom(), GEOID %in% filtered_selected)
   
   mapgl::maplibre_proxy("edit_map") |>
     mapgl::clear_layer("highlighted") |>
@@ -972,6 +957,7 @@ shiny::observeEvent(input$update, {
   
   # Update the reactive value
   full_data(updated_data)
+  map_geom(prep_map_data(updated_data))
   
   # Clear selected tracts
   selected_tracts(NULL)
@@ -987,6 +973,7 @@ shiny::observeEvent(input$reset, {
   
   # Reset the full_data reactive value
   full_data(full_data_reset())
+  map_geom(prep_map_data(full_data_reset()))
   
   # Clear selected tracts
   selected_tracts(NULL)
@@ -1146,6 +1133,7 @@ shiny::observeEvent(input$load_data, {
   
   # Update full_data with the loaded data
   full_data(loaded_data)
+  map_geom(prep_map_data(loaded_data))
   
   # Provide feedback to the user
   shiny::showModal(shiny::modalDialog(
@@ -1155,7 +1143,7 @@ shiny::observeEvent(input$load_data, {
   ))
   
   # Recreate the color scheme logic (same as in renderMaplibre)
-  number_asus <- max(full_data()$asunum)
+  number_asus <- max(map_geom()$asunum)
   number_categories <- min(c(number_asus, 8))
   asu_per_category <- number_asus/number_categories
   
@@ -1178,7 +1166,7 @@ shiny::observeEvent(input$load_data, {
     mapgl::clear_layer("basemap") |>
     mapgl::add_fill_layer(
       id = "basemap",
-      source = full_data(),
+      source = map_geom(),
       fill_color = mapgl::step_expr(
         column = "asunum",
         base = "#808080",  # Grey for asunum == 0 (and anything < first break)
@@ -1195,7 +1183,7 @@ shiny::observeEvent(input$load_data, {
         "<strong>Tract Unemployment: </strong>", mapgl::number_format(mapgl::get_column("tract_ASU_unemp"), style = "decimal", maximum_fraction_digits = 0), "<br>"
       )
     ) |>
-    mapgl::fit_bounds(full_data(), animate = TRUE)
+    mapgl::fit_bounds(map_geom(), animate = TRUE)
 })
 ```
 
