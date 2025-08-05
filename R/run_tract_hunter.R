@@ -458,59 +458,119 @@ tract_hunter_combine_groups <- function(state) {
 #' @return Updated state list
 #' @keywords internal
 tract_hunter_dropout <- function(state, quantile = 0) {
+  ## ---- 0 · sanity -----------------------------------------------------
+  stopifnot(is.numeric(quantile), quantile >= 0, quantile <= 1)
 
-  data_merge <- state$data_merge
+  dm         <- state$data_merge
   g          <- state$g
   pop_thresh <- state$pop_thresh
+  ur_thresh  <- ifelse(is.null(state$ur_thresh), 0.0645, state$ur_thresh)
 
-  asu_summary <- data_merge |>
+  dm <- dm |>
+    dplyr::select(
+      -dplyr::any_of(c(
+        "emp_tot", "unemp_tot", "ur_current",
+        "emp_after", "unemp_after", "ur_after", "delta_ur"
+      ))
+    )
+
+  ## ---- 0a · ensure asunum is integer ---------------------------------
+  dm$asunum <- suppressWarnings(as.integer(as.character(dm$asunum)))
+
+  ## ---- 1 · ASU-level totals & current UR -----------------------------
+  asu_totals <- dm |>
     dplyr::filter(!is.na(asunum)) |>
     dplyr::group_by(asunum) |>
     dplyr::summarise(
-      Unemployment = sum(tract_ASU_unemp, na.rm = TRUE),
-      Employed     = sum(tract_ASU_emp,   na.rm = TRUE),
-      .groups      = "drop"
+      emp_tot   = sum(tract_ASU_emp,   na.rm = TRUE),
+      unemp_tot = sum(tract_ASU_unemp, na.rm = TRUE),
+      .groups   = "drop"
     ) |>
-    dplyr::mutate(ur = ifelse(Unemployment + Employed == 0,
-                              0, Unemployment / (Unemployment + Employed)))
+    sf::st_drop_geometry() |>
+    dplyr::mutate(
+      ur_current = ifelse(
+        emp_tot + unemp_tot == 0,
+        0,
+        unemp_tot / (emp_tot + unemp_tot)
+      )
+    )
 
-  n_asu <- nrow(asu_summary)
-  n_drop <- ceiling(quantile * n_asu)
+  ## ---- 2 · tract-level ΔUR if removed --------------------------------
+  dm <- dm |>
+    dplyr::left_join(asu_totals, by = "asunum") |>
+    dplyr::mutate(
+      emp_after   = emp_tot   - tract_ASU_emp,
+      unemp_after = unemp_tot - tract_ASU_unemp,
+      ur_after = ifelse(emp_after + unemp_after == 0,
+                        0,
+                        unemp_after / (emp_after + unemp_after)),
+      delta_ur = ur_after - ur_current,
+      row_id   = dplyr::row_number()                 # stable index
+    )
 
-  if (n_asu > 0 && n_drop > 0) {
-    drop_ids <- asu_summary |>
-      dplyr::arrange(dplyr::desc(ur)) |>
-      dplyr::slice(seq_len(n_drop)) |>
-      dplyr::pull(asunum)
+  ## ---- 3 · drop top-quantile ΔUR tracts ------------------------------
+  n_drop <- ceiling(quantile * nrow(dm))
 
-    data_merge$asunum[data_merge$asunum %in% drop_ids] <- NA
+  if (n_drop > 0) {
+    drop_idx <- dm |>
+      dplyr::filter(!is.na(asunum)) |>
+      dplyr::arrange(dplyr::desc(delta_ur)) |>      # largest ΔUR first
+      dplyr::slice_head(n = n_drop) |>
+      dplyr::pull(row_id)
+
+    message(glue::glue(
+      "Dropping {length(drop_idx)} tracts (top {quantile*100}% ΔUR)"
+    ))
+
+    dm$asunum[drop_idx] <- NA_integer_
   }
 
-  remaining_asu <- sort(unique(stats::na.omit(data_merge$asunum)))
+  ## ---- early exit if everything dropped ------------------------------
+  if (all(is.na(dm$asunum))) {
+    dm$row_id <- NULL
+    state$data_merge <- dm
+    return(state)
+  }
 
-  valid_components <- list()
-  for (asu in remaining_asu) {
-    asu_vertices <- data_merge$row_num[data_merge$asunum == asu]
-    subg <- igraph::induced_subgraph(g, vids = asu_vertices)
-    comps <- igraph::components(subg)
-    for (comp_id in seq_len(comps$no)) {
-      comp_vertices <- asu_vertices[comps$membership == comp_id]
-      comp_rows <- match(comp_vertices, data_merge$row_num)
-      comp_pop <- sum(data_merge$tract_pop_cur[comp_rows], na.rm = TRUE)
-      if (comp_pop >= pop_thresh) {
-        valid_components[[length(valid_components) + 1]] <- comp_rows
+  ## ---- 4 · component checks ------------------------------------------
+  next_id <- max(dm$asunum, na.rm = TRUE, finite = TRUE) + 1L
+
+  for (asu in sort(unique(stats::na.omit(dm$asunum)))) {
+
+    asu_idx <- which(dm$asunum == asu)
+    comps   <- igraph::components(igraph::induced_subgraph(g, asu_idx))
+
+    for (cid in seq_len(comps$no)) {
+      comp_idx <- asu_idx[ comps$membership == cid ]
+
+      pop <- sum(dm$tract_pop_cur[comp_idx],   na.rm = TRUE)
+      emp <- sum(dm$tract_ASU_emp[comp_idx],   na.rm = TRUE)
+      unp <- sum(dm$tract_ASU_unemp[comp_idx], na.rm = TRUE)
+      ur  <- ifelse(emp + unp == 0, 0, unp / (emp + unp))
+
+      if (pop < pop_thresh || ur < ur_thresh) {
+        dm$asunum[comp_idx] <- NA_integer_
+      } else if (comps$no > 1) {                 # ASU split → relabel
+        dm$asunum[comp_idx] <- next_id
+        next_id <- next_id + 1L
       }
     }
   }
 
-  data_merge$asunum <- NA
-  for (i in seq_along(valid_components)) {
-    data_merge$asunum[valid_components[[i]]] <- i
-  }
+  ## ---- 5 · renumber surviving ASUs 1..N ------------------------------
+  kept_ids <- sort(unique(stats::na.omit(dm$asunum)))
+  dm$asunum <- ifelse(
+    is.na(dm$asunum),
+    NA_integer_,
+    match(dm$asunum, kept_ids)
+  )
 
-  state$data_merge <- data_merge
+  ## ---- 6 · cleanup & return ------------------------------------------
+  dm$row_id <- NULL             # drop helper column
+  state$data_merge <- dm
   state
 }
+
 
 #' Finalize Tract Hunter results
 #'
