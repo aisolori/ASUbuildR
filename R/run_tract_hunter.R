@@ -490,20 +490,19 @@ tract_hunter_dropout <- function(state, quantile = 0) {
 
   valid_components <- list()
   for (asu in remaining_asu) {
-    asu_vertices <- data_merge$row_num[data_merge$asunum == asu]
-    subg <- igraph::induced_subgraph(g, vids = asu_vertices)
-    comps <- igraph::components(subg)
+    asu_idx <- which(data_merge$asunum == asu)
+    subg    <- igraph::induced_subgraph(g, vids = asu_idx)
+    comps   <- igraph::components(subg)
     for (comp_id in seq_len(comps$no)) {
-      comp_vertices <- asu_vertices[comps$membership == comp_id]
-      comp_rows <- match(comp_vertices, data_merge$row_num)
-      comp_pop <- sum(data_merge$tract_pop_cur[comp_rows], na.rm = TRUE)
+      comp_vertices <- asu_idx[comps$membership == comp_id]
+      comp_pop <- sum(data_merge$tract_pop_cur[comp_vertices], na.rm = TRUE)
       if (comp_pop >= pop_thresh) {
-        valid_components[[length(valid_components) + 1]] <- comp_rows
+        valid_components[[length(valid_components) + 1]] <- comp_vertices
       }
     }
   }
 
-  data_merge$asunum <- NA
+  data_merge$asunum <- NA_integer_
   for (i in seq_along(valid_components)) {
     data_merge$asunum[valid_components[[i]]] <- i
   }
