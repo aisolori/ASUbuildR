@@ -261,7 +261,7 @@ tract_hunter_asu_pass <- function(state, verbose = TRUE) {
 
     all_paths <- list()
     for (nbr in found_neighbors) {
-      paths_temp <- igraph::k_shortest_paths(g, from = nbr, to = target_index, mode = "out", k = 5)
+      paths_temp <- igraph::k_shortest_paths(g, from = nbr, to = target_index, mode = "out", k = 20)
       # Defensive: add only non-empty paths
       all_paths <- c(all_paths, Filter(function(x) length(x) > 0, paths_temp$vpath))
     }
@@ -395,7 +395,8 @@ tract_hunter_asu_pass <- function(state, verbose = TRUE) {
     data_merge_local <- data_merge
     tracts_not_in_asu <- data_merge_local |>
       dplyr::filter(is.na(asunum)) |>
-      dplyr::arrange(-ur)
+      dplyr::mutate(priority_score = tract_ASU_unemp *((1+(ur-.0645)*50)**2)) |>
+      dplyr::arrange(-priority_score)
 
     if (nrow(tracts_not_in_asu) == 0L) {
       if (verbose) cat("\nNo more tracts to process.\n")
