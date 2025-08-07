@@ -12,7 +12,7 @@ tract_hunter_seed <- function(tract_list,
                               ur_thresh  = 0.0645,
                               pop_thresh = 10000,
                               verbose    = TRUE) {
-
+  # Progress updater
   update_status <- function(msg) {
     if (requireNamespace("shiny", quietly = TRUE) && shiny::isRunning()) {
       shiny::incProgress(amount = 0, detail = msg)
@@ -21,136 +21,160 @@ tract_hunter_seed <- function(tract_list,
     }
   }
 
-  # ---- 0 · PREP ----------------------------------------------------
+  # ---- 0 · PREP: join and compute UR --------------------------------
   data_merge <- tract_list %>%
-    left_join(bls_df, by = "GEOID") %>%
-    mutate(
+    dplyr::left_join(bls_df, by = "GEOID") %>%
+    dplyr::mutate(
       ur      = ifelse(tract_ASU_unemp + tract_ASU_emp == 0,
-                        0, tract_ASU_unemp/(tract_ASU_unemp + tract_ASU_emp)),
-      row_num = if_else(!is.na(row_num), row_num, row_number())
+                       0,
+                       tract_ASU_unemp / (tract_ASU_unemp + tract_ASU_emp)
+      ),
+      row_num = dplyr::row_number()
     )
 
+  # ensure neighbor list is integer vectors
   data_merge$continuous <- lapply(data_merge$continuous, function(x) {
-    # If it's scalar 0, replace with integer(0)
     if (length(x) == 1 && x == 0) return(integer(0))
     as.integer(x)
   })
 
+  # ---- 1 · neighbor statistics --------------------------------------
+  emp0 <- data_merge$tract_ASU_emp
+  une0 <- data_merge$tract_ASU_unemp
+  ur0  <- data_merge$ur
+  nb   <- data_merge$continuous
 
+  neigh_emp_tot   <- purrr::map_dbl(nb, ~ sum(emp0[.x], na.rm = TRUE))
+  neigh_unemp_tot <- purrr::map_dbl(nb, ~ sum(une0[.x], na.rm = TRUE))
+  neigh_emp_avg   <- purrr::map_dbl(nb, ~ mean(emp0[.x], na.rm = TRUE))
+  neigh_unemp_avg <- purrr::map_dbl(nb, ~ mean(une0[.x], na.rm = TRUE))
+  neigh_ur_tot    <- neigh_unemp_tot / (neigh_unemp_tot + neigh_emp_tot)
+  neigh_ur_avg    <- purrr::map_dbl(nb, ~ mean(ur0[.x],   na.rm = TRUE))
 
-
-
-  nb <- data_merge$continuous
-  g  <- igraph::graph_from_adj_list(nb)
-
-  comps <- igraph::components(g)
-  main_component_id <- which.max(comps$csize)
-  main_indices <- which(comps$membership == main_component_id)
-  island_indices <- which(comps$membership != main_component_id)
-
-  coords <- data.frame(
-    INTPTLAT = as.numeric(data_merge$INTPTLAT),
-    INTPTLON = as.numeric(data_merge$INTPTLON)
-  )
-
-  island_component_ids <- setdiff(unique(comps$membership), main_component_id)
-
-  for (island_id in island_component_ids) {
-    island_members <- which(comps$membership == island_id)
-    # For all members of this island component, get distances to all in main
-    combis <- expand.grid(island= island_members, main= main_indices)
-    combis$dist <- sqrt(
-      (coords$INTPTLAT[combis$island] - coords$INTPTLAT[combis$main])^2 +
-        (coords$INTPTLON[combis$island] - coords$INTPTLON[combis$main])^2
+  data_merge <- data_merge %>%
+    dplyr::mutate(
+      neigh_emp_tot   = neigh_emp_tot,
+      neigh_unemp_tot = neigh_unemp_tot,
+      neigh_emp_avg   = neigh_emp_avg,
+      neigh_unemp_avg = neigh_unemp_avg,
+      neigh_ur_tot    = neigh_ur_tot,
+      neigh_ur_avg    = neigh_ur_avg
     )
-    closest <- combis[which.min(combis$dist), ]
-    g <- igraph::add_edges(g, c(closest$island, closest$main))
-  }
 
-  emp_vec        <- data_merge$tract_ASU_emp
-  unemp_vec      <- data_merge$tract_ASU_unemp
-  population_vec <- data_merge$tract_pop_cur
-  ur_vec         <- data_merge$ur
-
-  used_indexes           <- integer(0)
-  tried_starting_indexes <- integer(0)
-  asu_groups             <- list()
-
-  # ---- 1 · SEED‑AND‑EXPAND ---------------------------------------
-  repeat {
-    all_unused   <- setdiff(seq_along(ur_vec), used_indexes)
-    valid_unused <- all_unused[ ur_vec[all_unused] >= ur_thresh ]
-
-    possible_starts <- setdiff(valid_unused, tried_starting_indexes)
-    if (length(possible_starts) == 0) break
-
-    starting_index <- possible_starts[which.max(ur_vec[possible_starts])]
-
-    asu_emp   <- emp_vec[starting_index]
-    asu_unemp <- unemp_vec[starting_index]
-    asu_pop   <- population_vec[starting_index]
-    asu_ur    <- ifelse(asu_emp + asu_unemp == 0,
-                         0, asu_unemp / (asu_emp + asu_unemp))
-
-    asu_list <- c(starting_index)
-
-    repeat {
-      boundary_tracts <- unique(unlist(nb[asu_list]))
-      boundary_tracts <- setdiff(boundary_tracts, c(asu_list, used_indexes))
-      if (length(boundary_tracts) == 0) break
-
-      res <- choose_best_neighbor(boundary_tracts,
-                                  emp_vec, unemp_vec, population_vec,
-                                  asu_emp, asu_unemp, asu_pop,
-                                  ur_thresh)
-
-      best_index <- res$best_index
-      if (is.na(best_index)) break
-
-      best_path  <- best_index
-      best_ur    <- res$best_ur
-      best_emp   <- res$best_emp
-      best_unemp <- res$best_unemp
-      best_pop   <- res$best_pop
-
-      new_tracts <- setdiff(best_path, asu_list)
-      asu_list   <- c(asu_list, new_tracts)
-
-      asu_emp    <- best_emp
-      asu_unemp  <- best_unemp
-      asu_pop    <- best_pop
-      asu_ur     <- best_ur
-
-      cat(glue::glue("UR: {round(asu_ur, 4)} | Unemp: {round(asu_unemp)} | Emp: {round(asu_emp)} | Pop: {round(asu_pop)}   \r"))
-      flush.console()
-    }
-
-    if (asu_pop >= pop_thresh && asu_ur >= ur_thresh) {
-      asu_groups[[length(asu_groups) + 1]] <- asu_list
-      used_indexes <- c(used_indexes, asu_list)
-    } else {
-      tried_starting_indexes <- c(tried_starting_indexes, starting_index)
-    }
-  }
-
-  data_merge$asunum <- NA
-  for (i in seq_along(asu_groups)) {
-    group_rows <- asu_groups[[i]]
-    data_merge$asunum[group_rows] <- i
-  }
-
-  list(
-    data_merge      = data_merge,
-    nb              = nb,
-    g               = g,
-    emp_vec         = emp_vec,
-    unemp_vec       = unemp_vec,
-    population_vec  = population_vec,
-    ur_vec          = ur_vec,
-    ur_thresh       = ur_thresh,
-    pop_thresh      = pop_thresh
+  # ---- 2 · scale predictors & score ---------------------------------
+  # extract predictors
+  pred_df <- data.frame(
+    tract_ASU_emp   = emp0,
+    tract_ASU_unemp = une0,
+    ur              = ur0,
+    neigh_emp_tot   = neigh_emp_tot,
+    neigh_unemp_tot = neigh_unemp_tot,
+    neigh_emp_avg   = neigh_emp_avg,
+    neigh_unemp_avg = neigh_unemp_avg,
+    neigh_ur_tot    = neigh_ur_tot,
+    neigh_ur_avg    = neigh_ur_avg
   )
+  # z-score
+  pred_scaled <- as.data.frame(
+    lapply(pred_df, function(x) (x - mean(x, na.rm = TRUE)) / sd(x, na.rm = TRUE))
+  )
+  # coefficients
+  coefs <- c(
+    `(Intercept)`    = 15.5542,
+    tract_ASU_emp    = -13.5182,
+    tract_ASU_unemp  =  31.2327,
+    ur               =  -0.3193,
+    neigh_emp_tot    =   1.9780,
+    neigh_unemp_tot  =  -1.7317,
+    neigh_ur_tot     =  -1.4887,
+    neigh_emp_avg    =  -1.6452,
+    neigh_unemp_avg  =   1.8233,
+    neigh_ur_avg     =   1.0896
+  )
+  data_merge$th_score <- coefs["(Intercept)"] +
+    pred_scaled$tract_ASU_emp   * coefs["tract_ASU_emp"] +
+    pred_scaled$tract_ASU_unemp * coefs["tract_ASU_unemp"] +
+    pred_scaled$ur              * coefs["ur"] +
+    pred_scaled$neigh_emp_tot   * coefs["neigh_emp_tot"] +
+    pred_scaled$neigh_unemp_tot * coefs["neigh_unemp_tot"] +
+    pred_scaled$neigh_ur_tot    * coefs["neigh_ur_tot"] +
+    pred_scaled$neigh_emp_avg   * coefs["neigh_emp_avg"] +
+    pred_scaled$neigh_unemp_avg * coefs["neigh_unemp_avg"] +
+    pred_scaled$neigh_ur_avg    * coefs["neigh_ur_avg"]
+
+  # ---- 3 · build graph & connect islands ---------------------------
+  g    <- igraph::graph_from_adj_list(nb, mode = "all")
+  comps<- igraph::components(g)
+  main <- which.max(comps$csize)
+  iso  <- setdiff(unique(comps$membership), main)
+  coords <- data.frame(lat = as.numeric(data_merge$INTPTLAT),
+                       lon = as.numeric(data_merge$INTPTLON))
+  for (i in iso) {
+    mem <- which(comps$membership == i)
+    d   <- expand.grid(island = mem, main = which(comps$membership == main))
+    d$dist <- sqrt((coords$lat[d$island] - coords$lat[d$main])^2 +
+                     (coords$lon[d$island] - coords$lon[d$main])^2)
+    nn  <- d[which.min(d$dist),]
+    g   <- igraph::add_edges(g, c(nn$island, nn$main))
+  }
+
+  # ---- 4 · init build state ----------------------------------------
+  emp_vec   <- emp0
+  une_vec   <- une0
+  pop_vec   <- data_merge$tract_pop_cur
+  ur_vec    <- ur0
+  score_vec <- data_merge$th_score
+  used      <- integer(0)
+  tried     <- integer(0)
+  asu_list  <- list()
+
+  # ---- 5 · SEED & EXPAND using score -------------------------------
+  repeat {
+    all_unused   <- setdiff(seq_along(ur_vec), used)
+    valid_unused <- all_unused[ur_vec[all_unused] >= ur_thresh]
+    starts       <- setdiff(valid_unused, tried)
+    if (length(starts) == 0) break
+    seed         <- starts[which.max(score_vec[starts])]
+    asu          <- seed
+    ae <- emp_vec[seed]; au <- une_vec[seed]; ap <- pop_vec[seed]; ar <- ur_vec[seed]
+    repeat {
+      boundary <- setdiff(unlist(nb[asu]), c(asu, used))
+      if (!length(boundary)) break
+      next_nb  <- boundary[which.max(score_vec[boundary])]
+      ne <- ae + emp_vec[next_nb]; nu <- au + une_vec[next_nb]; np <- ap + pop_vec[next_nb]
+      nr <- if ((ne+nu)==0) 0 else nu/(ne+nu)
+      if (np < pop_thresh || nr < ur_thresh) break
+      asu <- c(asu, next_nb); ae<-ne; au<-nu; ap<-np; ar<-nr
+    }
+    if (ap >= pop_thresh && ar >= ur_thresh) {
+      asu_list[[length(asu_list)+1]] <- asu
+      used <- c(used, asu)
+    } else {
+      tried <- c(tried, seed)
+    }
+  }
+
+  # ---- 6 · assign ASU numbers --------------------------------------
+  data_merge$asunum <- NA_integer_
+  for (i in seq_along(asu_list)) {
+    data_merge$asunum[asu_list[[i]]] <- i
+  }
+
+  # ---- 7 · return state --------------------------------------------
+  list(data_merge      = data_merge,
+       nb              = nb,
+       g               = g,
+       emp_vec         = emp0,
+       unemp_vec       = une0,
+       population_vec  = pop_vec,
+       ur_vec          = ur0,
+       score_vec       = score_vec,
+       ur_thresh       = ur_thresh,
+       pop_thresh      = pop_thresh)
 }
+
+
+
 
 combine_asu_groups_internal <- function(tract_data, nb) {
   assigned <- tract_data %>% filter(!is.na(asunum))
