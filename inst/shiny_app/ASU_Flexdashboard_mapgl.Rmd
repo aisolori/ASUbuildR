@@ -21,9 +21,54 @@ library(tidyverse)
 library(readxl)
 library(Rcpp)
 
-sourceCpp("../../src/choose_best_neighbor.cpp")
-sourceCpp("../../src/build_edges.cpp")
-sourceCpp("../../src/choose_best_drop.cpp")
+# Ensure `here` is available
+if (!requireNamespace("here", quietly = TRUE)) {
+  message("---- DEBUG: Installing 'here' ----")
+  install.packages("here")
+}
+library(here)
+message("DEBUG: Project root detected as: ", here::here())
+
+# Define all C++ source paths
+path_choose_best_neighbor <- here::here("src", "choose_best_neighbor.cpp")
+path_build_edges          <- here::here("src", "build_edges.cpp")
+path_choose_best_drop     <- here::here("src", "choose_best_drop.cpp")
+path_drop_xgb2            <- here::here("src", "choose_best_drop_candidate_xgb2.cpp")
+
+cpp_files <- list(
+  choose_best_neighbor = path_choose_best_neighbor,
+  build_edges          = path_build_edges,
+  choose_best_drop     = path_choose_best_drop,
+  drop_xgb2            = path_drop_xgb2
+)
+
+# Check existence before compiling
+for (nm in names(cpp_files)) {
+  message("DEBUG: Checking C++ file for ", nm, ": ", cpp_files[[nm]])
+  if (!file.exists(cpp_files[[nm]])) {
+    stop("DEBUG ERROR: Missing C++ file: ", cpp_files[[nm]])
+  }
+}
+
+# Try compiling one-by-one with messages
+maybe_sourceCpp <- function(name, path) {
+  message("DEBUG: Compiling ", name, " from ", path)
+  tryCatch({
+    Rcpp::sourceCpp(path, verbose = TRUE, rebuild = TRUE, showOutput = TRUE)
+    message("DEBUG: Successfully compiled ", name)
+  }, error = function(e) {
+    message("DEBUG ERROR during compilation of ", name, ": ", conditionMessage(e))
+    stop(e) # Re-throw so knit stops here
+  })
+}
+
+maybe_sourceCpp("choose_best_neighbor", path_choose_best_neighbor)
+maybe_sourceCpp("build_edges",          path_build_edges)
+maybe_sourceCpp("choose_best_drop",     path_choose_best_drop)
+maybe_sourceCpp("drop_xgb2",            path_drop_xgb2)
+
+message("DEBUG: Finished compiling all C++ helpers.")
+
 
 ## ---- tigris cache ----------------------------------------------------
 ## put cached TIGER/Line ZIPs in a per-user cache folder that is always

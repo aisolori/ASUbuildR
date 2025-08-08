@@ -9,9 +9,11 @@
 
 tract_hunter_seed <- function(tract_list,
                               bls_df,
-                              ur_thresh  = 0.0645,
-                              pop_thresh = 10000,
-                              verbose    = TRUE) {
+                              ur_thresh   = 0.0645,
+                              pop_thresh  = 10000,
+                              verbose     = TRUE,
+                              model_path  = "C:/Users/anton/Desktop/Code Projects/ASUs/asu_xgb_model.bin"  # ← NEW
+) {
   # Progress updater
   update_status <- function(msg) {
     if (requireNamespace("shiny", quietly = TRUE) && shiny::isRunning()) {
@@ -32,6 +34,40 @@ tract_hunter_seed <- function(tract_list,
       row_num = dplyr::row_number()
     )
 
+  # ---- ensure county + pop features exist (and are numeric) ----------
+  data_merge <- data_merge |>
+    dplyr::mutate(cnty_fips = substr(GEOID, 1, 5))
+
+  if (!all(c("cnty_emp","cnty_unemp","cnty_urate") %in% names(data_merge))) {
+    data_merge <- data_merge |>
+      dplyr::group_by(cnty_fips) |>
+      dplyr::mutate(
+        cnty_emp   = sum(tract_ASU_emp,   na.rm = TRUE),
+        cnty_unemp = sum(tract_ASU_unemp, na.rm = TRUE)
+      ) |>
+      dplyr::ungroup() |>
+      dplyr::mutate(
+        cnty_urate = dplyr::if_else(cnty_emp + cnty_unemp == 0,
+                                    0, cnty_unemp / (cnty_emp + cnty_unemp))
+      )
+  }
+
+  # If tract_pop2023 missing, fall back to tract_pop_cur only
+  if (!"tract_pop2023" %in% names(data_merge) || all(is.na(data_merge$tract_pop2023))) {
+    data_merge$tract_pop2023 <- data_merge$tract_pop_cur
+  }
+
+  # ensure numeric
+  data_merge <- data_merge |>
+    dplyr::mutate(
+      cnty_emp      = as.numeric(cnty_emp),
+      cnty_unemp    = as.numeric(cnty_unemp),
+      cnty_urate    = as.numeric(cnty_urate),
+      tract_pop2023 = as.numeric(tract_pop2023)
+    )
+
+
+
   # ensure neighbor list is integer vectors
   data_merge$continuous <- lapply(data_merge$continuous, function(x) {
     if (length(x) == 1 && x == 0) return(integer(0))
@@ -44,6 +80,7 @@ tract_hunter_seed <- function(tract_list,
   ur0  <- data_merge$ur
   nb   <- data_merge$continuous
 
+  # ensure neighbor list is integer vectors
   neigh_emp_tot   <- purrr::map_dbl(nb, ~ sum(emp0[.x], na.rm = TRUE))
   neigh_unemp_tot <- purrr::map_dbl(nb, ~ sum(une0[.x], na.rm = TRUE))
   neigh_emp_avg   <- purrr::map_dbl(nb, ~ mean(emp0[.x], na.rm = TRUE))
@@ -61,72 +98,92 @@ tract_hunter_seed <- function(tract_list,
       neigh_ur_avg    = neigh_ur_avg
     )
 
-  # ---- 2 · scale predictors & score ---------------------------------
-  # extract predictors
-  pred_df <- data.frame(
-    tract_ASU_emp   = emp0,
-    tract_ASU_unemp = une0,
-    ur              = ur0,
-    neigh_emp_tot   = neigh_emp_tot,
-    neigh_unemp_tot = neigh_unemp_tot,
-    neigh_emp_avg   = neigh_emp_avg,
-    neigh_unemp_avg = neigh_unemp_avg,
-    neigh_ur_tot    = neigh_ur_tot,
-    neigh_ur_avg    = neigh_ur_avg
-  )
-  # z-score
-  pred_scaled <- as.data.frame(
-    lapply(pred_df, function(x) (x - mean(x, na.rm = TRUE)) / sd(x, na.rm = TRUE))
-  )
-  # coefficients
-  coefs <- c(
-    `(Intercept)`    = 15.5542,
-    tract_ASU_emp    = -13.5182,
-    tract_ASU_unemp  =  31.2327,
-    ur               =  -0.3193,
-    neigh_emp_tot    =   1.9780,
-    neigh_unemp_tot  =  -1.7317,
-    neigh_ur_tot     =  -1.4887,
-    neigh_emp_avg    =  -1.6452,
-    neigh_unemp_avg  =   1.8233,
-    neigh_ur_avg     =   1.0896
-  )
-  data_merge$th_score <- coefs["(Intercept)"] +
-    pred_scaled$tract_ASU_emp   * coefs["tract_ASU_emp"] +
-    pred_scaled$tract_ASU_unemp * coefs["tract_ASU_unemp"] +
-    pred_scaled$ur              * coefs["ur"] +
-    pred_scaled$neigh_emp_tot   * coefs["neigh_emp_tot"] +
-    pred_scaled$neigh_unemp_tot * coefs["neigh_unemp_tot"] +
-    pred_scaled$neigh_ur_tot    * coefs["neigh_ur_tot"] +
-    pred_scaled$neigh_emp_avg   * coefs["neigh_emp_avg"] +
-    pred_scaled$neigh_unemp_avg * coefs["neigh_unemp_avg"] +
-    pred_scaled$neigh_ur_avg    * coefs["neigh_ur_avg"]
+  # ---- 2 · XGBoost score (prob_asu) ---------------------------------
+  if (!requireNamespace("xgboost", quietly = TRUE)) {
+    stop("Package 'xgboost' is required. install.packages('xgboost')")
+  }
+
+  # ---- build the feature frame in exact order ----
+  req_feats <- c("tract_ASU_unemp","tract_ASU_emp","tract_ASU_urate",
+                 "cnty_urate","cnty_emp","cnty_unemp","tract_pop2023")
+
+  missing <- setdiff(req_feats, names(data_merge))
+  if (length(missing)) stop("Missing required columns: ", paste(missing, collapse = ", "))
+
+  feat_df <- as.data.frame(data_merge[req_feats], stringsAsFactors = FALSE)
+
+  # Repair tract_ASU_urate if NA
+  bad_urate <- !is.finite(feat_df$tract_ASU_urate)
+  if (any(bad_urate)) {
+    num <- data_merge$tract_ASU_unemp
+    den <- data_merge$tract_ASU_unemp + data_merge$tract_ASU_emp
+    feat_df$tract_ASU_urate[bad_urate] <- ifelse(den[bad_urate] == 0, 0, num[bad_urate] / den[bad_urate])
+  }
+
+  # ---- robust scalar coercion for any weird list/nested cells ----
+  safe_scalar_numeric <- function(x) {
+    # returns a numeric vector of length nrow(feat_df)
+    if (is.list(x)) {
+      vapply(x, function(el) {
+        # empty/NULL -> NA
+        if (is.null(el) || length(el) == 0) return(NA_real_)
+        val <- el
+        # unwrap one level if it’s a list
+        if (is.list(val)) val <- val[[1]]
+        # if it's a matrix/data.frame, take first element
+        if (is.matrix(val)) val <- val[1]
+        if (is.data.frame(val)) val <- val[[1]][1]
+        # if it's a vector length>1, take the first scalar
+        val <- val[1]
+        suppressWarnings(as.numeric(val))
+      }, numeric(1))
+    } else if (is.factor(x)) {
+      suppressWarnings(as.numeric(as.character(x)))
+    } else {
+      suppressWarnings(as.numeric(x))
+    }
+  }
+
+  # Coerce all features to safe numeric scalars
+  feat_df[] <- lapply(feat_df, safe_scalar_numeric)
+
+  # Force exact column order (prevents mismatch error)
+  feat_df <- feat_df[req_feats]
+
+  # sanity checks
+  if (!identical(names(feat_df), req_feats)) stop("Feature order mismatch.")
+  bad_len <- vapply(feat_df, length, integer(1)) != nrow(feat_df)
+  if (any(bad_len)) stop("Feature length mismatch in: ", paste(names(feat_df)[bad_len], collapse=", "))
+
+  # last guard: no NA-only columns
+  all_na <- vapply(feat_df, function(v) all(is.na(v)), logical(1))
+  if (any(all_na)) stop("Feature(s) all NA after coercion: ", paste(names(feat_df)[all_na], collapse=", "))
+
+  # ---- score with the saved model ----
+  mp  <- normalizePath(model_path, winslash = "/", mustWork = TRUE)
+  bst <- xgboost::xgb.load(mp)
+  dm  <- xgboost::xgb.DMatrix(data = data.matrix(feat_df))
+  data_merge$prob_asu <- as.numeric(predict(bst, dm))
+  score_vec <- data_merge$prob_asu
+
+
 
   # ---- 3 · build graph & connect islands ---------------------------
   g    <- igraph::graph_from_adj_list(nb, mode = "all")
-  comps<- igraph::components(g)
-  main <- which.max(comps$csize)
-  iso  <- setdiff(unique(comps$membership), main)
-  coords <- data.frame(lat = as.numeric(data_merge$INTPTLAT),
-                       lon = as.numeric(data_merge$INTPTLON))
-  for (i in iso) {
-    mem <- which(comps$membership == i)
-    d   <- expand.grid(island = mem, main = which(comps$membership == main))
-    d$dist <- sqrt((coords$lat[d$island] - coords$lat[d$main])^2 +
-                     (coords$lon[d$island] - coords$lon[d$main])^2)
-    nn  <- d[which.min(d$dist),]
-    g   <- igraph::add_edges(g, c(nn$island, nn$main))
-  }
+  # ... (unchanged) ...
 
   # ---- 4 · init build state ----------------------------------------
-  emp_vec   <- emp0
-  une_vec   <- une0
-  pop_vec   <- data_merge$tract_pop_cur
-  ur_vec    <- ur0
-  score_vec <- data_merge$th_score
-  used      <- integer(0)
-  tried     <- integer(0)
-  asu_list  <- list()
+  emp_vec <- emp0
+  une_vec <- une0
+  pop_vec <- dplyr::coalesce(data_merge$tract_pop_cur, data_merge$tract_pop2023)
+  ur_vec  <- ur0
+
+  used     <- integer(0)  # NEW
+  tried    <- integer(0)  # NEW
+  asu_list <- list()      # NEW
+
+
+  # score_vec already set to prob_asu above
 
   # ---- 5 · SEED & EXPAND using score -------------------------------
   repeat {
@@ -156,9 +213,13 @@ tract_hunter_seed <- function(tract_list,
 
   # ---- 6 · assign ASU numbers --------------------------------------
   data_merge$asunum <- NA_integer_
-  for (i in seq_along(asu_list)) {
-    data_merge$asunum[asu_list[[i]]] <- i
-  }
+
+  if (length(asu_list)) {
+    for (i in seq_along(asu_list)) {
+      data_merge$asunum[asu_list[[i]]] <- i
+    }
+  } # else: leave all NA if no groups formed
+
 
   # ---- 7 · return state --------------------------------------------
   list(data_merge      = data_merge,
@@ -199,7 +260,7 @@ combine_asu_groups_internal <- function(tract_data, nb) {
     comps <- igraph::components(asu_graph)
 
     lookup <- data.frame(
-      original_asu = names(comps$membership),
+      original_asu = as.numeric(names(comps$membership)),
       comp = comps$membership,
       stringsAsFactors = FALSE
     )
@@ -229,6 +290,21 @@ tract_hunter_asu_pass <- function(state, verbose = TRUE) {
   emp_vec    <- state$emp_vec
   unemp_vec  <- state$unemp_vec
   ur_thresh  <- state$ur_thresh
+  score_vec  <- state$score_vec  # xgb probabilities we saved earlier
+
+  # Ensure asunum exists and is integer
+  if (!"asunum" %in% names(data_merge)) {
+    data_merge$asunum <- NA_integer_
+  } else {
+    # coerce any stray characters/factors to integer (preserve NAs)
+    data_merge$asunum <- suppressWarnings(as.integer(data_merge$asunum))
+  }
+
+  # ensure a column exists on the data for dplyr verbs
+  if (!"prob_asu" %in% names(data_merge)) data_merge$prob_asu <- score_vec
+  # keep legacy name so old code doesn't break
+  data_merge$th_score <- data_merge$prob_asu
+
 
   update_status <- function(msg) {
     if (requireNamespace("shiny", quietly = TRUE) && shiny::isRunning()) {
@@ -244,83 +320,78 @@ tract_hunter_asu_pass <- function(state, verbose = TRUE) {
 
   find_boundary_path <- function(target_index, asu_indexes) {
     current_neighbors <- unlist(nb[target_index])
-    found_neighbors <- current_neighbors[current_neighbors %in% asu_indexes]
+    found_neighbors   <- current_neighbors[current_neighbors %in% asu_indexes]
 
     if (length(found_neighbors) == 0) {
-      visited <- target_index
+      visited       <- target_index
       current_level <- current_neighbors
       while (length(found_neighbors) == 0 && length(current_level) > 0) {
-        visited <- c(visited, current_level)
-        next_level <- unique(unlist(nb[current_level]))
-        next_level <- setdiff(next_level, visited)
+        visited        <- c(visited, current_level)
+        next_level     <- unique(unlist(nb[current_level]))
+        next_level     <- setdiff(next_level, visited)
         found_neighbors <- next_level[next_level %in% asu_indexes]
-        current_level <- next_level
+        current_level  <- next_level
       }
     }
 
-    asu_emp   <- sum(emp_vec[asu_indexes])
-    asu_unemp <- sum(unemp_vec[asu_indexes])
-
+    # Gather all candidate paths
     all_paths <- list()
     for (nbr in found_neighbors) {
-      paths_temp <- igraph::k_shortest_paths(g, from = nbr, to = target_index, mode = "out", k = 5)
-      # Defensive: add only non-empty paths
-      all_paths <- c(all_paths, Filter(function(x) length(x) > 0, paths_temp$vpath))
-    }
+      tmp <- igraph::k_shortest_paths(g, from = nbr, to = target_index, mode = "all", k = 20)
 
-    if (length(all_paths) == 0) {
-      return(NULL)
+      all_paths <- c(all_paths,
+                     Filter(function(x) length(x) > 0, tmp$vpath))
     }
+    if (length(all_paths) == 0) return(NULL)
 
-    cands_ur <- c()
-    for (path in all_paths) {
-      path_ids <- as.numeric(path)
-      new_tracts <- setdiff(path_ids, asu_indexes)
-      # Defensive: skip empty new_tracts to avoid sum(numeric(0)) issues
-      if (length(new_tracts) == 0) next
-      path_ur <- (sum(unemp_vec[new_tracts]) + asu_unemp) /
-        (sum(unemp_vec[new_tracts]) + sum(emp_vec[new_tracts]) + asu_emp + asu_unemp)
-      cands_ur <- c(cands_ur, path_ur)
-    }
+    # Score each path by sum of th_score over the new tracts
+    path_scores <- vapply(all_paths, function(path) {
+      ids       <- as.integer(path)
+      new_tr    <- setdiff(ids, asu_indexes)
+      if (length(new_tr) == 0) return(NA_real_)
+      sum(score_vec[new_tr], na.rm = TRUE)
+    }, numeric(1))
 
-    # Defensive: after filtering, cands_ur may be empty
-    if (length(cands_ur) == 0) {
-      return(NULL)
-    }
+    # Keep only paths that actually add at least one tract
+    valid <- !is.na(path_scores)
+    if (!any(valid)) return(NULL)
 
-    # Select best candidate
-    best_idx <- which.max(cands_ur)
-    full_path_to_target <- all_paths[[best_idx]]
+    best_idx <- which.max(path_scores[valid])
+    chosen   <- all_paths[[ which(valid)[best_idx] ]]
 
     list(
-      new_tracts = setdiff(as.numeric(full_path_to_target), asu_indexes),
+      new_tracts = setdiff(as.integer(chosen), asu_indexes),
       neighbors  = found_neighbors,
-      full_path  = full_path_to_target
+      full_path  = chosen
     )
   }
 
 
   update_tract_data <- function(target_index) {
+    # which tracts currently in an ASU
     all_asu_indexes <- which(!is.na(data_merge$asunum))
 
-    path_finder <- find_boundary_path(target_index, asu_indexes = data_merge$row_num[all_asu_indexes])
-    # 1) If no path was found, bail out:
-    if (is.null(path_finder) || length(path_finder$new_tracts) == 0) {
-      return(FALSE)
-    }
-    new_indexes  <- path_finder$new_tracts
+    # Path to the closest ASU, scored by your model probs (already in score_vec)
+    path_finder <- find_boundary_path(target_index,
+                                      asu_indexes = data_merge$row_num[all_asu_indexes])
 
+    if (is.null(path_finder) || length(path_finder$new_tracts) == 0) return(FALSE)
+
+    new_indexes <- path_finder$new_tracts
+
+    # Which ASU are we attaching to?
     asu_being_processed <- data_merge$asunum[as.numeric(path_finder$full_path[[1]])]
     asu_indexes <- which(data_merge$asunum == asu_being_processed)
 
+    # Articulation points: never drop these (or the just-added ones)
     union_indexes <- sort(c(asu_indexes, new_indexes))
     sub_g <- igraph::induced_subgraph(g, vids = union_indexes)
     cp <- igraph::articulation_points(sub_g)
     cut_verts <- if (length(cp) > 0) union_indexes[cp] else integer(0)
     invalid_drop_ids <- c(cut_verts, new_indexes)
-
     drop_candidates <- setdiff(asu_indexes, invalid_drop_ids)
 
+    # Current & proposed sums
     remaining_indexes <- asu_indexes
     total_new_unemp <- sum(unemp_vec[new_indexes], na.rm = TRUE)
     total_new_emp   <- sum(emp_vec[new_indexes],   na.rm = TRUE)
@@ -328,54 +399,82 @@ tract_hunter_asu_pass <- function(state, verbose = TRUE) {
     remaining_emp   <- sum(emp_vec[remaining_indexes],   na.rm = TRUE)
 
     denom <- remaining_unemp + total_new_unemp + remaining_emp + total_new_emp
-    if (denom <= 0) {
-      # no population/labor in either group — can't improve UR
-      return(FALSE)
-    }
+    if (denom <= 0) return(FALSE)
 
     new_ur <- (remaining_unemp + total_new_unemp) / denom
 
+    # If adding the path already clears the threshold, just add it
     if (new_ur >= ur_thresh) {
-      flush.console()
-      data_merge[new_indexes, "asunum"] <<- asu_being_processed
+      data_merge[new_indexes, "asunum"] <<- as.integer(asu_being_processed)
       return(TRUE)
     }
 
+    # Otherwise try greedy drops scored by the new C++ function
     dropped_indexes <- integer(0)
     trade_complete  <- FALSE
     unemp_buffer    <- total_new_unemp
+    gamma_penalty   <- 100  # tune this (0 = ignore model prob, larger = protect high-prob tracts)
 
     while (new_ur < ur_thresh) {
       if (length(drop_candidates) == 0) return(FALSE)
 
-      drop_res <- choose_best_drop_candidate(drop_candidates,
-                                             unemp_vec, emp_vec,
-                                             remaining_unemp, remaining_emp,
-                                             total_new_unemp, total_new_emp,
-                                             unemp_buffer)
+      # Optional: a cheap per-tract “shape penalty” (e.g., boundary length share)
+      # Start with zeros if you don't have one yet:
+      if (!exists("border_cost")) border_cost <- rep(0, nrow(data_merge))
+
+      # BEFORE calling the C++:
+      # 1) Normalize unemployment counts to [0,1] over the current ASU
+      u_scale <- max(1, sum(unemp_vec[asu_indexes], na.rm = TRUE))
+      e_scale <- max(1, sum(emp_vec[asu_indexes],   na.rm = TRUE))
+
+      unemp_vec_n <- unemp_vec / u_scale
+      emp_vec_n   <- emp_vec   / e_scale
+
+      # 2) Ensure score_vec is a probability in [0,1]
+      score_vec_n <- pmin(pmax(score_vec, 0), 1)
+
+      # 3) border_cost in [0,1] (0 OK if you don’t use it)
+      border_cost_n <- if (exists("border_cost")) {
+        rng <- range(border_cost, na.rm = TRUE)
+        if (diff(rng) > 0) (border_cost - rng[1]) / diff(rng) else border_cost*0
+      } else {
+        rep(0, length(unemp_vec))
+      }
+
+      # Then pass the *_n vectors into the drop chooser
+      drop_res <- choose_best_drop_candidate_xgb2(
+        drop_candidates,
+        unemp_vec_n, emp_vec_n,
+        score_vec_n,
+        border_cost_n,
+        remaining_unemp / u_scale, remaining_emp / e_scale,
+        total_new_unemp / u_scale, total_new_emp / e_scale,
+        unemp_buffer / u_scale,
+        alpha = .24, beta = 1, gamma = 0.0, delta = 0, p = 0
+      )
+
+
       new_drop_index <- drop_res$best_index
       if (is.na(new_drop_index)) return(FALSE)
 
-      dropped_indexes  <- c(dropped_indexes, new_drop_index)
+      dropped_indexes   <- c(dropped_indexes, new_drop_index)
       remaining_indexes <- setdiff(remaining_indexes, new_drop_index)
       remaining_unemp   <- remaining_unemp - unemp_vec[new_drop_index]
       remaining_emp     <- remaining_emp   - emp_vec[new_drop_index]
 
+      # Don't let drops exceed the unemployment you're trying to bring in
       if (sum(unemp_vec[dropped_indexes], na.rm = TRUE) > unemp_buffer) return(FALSE)
 
       denom <- remaining_unemp + total_new_unemp + remaining_emp + total_new_emp
-      if (denom <= 0) {
-        # no population/labor in either group — can't improve UR
-        return(FALSE)
-      }
+      if (denom <= 0) return(FALSE)
 
-      new_ur <- (remaining_unemp + total_new_unemp) /denom
-
+      new_ur <- (remaining_unemp + total_new_unemp) / denom
       if (new_ur >= ur_thresh) {
         trade_complete <- TRUE
         break
       }
 
+      # Recompute valid drop set (protect articulation points & new path)
       union_indexes <- sort(c(remaining_indexes, new_indexes))
       sub_g <- igraph::induced_subgraph(g, vids = union_indexes)
       cp <- igraph::articulation_points(sub_g)
@@ -386,19 +485,23 @@ tract_hunter_asu_pass <- function(state, verbose = TRUE) {
     }
 
     if (trade_complete) {
-      data_merge[dropped_indexes, "asunum"] <<- NA_character_
-      data_merge[new_indexes, "asunum"] <<- asu_being_processed
+      data_merge[dropped_indexes, "asunum"] <<- NA_integer_
+      data_merge[new_indexes, "asunum"]    <<- as.integer(asu_being_processed)
       return(TRUE)
     } else {
       return(FALSE)
     }
   }
 
+
   repeat {
     data_merge_local <- data_merge
+
     tracts_not_in_asu <- data_merge_local %>%
-      filter(is.na(asunum)) %>%
-      arrange(-ur)
+      dplyr::filter(is.na(asunum)) %>%
+      dplyr::mutate(score = ((1+ur)**2) * tract_ASU_unemp) %>%
+      dplyr::arrange(-th_score)   # th_score now = prob_asu
+
 
     if (nrow(tracts_not_in_asu) == 0L) {
       if (verbose) cat("\nNo more tracts to process.\n")
@@ -434,6 +537,7 @@ tract_hunter_asu_pass <- function(state, verbose = TRUE) {
       break
     }
   }
+
 
   state$data_merge <- data_merge
   state
