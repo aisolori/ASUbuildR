@@ -16,13 +16,17 @@
 #' @param ur_thresh Unemployment rate threshold
 #' @param pop_thresh Population threshold
 #' @param verbose Logical, print progress messages
+#' @param unemp_power Exponent applied to unemployment counts when scoring neighbors
+#' @param ur_weight Power applied to unemployment rate when scoring neighbors
 #' @return A list representing the algorithm state
 #' @keywords internal
 tract_hunter_seed <- function(tract_list,
                               bls_df,
                               ur_thresh  = 0.0645,
                               pop_thresh = 10000,
-                              verbose    = TRUE) {
+                              verbose    = TRUE,
+                              unemp_power = 0.9,
+                              ur_weight   = 1.0) {
 
   update_status <- function(msg) {
     if (requireNamespace("shiny", quietly = TRUE) && shiny::isRunning()) {
@@ -109,7 +113,9 @@ tract_hunter_seed <- function(tract_list,
       res <- choose_best_neighbor(boundary_tracts,
                                   emp_vec, unemp_vec, population_vec,
                                   asu_emp, asu_unemp, asu_pop,
-                                  ur_thresh)
+                                  ur_thresh,
+                                  unemp_power = unemp_power,
+                                  ur_weight   = ur_weight)
 
       best_index <- res$best_index
       if (is.na(best_index)) break
@@ -220,9 +226,16 @@ combine_asu_groups_internal <- function(tract_data, nb) {
 #'
 #' @param state Internal state list from `tract_hunter_seed`
 #' @param verbose Logical, print progress messages
+#' @param path_len_weight Penalty applied per tract when evaluating boundary paths
+#' @param unemp_power Exponent applied to unemployment counts when scoring neighbors
+#' @param ur_weight Power applied to unemployment rate when scoring neighbors
 #' @return Updated state list
 #' @keywords internal
-tract_hunter_asu_pass <- function(state, verbose = TRUE) {
+tract_hunter_asu_pass <- function(state,
+                                  verbose = TRUE,
+                                  path_len_weight = 0,
+                                  unemp_power = 0.9,
+                                  ur_weight = 1.0) {
 
   data_merge <- state$data_merge
   nb         <- state$nb
@@ -243,7 +256,7 @@ tract_hunter_asu_pass <- function(state, verbose = TRUE) {
     sum(unemp_vec[indexes])/(sum(emp_vec[indexes])+sum(unemp_vec[indexes]))
   }
 
-  find_boundary_path <- function(target_index, asu_indexes) {
+  find_boundary_path <- function(target_index, asu_indexes, path_len_weight) {
     current_neighbors <- unlist(nb[target_index])
     found_neighbors <- current_neighbors[current_neighbors %in% asu_indexes]
 
@@ -281,7 +294,8 @@ tract_hunter_asu_pass <- function(state, verbose = TRUE) {
       if (length(new_tracts) == 0) next
       path_ur <- (sum(unemp_vec[new_tracts]) + asu_unemp) /
         (sum(unemp_vec[new_tracts]) + sum(emp_vec[new_tracts]) + asu_emp + asu_unemp)
-      cands_ur <- c(cands_ur, path_ur)
+      path_score <- path_ur - path_len_weight * length(new_tracts)
+      cands_ur <- c(cands_ur, path_score)
     }
 
     # Defensive: after filtering, cands_ur may be empty
@@ -303,7 +317,9 @@ tract_hunter_asu_pass <- function(state, verbose = TRUE) {
   update_tract_data <- function(target_index) {
     all_asu_indexes <- which(!is.na(data_merge$asunum))
 
-    path_finder <- find_boundary_path(target_index, asu_indexes = data_merge$row_num[all_asu_indexes])
+    path_finder <- find_boundary_path(target_index,
+                                      asu_indexes = data_merge$row_num[all_asu_indexes],
+                                      path_len_weight = path_len_weight)
     # 1) If no path was found, bail out:
     if (is.null(path_finder) || length(path_finder$new_tracts) == 0) {
       return(FALSE)
@@ -501,6 +517,9 @@ tract_hunter_finalize <- function(state) {
 #' @param pop_thresh Population threshold
 #' @param join_touching Logical, join touching ASUs after first pass
 #' @param verbose Logical, print progress messages
+#' @param unemp_power Exponent applied to unemployment counts when scoring neighbors
+#' @param ur_weight Power applied to unemployment rate when scoring neighbors
+#' @param path_len_weight Penalty applied per tract when evaluating boundary paths
 #' @return A list of results similar to `run_asu_original()`
 #' @keywords internal
 run_tract_hunter <- function(tract_list,
@@ -508,17 +527,30 @@ run_tract_hunter <- function(tract_list,
                              ur_thresh  = 0.0645,
                              pop_thresh = 10000,
                              join_touching = TRUE,
-                             verbose    = TRUE) {
+                             verbose    = TRUE,
+                             unemp_power = 0.9,
+                             ur_weight   = 1.0,
+                             path_len_weight = 0) {
   state <- tract_hunter_seed(tract_list, bls_df,
                              ur_thresh = ur_thresh,
                              pop_thresh = pop_thresh,
-                             verbose = verbose)
+                             verbose = verbose,
+                             unemp_power = unemp_power,
+                             ur_weight   = ur_weight)
 
-  state <- tract_hunter_asu_pass(state, verbose = verbose)
+  state <- tract_hunter_asu_pass(state,
+                                 verbose = verbose,
+                                 path_len_weight = path_len_weight,
+                                 unemp_power = unemp_power,
+                                 ur_weight = ur_weight)
 
   if (isTRUE(join_touching)) {
     state <- tract_hunter_combine_groups(state)
-    state <- tract_hunter_asu_pass(state, verbose = verbose)
+    state <- tract_hunter_asu_pass(state,
+                                   verbose = verbose,
+                                   path_len_weight = path_len_weight,
+                                   unemp_power = unemp_power,
+                                   ur_weight = ur_weight)
   }
 
   tract_hunter_finalize(state)
