@@ -94,6 +94,19 @@ edit_table <- shiny::reactiveVal(NULL)
 edit_summary <- shiny::reactiveVal(NULL)
 current_selection <- shiny::reactiveVal(NULL)
 
+# New England Optional year selection logic
+output$is_new_england <- shiny::reactive({
+  if (is.null(state())) return(FALSE)
+  
+  # New England state FIPS codes
+  new_england_fips <- c("09", "23", "25", "33", "44", "50")  # CT, ME, MA, NH, RI, VT
+  
+  state() %in% new_england_fips
+})
+
+# Make it available to the UI
+shiny::outputOptions(output, "is_new_england", suspendWhenHidden = FALSE)
+
 # Tract Hunter staged state -----------------------------------------
 th_state <- shiny::reactiveVal(NULL)
 th_tract_list <- shiny::reactiveVal(NULL)
@@ -181,7 +194,13 @@ shiny::observeEvent(input$file, {
            tract_ASU_clf,
            tract_ASU_emp,
            tract_ASU_unemp,
-           tract_ASU_urate)
+           tract_ASU_urate) |> 
+    dplyr::mutate(
+      tract_pop_cur = as.integer(tract_pop_cur),
+      tract_ASU_clf = as.integer(tract_ASU_clf),
+      tract_ASU_emp = as.integer(tract_ASU_emp),
+      tract_ASU_unemp = as.integer(tract_ASU_unemp)
+    )
   
   uploaded_data(df)
   
@@ -214,12 +233,36 @@ shiny::observeEvent(input$file, {
 ## Controls {data-width="200"}
 
 ```{r}
+# ---- New England year override controls ------------------------------
+shiny::conditionalPanel(
+  condition = "output.is_new_england === true",
+  shiny::tagList(
+    shiny::hr(style = "margin: 0.8rem 0;"),
+    shiny::h5("New England Year Selection"),
+    shiny::radioButtons(
+      inputId = "ne_year_choice",
+      label   = "Choose tract year:",
+      choices = list(
+        "Use detected year (default)" = "detected",
+        "Use 2021 (last NECTA year)"  = "2021"
+      ),
+      selected = "detected",
+      inline = FALSE
+    ),
+    shiny::p(
+      style = "font-size: 0.9em; color: #666;",
+      "Note: 2021 is the last year NECTA-based tracts were available for New England states."
+    )
+  )
+)
+
 # ---- algorithm picker -------------------------------------------------
 shiny::radioButtons(
   inputId = "asu_algo",
   label   = "Choose algorithm",
-  choices = c("Original"      = "orig",
-              "Tract Hunter"  = "mine"),
+  choices = c(
+    "Tract Hunter"  = "mine",
+    "Simple Snake"  = "orig"),
   inline  = TRUE
 )
 
@@ -247,6 +290,7 @@ shiny::conditionalPanel(
     )
   )
 )
+
 
 # ---- dynamic algorithm description -----------------------------------
 output$algo_blurb <- shiny::renderUI({
@@ -280,25 +324,23 @@ output$algo_blurb <- shiny::renderUI({
   } else {
     ## ───────── TRACT-HUNTER METHOD ─────────
     shiny::HTML(
-      "<p><strong>Tract Hunter pipeline</strong></p>
+      "<p><strong>Tract Hunter workflow</strong></p>
        <p>Because Tract Hunter works in stages, the interface exposes those
           stages as separate buttons:</p>
        <ul>
          <li><em>Load tracts & initialise</em><br>
              ▸ downloads shapefiles, merges the BLS file, then runs the
-             <strong>Seed + Expand</strong> step automatically.</li>
-         <li><em>Run ASU Pass</em><br>
+             <strong>Seed + Expand</strong> step automatically. This should only be run once.</li>
+         <li><em>Run Hunter</em><br>
              ▸ performs the optimisation/trade pass that adds
              high-unemployment neighbours and drops low-unemployment ones until
              every ASU is as close as possible to the
-             <code>6.45&nbsp;%</code> threshold.</li>
+             <code>6.45%</code> threshold.</li>
          <li><em>Combine Groups</em><br>
-             ▸ merges adjacent ASUs that share a boundary, then performs a
-             <em>second</em> optimisation pass so no eligible tract is left
-             behind.</li>
+             ▸ merges adjacent ASUs that share a boundary. Connected ASUs allow for more tracts to be added, so whenever ASUs are merged it is advisable to run another pass with the Tract Hunter.</li>
        </ul>
        <p>You can stop after any step to inspect the map, or run the buttons
-          in sequence for the full, automatic workflow.  Each step updates the
+          in sequence for the full, automatic workflow. We suggest iteratively running the Run Hunter and Combine Groups steps until Total Unemployment in ASUs no longer increases.  Each step updates the
           colour map and the unemployment totals shown on the right.</p>"
     )
   }
@@ -307,6 +349,7 @@ output$algo_blurb <- shiny::renderUI({
 shiny::uiOutput("algo_blurb")
 
 shiny::htmlOutput("total_unemp")
+
 shiny::tableOutput("asu")
 
 palette_logic <- function(n_asu) {
@@ -349,11 +392,30 @@ shiny::observeEvent(input$process, {
   ## 0 · Basic checks ----------------------------------------------------
   shiny::req(uploaded_data(), state(), tract_year())
 
+  # Determine which year to use
+  selected_year <- tract_year()  # default to detected year
+  
+  # Check if this is New England and user selected 2021
+  state_val <- state()
+  if (!is.null(state_val) && length(state_val) > 0) {
+    new_england_fips <- c("09", "23", "25", "33", "44", "50")
+    if (state_val %in% new_england_fips && 
+        !is.null(input$ne_year_choice) && 
+        input$ne_year_choice == "2021") {
+      selected_year <- "2021"
+    }
+  }
+
   ## 1 · Wrap the whole long job in withProgress -------------------------
   shiny::withProgress(message = "Running ASU initialisation…", value = 0, {
+
     ## 1a · Build tracts + neighbours (can take ~10–60 s the first time)
     shiny::incProgress(0.10, detail = "Downloading Census shapefiles…")
-    tract_list <- tigris::tracts(state = state(), year = tract_year()) |>
+    
+    # CHANGE THIS LINE FROM:
+    # tract_list <- tigris::tracts(state = state(), year = tract_year()) |>
+    # TO:
+    tract_list <- tigris::tracts(state = state(), year = selected_year) |>
       dplyr::mutate(
         row_num    = dplyr::row_number(),
         continuous = sfdep::st_contiguity(geometry)
@@ -393,7 +455,7 @@ shiny::observeEvent(input$process, {
     asu_data(res$asu_data)
     asu_tracts(res$asu_tracts)
     asu_summary(res$asu_summary)
-    map_geom(prep_map_data(res$full_data))
+    map_geom(prep_map_data(res$full_data))}
 
     output$asu <- shiny::renderTable(asu_summary(), digits = 3)
 
@@ -401,14 +463,56 @@ shiny::observeEvent(input$process, {
 
     output$initial_map <- mapgl::renderMaplibre({
       shiny::req(map_geom())
-      map_data <- map_geom()
 
-      if (nrow(map_data) == 0) {
-        return(
-          mapgl::maplibre(style = mapgl::carto_style("positron")) |>
-            mapgl::add_control("No valid polygon geometry to display.", "top-left")
-        )
-      }
+    shiny::req(full_data())
+    map_data <- full_data()
+
+    # ---- 6·1 geometry housekeeping ----------------------------------
+    map_data <- map_data |>
+      sf::st_make_valid() |>
+      sf::st_zm(what = "ZM", drop = TRUE) |>
+      dplyr::filter(!sf::st_is_empty(geometry)) |>
+      dplyr::mutate(geom_type = sf::st_geometry_type(geometry)) |>
+      dplyr::filter(geom_type %in% c("POLYGON", "MULTIPOLYGON")) |>
+      dplyr::select(-geom_type)
+
+    if (nrow(map_data) == 0) {
+      return(
+        mapgl::maplibre(style = mapgl::carto_style("positron")) |>
+        mapgl::add_control("No valid polygon geometry to display.", "top-left")
+      )
+    }
+
+    # ---- 6·2 palette / breaks ---------------------------------------
+    map_data <- map_data |>
+      dplyr::mutate(asunum = dplyr::na_if(asunum, 0L))
+
+    n_asu <- max(map_data$asunum, na.rm = TRUE)
+    n_asu <- ifelse(is.finite(n_asu), n_asu, 0L)
+
+    pal <- palette_logic(n_asu)
+
+    # ---- 6·3 build map ----------------------------------------------
+    mapgl::maplibre(style = mapgl::carto_style("positron")) |>
+      mapgl::fit_bounds(map_data, animate = FALSE) |>
+      mapgl::add_fill_layer(
+        id                 = "basemap",
+        source             = map_data,
+        fill_color         = pal$fill,
+        fill_opacity       = 0.6,
+        fill_outline_color = "black",
+        tooltip = mapgl::concat(
+          "<strong>ASU Number: </strong>", mapgl::get_column("asunum"), "<br>",
+          "<strong>Tract GEOID: </strong>", mapgl::get_column("GEOID"),  "<br>",
+          "<strong>UR: </strong>",
+          mapgl::number_format(mapgl::get_column("tract_ASU_urate"),
+                        style = "decimal", maximum_fraction_digits = 2),
+          "%<br>",
+          "<strong>Unemp: </strong>",
+          mapgl::number_format(mapgl::get_column("tract_ASU_unemp"),
+                        style = "decimal", maximum_fraction_digits = 0), "<br>"
+
+        ))
 
       # ---- 6·2 palette / breaks ---------------------------------------
       map_data <- map_data |>
@@ -451,8 +555,9 @@ shiny::observeEvent(input$process, {
           type   = "categorical"
         )
     })
-  }
-}) # ---- end observeEvent -------------------------------------------------
+  })
+  
+  # ---- end observeEvent -------------------------------------------------
 
 shiny::observeEvent(input$th_pass, {
   shiny::req(th_state())
@@ -479,6 +584,45 @@ shiny::observeEvent(input$th_pass, {
       dplyr::mutate(asunum = dplyr::na_if(asunum, 0L))
     n_asu <- max(map_data$asunum, na.rm = TRUE)
     n_asu <- ifelse(is.finite(n_asu), n_asu, 0L)
+    
+
+    palette_logic <- function(n_asu) {
+  if (n_asu == 0) {
+    list(fill = "#E0E0E0",
+         legend_vals = "(none)",
+         legend_cols = "#E0E0E0")
+
+  } else if (n_asu == 1) {
+    list(
+      fill  = mapgl::step_expr(column="asunum",
+                        base="#E0E0E0",
+                        stops="#7FC97F",
+                        values=1,
+                        na_color="#E0E0E0"),
+      legend_vals = 1,
+      legend_cols = "#7FC97F"
+    )
+
+  } else {
+    n_cat <- min(max(n_asu, 3L), 8L)          # 3-to-8 distinct hues
+    pal   <- RColorBrewer::brewer.pal(n_cat, "Accent")
+
+    # make colours exactly as long as the value vector
+    legend_cols <- rep_len(pal, n_asu)
+
+    breaks <- seq(1 + n_asu / n_cat, n_asu, length.out = n_cat - 1)
+
+    list(
+      fill = mapgl::step_expr(column   = "asunum",
+                       base     = pal[1],
+                       stops    = pal[-1],
+                       values   = breaks,
+                       na_color = "#E0E0E0"),
+      legend_vals = seq_len(n_asu),
+      legend_cols = legend_cols
+    )
+  }
+}
     
     pal <- palette_logic(n_asu)
     mapgl::maplibre(style = mapgl::carto_style("positron")) |>
@@ -519,6 +663,8 @@ shiny::observeEvent(input$th_combine, {
     n_asu <- max(map_data$asunum, na.rm = TRUE)
     n_asu <- ifelse(is.finite(n_asu), n_asu, 0L)
     
+
+
     pal <- palette_logic(n_asu)
     mapgl::maplibre(style = mapgl::carto_style("positron")) |>
       mapgl::fit_bounds(map_data, animate = FALSE) |>
@@ -547,6 +693,13 @@ output$total_unemp <- shiny::renderUI({
            scales::comma(total_unemp()))
   )
 })
+
+output$total_unemp2 <- shiny::renderUI({
+  shiny::HTML(
+    paste0("<strong>Total Unemployment in ASUs:</strong> ",
+           scales::comma(total_unemp()))
+  )
+})
 ```
 
 ## Output {data-width="800"}
@@ -562,6 +715,10 @@ mapgl::maplibreOutput("initial_map", height = "100vh")
 These tools allow you to select, inspect, and change ASU designations for individual Census tracts.  *Selected* Census tracts will be outlined in red, and are the tracts updated when you change the ASU number.  You may also click on the map to select or unselect individual tracts. An ASU value of 0 means the tract is not included in any ASU.
 
 ```{r}
+#-------Total Unemployment Box --------------------------------
+shiny::htmlOutput("total_unemp2")
+shiny::renderUI(shiny::HTML("<hr>"))
+
 # Select an ASU
 asu_selection_ui <- shiny::reactive({
   shiny::selectInput("select_asunum", "Select ASU Number:",
@@ -647,10 +804,10 @@ output$edit_map <- mapgl::renderMaplibre({
       source = map_geom(),
       fill_color = mapgl::step_expr(
         column = "asunum",
-        base = "#808080",  # Grey for asunum == 0 (and anything < first break)
+        base = "#E0E0E0",  # Grey for asunum == 0 (and anything < first break)
         stops = brewer_pal,
         values = asu_breaks,
-        na_color = "#444444"
+        na_color = "#E0E0E0"
       ),
       fill_opacity = 0.5,
       fill_outline_color = "black",
@@ -930,10 +1087,7 @@ Modification tab to continue making edits.
 ```{r}
 # Directory selection - Simple text input approach
 shiny::textInput("save_dir_path", "Save Directory Path:", value = getwd(), width = "100%")
-shiny::br()
-shiny::actionButton("browse_dir", "Browse for Directory")
-shiny::br()
-shiny::br()
+#shiny::actionButton("browse_dir", "Browse for Directory") # non-functional
 shiny::textOutput("current_save_dir")
 shiny::textOutput("dir_status")
 shiny::br()
@@ -953,34 +1107,34 @@ shiny::observeEvent(input$save_dir_path, {
   }
 })
 
-# Alternative browse button (opens file dialog for directory selection)
-shiny::observeEvent(input$browse_dir, {
-  # This will work in RStudio or desktop R
-  if (interactive()) {
-    selected_dir <- tryCatch({
-      utils::choose.dir(default = save_directory(), caption = "Select Save Directory")
-    }, error = function(e) {
-      # For non-Windows systems, use tcltk
-      tryCatch({
-        tcltk::tk_choose.dir(default = save_directory(), caption = "Select Save Directory")
-      }, error = function(e2) {
-        NULL
-      })
-    })
-    
-    if (!is.null(selected_dir) && selected_dir != "") {
-      shiny::updateTextInput(session, "save_dir_path", value = selected_dir)
-      save_directory(selected_dir)
-    }
-  } else {
-    # In web-deployed apps, show instruction
-    shiny::showModal(shiny::modalDialog(
-      title = "Directory Selection",
-      "In web-deployed apps, please manually enter the directory path in the text field above.",
-      easyClose = TRUE
-    ))
-  }
-})
+# # Alternative browse button (opens file dialog for directory selection)
+# shiny::observeEvent(input$browse_dir, {
+#   # This will work in RStudio or desktop R
+#   if (interactive()) {
+#     selected_dir <- tryCatch({
+#       utils::choose.dir(default = save_directory(), caption = "Select Save Directory")
+#     }, error = function(e) {
+#       # For non-Windows systems, use tcltk
+#       tryCatch({
+#         tcltk::tk_choose.dir(default = save_directory(), caption = "Select Save Directory")
+#       }, error = function(e2) {
+#         NULL
+#       })
+#     })
+#     
+#     if (!is.null(selected_dir) && selected_dir != "") {
+#       shiny::updateTextInput(session, "save_dir_path", value = selected_dir)
+#       save_directory(selected_dir)
+#     }
+#   } else {
+#     # In web-deployed apps, show instruction
+#     shiny::showModal(shiny::modalDialog(
+#       title = "Directory Selection",
+#       "In web-deployed apps, please manually enter the directory path in the text field above.",
+#       easyClose = TRUE
+#     ))
+#   }
+# })
 
 # Display current save directory
 output$current_save_dir <- shiny::renderText({
@@ -1094,10 +1248,10 @@ shiny::observeEvent(input$load_data, {
       source = map_geom(),
       fill_color = mapgl::step_expr(
         column = "asunum",
-        base = "#808080",  # Grey for asunum == 0 (and anything < first break)
+        base = "#E0E0E0",  # Grey for asunum == 0 (and anything < first break)
         stops = brewer_pal,
         values = asu_breaks,
-        na_color = "#444444"
+        na_color = "#E0E0E0"
       ),
       fill_opacity = 0.5,
       fill_outline_color = "black",
@@ -1357,9 +1511,7 @@ ASUloadR is an application built in R using Shiny and Flexdashboard to
 create a point-and-click environment to build Areas of Substantial
 Unemployment (ASU). While this package does not replace the work of an
 analyst in a state from working on the ASU process, it provides tools to
-make that process more straightforward.
-
-It should be noted, the U.S. Bureau of Labor Statistics has several
+make that process more straightforward. It should be noted, the U.S. Bureau of Labor Statistics has several
 options for designating ASUs. **ASUloadR** only uses the addition
 method, building regions at the Census Tract level. Analysts may
 discover that other alternatives work better for their state in a given
@@ -1367,10 +1519,7 @@ year.
 
 The ASU creation logic in this program was created by a collaboration
 between the states of Ohio and Nevada, with the Shiny app and Graphical
-User Interface designed by Nevada’s Research & Analysis Bureau.
-
-The Github repository for this package can be found at
-<https://github.com/schmidtDETR/ASUbuildR>
+User Interface designed by Nevada’s Research & Analysis Bureau. The Github repository for this package can be found at <https://github.com/schmidtDETR/ASUbuildR>
 
 **About the ASU Process**
 
@@ -1381,9 +1530,7 @@ This is provided as an Excel sheet with a filename like `ST_asuYY.xlsx`
 where ST is the state abbreviation and YY is the year for which the ASU
 is being designated. **ASUloadR** is currently designed to pull
 information directly from this file, including identifying the state and
-year for which data should be retrieved.
-
-Because this file is built using public information but using
+year for which data should be retrieved. Because this file is built using public information but using
 preliminary LAUS data for June of the current year, archives of these
 files are not publicly available but also do not contain confidential
 information. Future versions of ASUloadR may build these input files
@@ -1447,14 +1594,16 @@ When review is complete, continue to the next tab - Load Initial ASU.
 
 **Load Initial ASU**
 
-To begin the ASU designation process, click the
-`Load Tracts and Initialize ASU` button. This will execute the
-tract-by-tract ASU building process. Small states may see this process
-run in under 20 seconds. The largest states may take up to 5 minutes.
-When the process is complete, the app will render a map to on the right
-side of the page. The number of colors on this map is limited to 8, so
-if more than 8 potential ASUs are identified, more than one ASU will use
-the same color.
+There are two options available to the user at this stage.  The **Tract Hunter** is a process that will iteratively build ASU regions by seeding an initial map, then comparing potential targeted tracts to add or remove, with the goal of achieving the maximum level of unemployment within ASUs. Tract Hunter includes logic to only allow ASUs that meet the minimum 10,000 population threshold.
+
+The original **Simple Snake** methodology starts from tracts with an unemployment rate of at least 6.45%, then sequentially adding the adjacent tract with the highest unemployment rate until the combined region is less than 6.45%. Because this starts from single tracts, it does not consider whether the combined population qualifies as an ASU.
+
+If the state being loaded is a New England state, you will see an additional option to select the year to download.  Because the Census Bureau only maintains NECTA-based census tracts for 2021 and earlier, using the default settings may cause the app to crash if your Excel file uses these older GEOIDs.
+
+To begin the ASU designation process, choose a methodology.  Then, click the
+`Load Tracts and Initialize ASU` button. This will download the appropriate shapefiles from the Census and execute the tract-by-tract ASU building process. Small states may see this process run in under 20 seconds. The largest states may take up to 5 minutes. When the process is complete, the app will render a map to on the right side of the page. The number of colors on this map is limited to 8, so if more than 8 potential ASUs are identified, more than one ASU will use the same color.
+
+If using the Tract Hunter, use the **Run Hunter** and **Combine Groups** buttons to allow the algorithm to attempt to improve the existing ASUs.
 
 In addition, note that a table of the potential ASUs will appear below
 the button. This will give the analyst a sense of how many tracts may be
@@ -1462,7 +1611,7 @@ worth merging into larger ASUs. In general, regions with 3 or fewer
 tracts are unlikely to meet the population threshold to qualify as an
 ASU.
 
-To begin manipulating the data, proceed to the next tab, Modify ASU
+To begin manually manipulating the data, proceed to the next tab, Modify ASU
 Selections. Or, if the number of modifications is large or the state
 takes a long time to run, skip ahead to perform an initial save of the
 data on Save and Load Data.
@@ -1496,18 +1645,7 @@ tools are provided to aid in the optimization of the ASUs. In general,
     may help with determining whether it is efficient to add a tract or
     group of tracts to an existing ASU.
 
--   Percentile Threshold / Show Tracts with Lowest UR: This allows you
-    to enter a numeric value (0-100) which will highlight the tracts
-    within the current selection that have the lowest unemployment
-    rates. As the analyst changes ASUs, this helps identify tracts which
-    might be good candidates to remove from an ASU to add others in.
-    While the algorithm will add tracts until the combined rate is as
-    low as possible, it does not know whether a tract with low
-    unemployment would be useful to “bridge” to a further high
-    unemployment tract that could not otherwise qualify as an ASU.
-    *Note: this functionality currently **removes highlighting from
-    still-selected tracts**. To make changes, please Clear Selected
-    Tracts, then select the tract you wish to modify.*
+-   Percentile Threshold: This allows you to examine the tracts in your current selection with either high or low unemployment rates.  This is useful for identifying tracts outside of current ASUs that you may wish to include in an ASU or identifying tracts inside of current ASUs that you may with to drop.  Please choose whether you want to highlight Low or High unemployment tracts and enter a number in the Percentile Threshold box to highlight the top or bottom X% of tracts (X is the number you enter).  For example, if you have 200 tracts selected and choose 5 as your threshold and High unemployment, clicking the **Highlight Tracts** button will turn the color of the 10 tracts with the highest unemployment rates black.  Selecting **Clear Highlights** will clear all current highlighting.
 
 -   Enter a GEOID / Select a Single Tract: This functionality is most
     useful when using the CSV output that this app generates on the

@@ -1,7 +1,7 @@
 Package: ASUbuildR
 Type: Package
 Title: A Shiny Interface for Constructing Areas of Substantial Unemployment
-Version: 0.3
+Version: 0.4
 Authors@R: c(
     person("David",  "Schmidt",  email = "deschmidt@detr.nv.gov", role = c("aut", "cre")),
     person("Michael","Frank",                      role = "aut"),

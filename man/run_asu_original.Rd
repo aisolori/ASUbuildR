@@ -20,3 +20,4 @@ A named list (see details above).
 \description{
 Build ASUs with the original algorithm
 }
+\keyword{internal}
