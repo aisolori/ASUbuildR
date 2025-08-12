@@ -22,10 +22,45 @@ asu_cut_vertices <- function(asu_sf) {
   cuts
 }
 
+rebuild_asus <- function(full_sf) {
+  new_ids <- full_sf$asunum
+  asu_ids <- unique(full_sf$asunum[full_sf$asunum > 0])
+  next_id <- 1L
+  for (asu in asu_ids) {
+    idx <- which(full_sf$asunum == asu)
+    group <- full_sf[idx, ]
+    comps <- if (nrow(group) > 1) {
+      nb <- sfdep::st_contiguity(group$geometry)
+      g  <- igraph::graph_from_adj_list(nb, mode = "undirected")
+      igraph::components(g)$membership
+    } else {
+      rep(1L, nrow(group))
+    }
+    for (comp in unique(comps)) {
+      sub_idx <- idx[comps == comp]
+      pop <- sum(full_sf$tract_pop_cur[sub_idx],   na.rm = TRUE)
+      lf  <- sum(full_sf$tract_ASU_clf[sub_idx],   na.rm = TRUE)
+      unemp <- sum(full_sf$tract_ASU_unemp[sub_idx], na.rm = TRUE)
+      rate <- if (lf > 0) unemp / lf else 1
+      if (pop >= 10000 && rate <= 0.0645) {
+        new_ids[sub_idx] <- next_id
+        next_id <- next_id + 1L
+      } else {
+        new_ids[sub_idx] <- 0L
+      }
+    }
+  }
+  full_sf$asunum <- new_ids
+  full_sf
+}
+
 #' Drop low-unemployment tracts by percentile
 #'
 #' Removes tracts with the lowest unemployment metrics from ASUs while
-#' optionally preserving contiguity.
+#' optionally preserving contiguity. When contiguity is allowed to break,
+#' each resulting component is evaluated: those with at least 10,000 people
+#' and unemployment rate no greater than 0.0645 receive new ASU IDs, and all
+#' others are unassigned.
 #'
 #' @param full_sf sf object of all tracts with an `asunum` column.
 #' @param percentile Numeric value between 0 and 100 specifying the bottom
@@ -33,7 +68,9 @@ asu_cut_vertices <- function(asu_sf) {
 #' @param metric Character string indicating which unemployment metric to use:
 #'   "rate" for unemployment rate or "unemp" for unemployment level.
 #' @param allow_breaks Logical; if `TRUE`, drop tracts even if doing so
-#'   disconnects existing ASU groups.
+#'   disconnects existing ASU groups. Disconnected pieces are re-evaluated
+#'   against ASU size and unemployment thresholds and either re-numbered or
+#'   cleared.
 #'
 #' @return A list with updated `full_data`, `asu_data`, `asu_tracts`,
 #'   `asu_summary`, and the GEOIDs of `dropped` tracts.
@@ -69,6 +106,8 @@ drop_lowest_percentile <- function(full_sf, percentile = 5,
   }
 
   full_sf$asunum[full_sf$GEOID %in% to_drop] <- 0L
+
+  full_sf <- rebuild_asus(full_sf)
 
   asu_data <- dplyr::filter(full_sf, asunum > 0)
   asu_tracts <- asu_data |>

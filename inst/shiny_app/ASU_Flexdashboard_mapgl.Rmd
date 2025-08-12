@@ -583,7 +583,9 @@ shiny::observeEvent(input$drop_tracts, {
   output$asu <- shiny::renderTable(asu_summary(), digits = 3)
   st <- th_state()
   if (!is.null(st)) {
-    st$data_merge$asunum[st$data_merge$GEOID %in% res$dropped] <- NA
+    ids <- sf::st_drop_geometry(res$full_data)[, c("GEOID", "asunum")]
+    st$data_merge$asunum <- ids$asunum[match(st$data_merge$GEOID, ids$GEOID)]
+    st$data_merge$asunum <- dplyr::na_if(st$data_merge$asunum, 0L)
     th_state(st)
   }
   msg <- paste(length(res$dropped), "tracts dropped")
