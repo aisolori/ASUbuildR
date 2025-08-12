@@ -1,4 +1,6 @@
 export(launch_ASUbuildR)
+export(asu_cut_vertices)
+export(drop_lowest_percentile)
 useDynLib(ASUbuildR, .registration = TRUE)
 importFrom(Rcpp, sourceCpp)
 

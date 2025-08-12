@@ -48,6 +48,7 @@ if (is_dev_mode) {
 
   source(file.path(r_dir, "run_tract_hunter.R"))
   source(file.path(r_dir, "run_asu_original.r"))
+  source(file.path(r_dir, "drop_low_unemployment.R"))
 } else {
   message("→ Installed package mode: functions should already be available")
 }
@@ -291,6 +292,17 @@ shiny::conditionalPanel(
   )
 )
 
+
+# ---- drop low-unemployment controls ------------------------------------
+shiny::hr(style = "margin: 0.8rem 0;")
+shiny::h5("Drop low unemployment tracts")
+shiny::selectInput("drop_metric", "Metric",
+                   choices = c("Unemployment rate" = "rate",
+                               "Unemployment level" = "unemp"),
+                   selected = "rate")
+shiny::selectInput("drop_percentile", "Percentile to drop",
+                   choices = c(1,5,10,15,20), selected = 5)
+shiny::actionButton("drop_tracts", "Drop tracts", class = "btn-warning")
 
 # ---- dynamic algorithm description -----------------------------------
 output$algo_blurb <- shiny::renderUI({
@@ -558,6 +570,18 @@ shiny::observeEvent(input$process, {
   })
   
   # ---- end observeEvent -------------------------------------------------
+shiny::observeEvent(input$drop_tracts, {
+  shiny::req(full_data())
+  res <- drop_lowest_percentile(full_data(),
+                                percentile = as.numeric(input$drop_percentile),
+                                metric = input$drop_metric)
+  full_data(res$full_data); asu_data(res$asu_data)
+  asu_tracts(res$asu_tracts); asu_summary(res$asu_summary)
+  map_geom(prep_map_data(res$full_data))
+  output$asu <- shiny::renderTable(asu_summary(), digits = 3)
+  msg <- paste(length(res$dropped), "tracts dropped")
+  shiny::showNotification(msg, type = "message")
+})
 
 shiny::observeEvent(input$th_pass, {
   shiny::req(th_state())
