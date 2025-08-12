@@ -101,32 +101,47 @@ tract_hunter_seed <- function(tract_list,
 
     asu_list <- c(starting_index)
 
+    grace <- init_ur_grace(tau = ur_thresh, W = 50L)
+    deficit_cap  <- 0.2 * pop_thresh * ur_thresh   # safety cap (tweak if desired)
+    temp_pop_cap <- Inf                             # or your temporary early cap
+
     repeat {
       boundary_tracts <- unique(unlist(nb[asu_list]))
       boundary_tracts <- setdiff(boundary_tracts, c(asu_list, used_indexes))
       if (length(boundary_tracts) == 0) break
 
-      res <- choose_best_neighbor(boundary_tracts,
-                                  emp_vec, unemp_vec, population_vec,
-                                  asu_emp, asu_unemp, asu_pop,
-                                  ur_thresh)
+      res <- choose_best_neighbor_grace(boundary_tracts,
+                                        emp_vec, unemp_vec, population_vec,
+                                        asu_emp, asu_unemp, asu_pop,
+                                        ur_thresh, asu_list, used_indexes, nb,
+                                        grace, pop_max = temp_pop_cap,
+                                        deficit_cap = deficit_cap)
 
       best_index <- res$best_index
+      grace      <- res$grace
       if (is.na(best_index)) break
 
-      best_path  <- best_index
-      best_ur    <- res$best_ur
-      best_emp   <- res$best_emp
-      best_unemp <- res$best_unemp
-      best_pop   <- res$best_pop
+      # apply the accepted move
+      asu_list   <- c(asu_list, setdiff(best_index, asu_list))
+      asu_emp    <- res$best_emp
+      asu_unemp  <- res$best_unemp
+      asu_pop    <- res$best_pop
+      asu_ur     <- res$best_ur
 
-      new_tracts <- setdiff(best_path, asu_list)
-      asu_list   <- c(asu_list, new_tracts)
-
-      asu_emp    <- best_emp
-      asu_unemp  <- best_unemp
-      asu_pop    <- best_pop
-      asu_ur     <- best_ur
+      # If the grace window expired, try to catch up immediately; if fail, exit loop
+      if (isTRUE(grace$active) && grace$steps_left == 0L) {
+        fix <- force_catch_up(asu_list, used_indexes, nb,
+                              emp_vec, unemp_vec, population_vec,
+                              asu_emp, asu_unemp, asu_pop, grace,
+                              pop_max = temp_pop_cap)
+        asu_list   <- fix$asu_list
+        asu_emp    <- fix$asu_emp
+        asu_unemp  <- fix$asu_unemp
+        asu_pop    <- fix$asu_pop
+        grace      <- fix$grace
+        asu_ur     <- ifelse(asu_emp + asu_unemp == 0, 0, asu_unemp / (asu_emp + asu_unemp))
+        if (!fix$grace_ok) break
+      }
 
       cat(glue::glue("UR: {round(asu_ur, 4)} | Unemp: {round(asu_unemp)} | Emp: {round(asu_emp)} | Pop: {round(asu_pop)}   \r"))
       utils::flush.console()
