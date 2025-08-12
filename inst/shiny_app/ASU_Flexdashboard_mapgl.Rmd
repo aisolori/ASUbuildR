@@ -365,7 +365,7 @@ shiny::observeEvent(input$process, {
       dplyr::left_join(uploaded_data(), by = "GEOID")
 
     # 2 · Run the chosen ASU algorithm ---------------------------------
-    algo_choice <- shiny::isolate(input$asu_algo %||% "orig")
+    algo_choice <- shiny::isolate(input$asu_algo)
 
     join_flag <- isTRUE(input$join_touching) # ← keep the flag you already built
 
