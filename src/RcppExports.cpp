@@ -41,8 +41,8 @@ BEGIN_RCPP
 END_RCPP
 }
 // choose_best_neighbor
-List choose_best_neighbor(IntegerVector boundary_tracts, NumericVector emp_vec, NumericVector unemp_vec, NumericVector pop_vec, double asu_emp, double asu_unemp, double asu_pop, double ur_thresh);
-RcppExport SEXP _ASUbuildR_choose_best_neighbor(SEXP boundary_tractsSEXP, SEXP emp_vecSEXP, SEXP unemp_vecSEXP, SEXP pop_vecSEXP, SEXP asu_empSEXP, SEXP asu_unempSEXP, SEXP asu_popSEXP, SEXP ur_threshSEXP) {
+List choose_best_neighbor(IntegerVector boundary_tracts, NumericVector emp_vec, NumericVector unemp_vec, NumericVector pop_vec, double asu_emp, double asu_unemp, double asu_pop, double ur_thresh, double unemp_power, double ur_weight);
+RcppExport SEXP _ASUbuildR_choose_best_neighbor(SEXP boundary_tractsSEXP, SEXP emp_vecSEXP, SEXP unemp_vecSEXP, SEXP pop_vecSEXP, SEXP asu_empSEXP, SEXP asu_unempSEXP, SEXP asu_popSEXP, SEXP ur_threshSEXP, SEXP unemp_powerSEXP, SEXP ur_weightSEXP) {
 BEGIN_RCPP
     Rcpp::RObject rcpp_result_gen;
     Rcpp::RNGScope rcpp_rngScope_gen;
@@ -54,7 +54,9 @@ BEGIN_RCPP
     Rcpp::traits::input_parameter< double >::type asu_unemp(asu_unempSEXP);
     Rcpp::traits::input_parameter< double >::type asu_pop(asu_popSEXP);
     Rcpp::traits::input_parameter< double >::type ur_thresh(ur_threshSEXP);
-    rcpp_result_gen = Rcpp::wrap(choose_best_neighbor(boundary_tracts, emp_vec, unemp_vec, pop_vec, asu_emp, asu_unemp, asu_pop, ur_thresh));
+    Rcpp::traits::input_parameter< double >::type unemp_power(unemp_powerSEXP);
+    Rcpp::traits::input_parameter< double >::type ur_weight(ur_weightSEXP);
+    rcpp_result_gen = Rcpp::wrap(choose_best_neighbor(boundary_tracts, emp_vec, unemp_vec, pop_vec, asu_emp, asu_unemp, asu_pop, ur_thresh, unemp_power, ur_weight));
     return rcpp_result_gen;
 END_RCPP
 }
@@ -62,7 +64,7 @@ END_RCPP
 static const R_CallMethodDef CallEntries[] = {
     {"_ASUbuildR_build_asu_edges", (DL_FUNC) &_ASUbuildR_build_asu_edges, 2},
     {"_ASUbuildR_choose_best_drop_candidate", (DL_FUNC) &_ASUbuildR_choose_best_drop_candidate, 8},
-    {"_ASUbuildR_choose_best_neighbor", (DL_FUNC) &_ASUbuildR_choose_best_neighbor, 8},
+    {"_ASUbuildR_choose_best_neighbor", (DL_FUNC) &_ASUbuildR_choose_best_neighbor, 10},
     {NULL, NULL, 0}
 };
 

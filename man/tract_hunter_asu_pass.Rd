@@ -4,12 +4,19 @@
 \alias{tract_hunter_asu_pass}
 \title{Execute a single ASU building pass}
 \usage{
-tract_hunter_asu_pass(state, verbose = TRUE)
+tract_hunter_asu_pass(state, verbose = TRUE, path_len_weight = 0,
+  unemp_power = 0.9, ur_weight = 1)
 }
 \arguments{
 \item{state}{Internal state list from \code{tract_hunter_seed}}
 
 \item{verbose}{Logical, print progress messages}
+
+\item{path_len_weight}{Penalty applied per tract when evaluating boundary paths}
+
+\item{unemp_power}{Exponent applied to unemployment counts when scoring neighbors}
+
+\item{ur_weight}{Power applied to unemployment rate when scoring neighbors}
 }
 \value{
 Updated state list

@@ -9,7 +9,9 @@ tract_hunter_seed(
   bls_df,
   ur_thresh = 0.0645,
   pop_thresh = 10000,
-  verbose = TRUE
+  verbose = TRUE,
+  unemp_power = 0.9,
+  ur_weight = 1
 )
 }
 \arguments{
@@ -22,6 +24,10 @@ tract_hunter_seed(
 \item{pop_thresh}{Population threshold}
 
 \item{verbose}{Logical, print progress messages}
+
+\item{unemp_power}{Exponent applied to unemployment counts when scoring neighbors}
+
+\item{ur_weight}{Power applied to unemployment rate when scoring neighbors}
 }
 \value{
 A list representing the algorithm state

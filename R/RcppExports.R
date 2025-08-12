@@ -9,7 +9,7 @@ choose_best_drop_candidate <- function(drop_candidates, unemp_vec, emp_vec, rema
     .Call(`_ASUbuildR_choose_best_drop_candidate`, drop_candidates, unemp_vec, emp_vec, remaining_unemp, remaining_emp, total_new_unemp, total_new_emp, unemp_buffer)
 }
 
-choose_best_neighbor <- function(boundary_tracts, emp_vec, unemp_vec, pop_vec, asu_emp, asu_unemp, asu_pop, ur_thresh = 0.0645) {
-    .Call(`_ASUbuildR_choose_best_neighbor`, boundary_tracts, emp_vec, unemp_vec, pop_vec, asu_emp, asu_unemp, asu_pop, ur_thresh)
+choose_best_neighbor <- function(boundary_tracts, emp_vec, unemp_vec, pop_vec, asu_emp, asu_unemp, asu_pop, ur_thresh = 0.0645, unemp_power = 0.9, ur_weight = 1.0) {
+    .Call(`_ASUbuildR_choose_best_neighbor`, boundary_tracts, emp_vec, unemp_vec, pop_vec, asu_emp, asu_unemp, asu_pop, ur_thresh, unemp_power, ur_weight)
 }
 

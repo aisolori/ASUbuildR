@@ -1,0 +1,41 @@
+---
+title: "Hyperparameter Tuning for Tract Hunter"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>"
+)
+```
+
+This script demonstrates how to evaluate different scoring weights in the
+Tract Hunter workflow using the `tune_scoring()` helper.  Adjust the
+parameter grids and the number of cores to leverage the resources on your
+machine.
+
+```{r, eval=FALSE}
+library(ASUbuildR)
+
+# objects you would normally pass to run_tract_hunter()
+tract_list <- ...   # tract data with contiguity info
+bls_df     <- ...   # BLS unemployment data
+
+# define the grid of weights to try
+unemp_power     <- c(0.8, 0.9, 1.0)
+ur_weight       <- c(1.0, 1.2)
+path_len_weight <- c(0, 0.05)
+
+# launch the tuning with, say, all but one of your cores
+res <- tune_scoring(tract_list, bls_df,
+                    unemp_power     = unemp_power,
+                    ur_weight       = ur_weight,
+                    path_len_weight = path_len_weight,
+                    cores = parallel::detectCores() - 1)
+
+print(res)
+```
+
+The resulting data frame summarises the ASU counts for each parameter
+combination, allowing you to identify effective scoring weights quickly.

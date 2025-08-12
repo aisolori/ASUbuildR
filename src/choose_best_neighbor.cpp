@@ -9,7 +9,9 @@ List choose_best_neighbor(IntegerVector boundary_tracts,
                           double asu_emp,
                           double asu_unemp,
                           double asu_pop,
-                          double ur_thresh = 0.0645) {
+                          double ur_thresh = 0.0645,
+                          double unemp_power = 0.9,
+                          double ur_weight   = 1.0) {
   double best_improvement = R_NegInf;
   int best_index = NA_INTEGER;
   double best_ur = NA_REAL, best_emp = NA_REAL,
@@ -26,7 +28,7 @@ List choose_best_neighbor(IntegerVector boundary_tracts,
     double total_ur    = total_unemp / (total_emp + total_unemp);
 
     if (total_ur >= ur_thresh) {
-      double improvement = pow(total_unemp, 0.9) * total_ur;
+      double improvement = pow(total_unemp, unemp_power) * pow(total_ur, ur_weight);
       if (Rcpp::NumericVector::is_na(improvement)) improvement = 0.0;
       if (improvement > best_improvement) {
         best_improvement = improvement;

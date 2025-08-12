@@ -10,7 +10,10 @@ run_tract_hunter(
   ur_thresh = 0.0645,
   pop_thresh = 10000,
   join_touching = TRUE,
-  verbose = TRUE
+  verbose = TRUE,
+  unemp_power = 0.9,
+  ur_weight = 1,
+  path_len_weight = 0
 )
 }
 \arguments{
@@ -25,6 +28,12 @@ run_tract_hunter(
 \item{join_touching}{Logical, join touching ASUs after first pass}
 
 \item{verbose}{Logical, print progress messages}
+
+\item{unemp_power}{Exponent applied to unemployment counts when scoring neighbors}
+
+\item{ur_weight}{Power applied to unemployment rate when scoring neighbors}
+
+\item{path_len_weight}{Penalty applied per tract when evaluating boundary paths}
 }
 \value{
 A list of results similar to \code{run_asu_original()}
