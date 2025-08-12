@@ -579,6 +579,11 @@ shiny::observeEvent(input$drop_tracts, {
   asu_tracts(res$asu_tracts); asu_summary(res$asu_summary)
   map_geom(prep_map_data(res$full_data))
   output$asu <- shiny::renderTable(asu_summary(), digits = 3)
+  st <- th_state()
+  if (!is.null(st)) {
+    st$data_merge$asunum[st$data_merge$GEOID %in% res$dropped] <- NA
+    th_state(st)
+  }
   msg <- paste(length(res$dropped), "tracts dropped")
   shiny::showNotification(msg, type = "message")
 })
