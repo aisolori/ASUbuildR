@@ -52,6 +52,48 @@ if (is_dev_mode) {
   message("→ Installed package mode: functions should already be available")
 }
 
+# --- Reticulate + Python deps bootstrap (uv-managed env) ----------------
+library(reticulate)
+
+# Make sure Python is initialized (uses the uv env shown by py_config())
+invisible(py_config())
+
+# Ensure required modules are present in the *active* Python
+req <- c("pandas", "numpy", "networkx", "ortools")
+
+missing <- req[!vapply(req, py_module_available, logical(1))]
+if (length(missing)) {
+  message("Installing missing Python packages into the active env: ",
+          paste(missing, collapse = ", "))
+  # Installs into the current uv env (no envname needed)
+  reticulate::py_install(missing, pip = TRUE)
+}
+
+# Import your CP-SAT bridge; try installed pkg path, then dev path
+asu_py <- tryCatch(
+  import_from_path(
+    module  = "asu_cpsat",
+    path    = system.file("python", package = "ASUbuildR"),
+    convert = TRUE
+  ),
+  error = function(e) {
+    # dev-mode fallback (your tree shows inst/python/asu_cpsat.py)
+    import_from_path(
+      module  = "asu_cpsat",
+      path    = normalizePath(file.path("..","..","inst","python"),
+                              winslash = "/",
+                              mustWork = TRUE),
+      convert = TRUE
+    )
+  }
+)
+
+# Optional: quick sanity check
+stopifnot(py_has_attr(asu_py, "build_many_asus_cpsat"))
+message("✓ Python backend ready")
+# ------------------------------------------------------------------------
+
+
 
 ## ---- tigris cache ----------------------------------------------------
 ## put cached TIGER/Line ZIPs in a per-user cache folder that is always
@@ -261,10 +303,13 @@ shiny::radioButtons(
   inputId = "asu_algo",
   label   = "Choose algorithm",
   choices = c(
-    "Tract Hunter"  = "mine",
-    "Simple Snake"  = "orig"),
+    "Tract Hunter"      = "mine",
+    "Simple Snake"      = "orig",
+    "CP-SAT (OR-Tools)" = "cpsat"
+  ),
   inline  = TRUE
 )
+
 
 # -----------------------------------------------------------------------
 # main "Run" button (always visible)
@@ -290,6 +335,21 @@ shiny::conditionalPanel(
     )
   )
 )
+
+# Conditional panel for CP-SAT algorithm options
+shiny::conditionalPanel(
+  condition = "input.asu_algo === 'cpsat'",
+  shiny::tagList(
+    shiny::hr(style = "margin: 0.8rem 0;"),
+    shiny::numericInput("cpsat_tau",       "UR threshold (τ)",          value = 0.0645, min = 0, max = 1, step = 0.0001),
+    shiny::numericInput("cpsat_pop",       "Population threshold",      value = 10000,  min = 0, step = 100),
+    shiny::numericInput("cpsat_max",       "Max ASUs",                  value = 30,     min = 1, step = 1),
+    shiny::numericInput("cpsat_timelimit", "Time limit (sec) per window", value = 1200, min = 1, step = 10),
+    shiny::numericInput("cpsat_workers",   "Parallel workers",          value = max(1, parallel::detectCores()-1), min = 1, step = 1),
+    shiny::numericInput("cpsat_relgap",    "Relative gap (optional)",   value = NA,     min = 0, step = 0.0001)
+  )
+)
+
 
 
 # ---- dynamic algorithm description -----------------------------------
@@ -387,112 +447,193 @@ palette_logic <- function(n_asu) {
           )
         }
       }
+  # ---- end observeEvent -------------------------------------------------
 
 shiny::observeEvent(input$process, {
   ## 0 · Basic checks ----------------------------------------------------
   shiny::req(uploaded_data(), state(), tract_year())
 
-  # Determine which year to use
-  selected_year <- tract_year()  # default to detected year
-  
-  # Check if this is New England and user selected 2021
+  # Determine which year to use (NE states can force 2021)
+  selected_year <- tract_year()
   state_val <- state()
   if (!is.null(state_val) && length(state_val) > 0) {
-    new_england_fips <- c("09", "23", "25", "33", "44", "50")
-    if (state_val %in% new_england_fips && 
-        !is.null(input$ne_year_choice) && 
+    new_england_fips <- c("09","23","25","33","44","50")
+    if (state_val %in% new_england_fips &&
+        !is.null(input$ne_year_choice) &&
         input$ne_year_choice == "2021") {
       selected_year <- "2021"
     }
   }
 
-  ## 1 · Wrap the whole long job in withProgress -------------------------
-  shiny::withProgress(message = "Running ASU initialisation…", value = 0, {
+  ## 1 · Wrap the long job in withProgress -------------------------------
+  shiny::withProgress(message = "Running OR-Tools CP-SAT…", value = 0, {
+  dbg <- function(...) message("[CP-SAT] ", paste0(..., collapse = ""))
 
-    ## 1a · Build tracts + neighbours (can take ~10–60 s the first time)
-    shiny::incProgress(0.10, detail = "Downloading Census shapefiles…")
-    
-    # CHANGE THIS LINE FROM:
-    # tract_list <- tigris::tracts(state = state(), year = tract_year()) |>
-    # TO:
-    tract_list <- tigris::tracts(state = state(), year = selected_year) |>
-      dplyr::mutate(
-        row_num    = dplyr::row_number(),
-        continuous = sfdep::st_contiguity(geometry)
-      )
+  # 1) Build tracts + neighbours for the selected year (this was missing)
+  shiny::incProgress(0.08, detail = "Downloading Census shapefiles…")
+  tract_list <- tigris::tracts(state = state(), year = selected_year) |>
+    dplyr::mutate(
+      row_num    = dplyr::row_number(),
+      continuous = sfdep::st_contiguity(geometry)  # neighbors as integer indices (1-based)
+    )
+  dbg("tracts n=", nrow(tract_list))
 
-    ## 1b · Merge the BLS data
-    shiny::incProgress(0.05, detail = "Merging BLS unemployment data…")
-    data_merge <- tract_list |>
-      dplyr::left_join(uploaded_data(), by = "GEOID")
+  # Quick input checks
+  shiny::incProgress(0.02, detail = "Sanity checks")
+  shiny::req(!is.null(uploaded_data()))
+  cols_needed <- c("GEOID","tract_ASU_unemp","tract_ASU_emp","tract_pop_cur","tract_ASU_clf","tract_ASU_urate")
+  missing_cols <- setdiff(cols_needed, names(uploaded_data()))
+  if (length(missing_cols))
+    stop("Uploaded data missing columns: ", paste(missing_cols, collapse=", "))
 
-    # 2 · Run the chosen ASU algorithm ---------------------------------
-    algo_choice <- shiny::isolate(input$asu_algo)
+  # 2) Merge the BLS data to the tracts (no geometry drop yet)
+  shiny::incProgress(0.05, detail = "Merging inputs")
+  data_merge_local <- tract_list |>
+    dplyr::left_join(uploaded_data(), by = "GEOID")
 
-    join_flag <- isTRUE(input$join_touching) # ← keep the flag you already built
+  data_merge_df <- data_merge_local |> sf::st_drop_geometry()
+  dbg("merge nrows=", nrow(data_merge_df), " ncols=", ncol(data_merge_df))
 
-    shiny::incProgress(0.05, detail = "Finding initial ASU seeds…")
-    if (algo_choice == "orig") {
-      res <- run_asu_original(tract_list, uploaded_data())
-    } else {
-      shiny::withProgress(message = "Seeding & expanding…", value = 0, {
-        th_tract_list(tract_list)
-        th_bls_df(uploaded_data())
-        st <- tract_hunter_seed(th_tract_list(), th_bls_df(), verbose = TRUE)
-      })
-      th_state(st)
-      res <- tract_hunter_finalize(st)
+  # 3) Build Python payload
+  shiny::incProgress(0.10, detail = "Building Python payload")
+  df_py_r <- data_merge_df |>
+    dplyr::transmute(
+      geoid            = GEOID,
+      tract_ASU_unemp  = as.integer(tract_ASU_unemp),
+      tract_ASU_emp    = as.integer(tract_ASU_emp),
+      tract_pop2024    = as.integer(tract_pop_cur)
+    )
+  if (any(is.na(df_py_r$tract_ASU_unemp))) stop("NA in tract_ASU_unemp after coercion")
+  if (any(is.na(df_py_r$tract_ASU_emp)))   stop("NA in tract_ASU_emp after coercion")
+  if (any(is.na(df_py_r$tract_pop2024)))   stop("NA in tract_pop_cur after coercion")
+
+  df_py <- reticulate::r_to_py(df_py_r, convert = TRUE)
+  dbg("df_py ok")
+
+  # 4) Neighbors as true Python list[list[int]] (0-based)
+  shiny::incProgress(0.20, detail = "Preparing neighbors")
+  if (!"continuous" %in% names(tract_list)) stop("tract_list lacks 'continuous' column")
+  nb_r <- lapply(tract_list$continuous, function(idx) as.integer(idx) - 1L)
+  nb_r <- lapply(nb_r, function(v) if (length(v)) v else integer(0))
+  dbg("nb_r length=", length(nb_r),
+      "; first lens=", paste(utils::head(vapply(nb_r, length, 1L), 6), collapse=","))
+
+  py_builtins <- reticulate::import_builtins()
+  nb_py <- py_builtins$list()
+  for (v in nb_r) nb_py$append(py_builtins$list(v))
+  dbg("nb_py len=", reticulate::py_len(nb_py),
+      "; type[0]=", if (reticulate::py_len(nb_py)>0) reticulate::py_str(reticulate::py_type(nb_py[[1]])) else "NA")
+
+  # 5) Parameters
+  shiny::incProgress(0.25, detail = "Reading params")
+  tau      <- if (is.null(input$cpsat_tau)) 0.0645 else as.numeric(input$cpsat_tau)
+  pop_thr  <- if (is.null(input$cpsat_pop)) 10000  else as.integer(input$cpsat_pop)
+  max_asus <- if (is.null(input$cpsat_max)) 30     else as.integer(input$cpsat_max)
+  tlimit   <- if (is.null(input$cpsat_timelimit)) 1200 else as.integer(input$cpsat_timelimit)
+  workers  <- if (is.null(input$cpsat_workers)) max(1L, parallel::detectCores()-1L) else as.integer(input$cpsat_workers)
+  rel_gap  <- if (!is.null(input$cpsat_relgap) && !is.na(input$cpsat_relgap)) as.numeric(input$cpsat_relgap) else NULL
+  dbg(sprintf("params: tau=%.6f pop=%d max=%d tlimit=%d workers=%d rel_gap=%s",
+              tau, pop_thr, max_asus, tlimit, workers, if (is.null(rel_gap)) "NULL" else as.character(rel_gap)))
+
+  # 6) Call Python
+  shiny::incProgress(0.35, detail = "Calling Python solver")
+  args <- list(
+    df         = df_py,
+    nb         = nb_py,
+    tau        = tau,
+    pop_thresh = pop_thr,
+    max_asus   = max_asus,
+    time_limit = tlimit,
+    workers    = workers,
+    verbose    = TRUE
+  )
+  if (!is.null(rel_gap)) args$rel_gap <- rel_gap
+
+  out <- tryCatch(
+    do.call(asu_py$build_many_asus_cpsat, args),
+    error = function(e) {
+      message("[CP-SAT] Python error ->")
+      try(print(reticulate::py_last_error()), silent = TRUE)
+      stop(e)
     }
+  )
+  dbg("solver returned")
 
-    ## 3 · Finish the bar
-    shiny::incProgress(1, detail = "Finishing up…")
-  }) # ---- withProgress ends here  -------------------------------------
+  # 7) Validate + map results
+  shiny::incProgress(0.80, detail = "Validating output")
+  asu_id <- as.integer(reticulate::py_to_r(out$asu_id))
+  dbg("asu_id length=", length(asu_id))
+  if (length(asu_id) != nrow(data_merge_df)) {
+    stop(sprintf("CP-SAT returned %d assignments for %d tracts.",
+                 length(asu_id), nrow(data_merge_df)))
+  }
 
-  ## 4 · Store results & draw map  --------------------------------------
+  shiny::incProgress(0.90, detail = "Building results")
+  data_cpsat <- data_merge_local |>
+    dplyr::mutate(asunum = ifelse(asu_id < 0L, 0L, as.integer(asu_id)))
+
+  res <<- list(
+    full_data       = data_cpsat,
+    full_data_reset = data_cpsat,
+    asu_data        = NULL,
+    asu_tracts      = NULL,
+    asu_summary     = data_cpsat |>
+      sf::st_drop_geometry() |>
+      dplyr::filter(asunum > 0) |>
+      dplyr::group_by(asunum) |>
+      dplyr::summarise(
+        Tracts              = dplyr::n(),
+        Population          = sum(tract_pop_cur,   na.rm = TRUE),
+        `Labor Force`       = sum(tract_ASU_clf,   na.rm = TRUE),
+        Unemployment        = sum(tract_ASU_unemp, na.rm = TRUE),
+        `Unemployment Rate` = round(Unemployment/`Labor Force`*100, 5),
+        .groups = "drop"
+      )
+  )
+
+  shiny::incProgress(1, detail = "Done")
+})
+
+
+
+
+
+  ## 4 · Store results & draw map ---------------------------------------
   if (!is.null(res)) {
     full_data(res$full_data)
     full_data_reset(res$full_data_reset)
     asu_data(res$asu_data)
     asu_tracts(res$asu_tracts)
     asu_summary(res$asu_summary)
-    map_geom(prep_map_data(res$full_data))}
+    map_geom(prep_map_data(res$full_data))
+  }
 
-    output$asu <- shiny::renderTable(asu_summary(), digits = 3)
+  output$asu <- shiny::renderTable(asu_summary(), digits = 3)
 
-    ## 5. (Re‑)draw the first map ----------------------------------
+  ## 5 · Draw map --------------------------------------------------------
+  output$initial_map <- mapgl::renderMaplibre({
+    shiny::req(map_geom(), full_data())
 
-    output$initial_map <- mapgl::renderMaplibre({
-      shiny::req(map_geom())
-
-    shiny::req(full_data())
-    map_data <- full_data()
-
-    # ---- 6·1 geometry housekeeping ----------------------------------
-    map_data <- map_data |>
+    map_data <- full_data() |>
       sf::st_make_valid() |>
       sf::st_zm(what = "ZM", drop = TRUE) |>
       dplyr::filter(!sf::st_is_empty(geometry)) |>
       dplyr::mutate(geom_type = sf::st_geometry_type(geometry)) |>
-      dplyr::filter(geom_type %in% c("POLYGON", "MULTIPOLYGON")) |>
-      dplyr::select(-geom_type)
+      dplyr::filter(geom_type %in% c("POLYGON","MULTIPOLYGON")) |>
+      dplyr::select(-geom_type) |>
+      dplyr::mutate(asunum = dplyr::na_if(asunum, 0L))
 
     if (nrow(map_data) == 0) {
       return(
         mapgl::maplibre(style = mapgl::carto_style("positron")) |>
-        mapgl::add_control("No valid polygon geometry to display.", "top-left")
+          mapgl::add_control("No valid polygon geometry to display.", "top-left")
       )
     }
 
-    # ---- 6·2 palette / breaks ---------------------------------------
-    map_data <- map_data |>
-      dplyr::mutate(asunum = dplyr::na_if(asunum, 0L))
-
     n_asu <- max(map_data$asunum, na.rm = TRUE)
     n_asu <- ifelse(is.finite(n_asu), n_asu, 0L)
-
     pal <- palette_logic(n_asu)
 
-    # ---- 6·3 build map ----------------------------------------------
     mapgl::maplibre(style = mapgl::carto_style("positron")) |>
       mapgl::fit_bounds(map_data, animate = FALSE) |>
       mapgl::add_fill_layer(
@@ -506,136 +647,21 @@ shiny::observeEvent(input$process, {
           "<strong>Tract GEOID: </strong>", mapgl::get_column("GEOID"),  "<br>",
           "<strong>UR: </strong>",
           mapgl::number_format(mapgl::get_column("tract_ASU_urate"),
-                        style = "decimal", maximum_fraction_digits = 2),
+                               style = "decimal", maximum_fraction_digits = 2),
           "%<br>",
           "<strong>Unemp: </strong>",
           mapgl::number_format(mapgl::get_column("tract_ASU_unemp"),
-                        style = "decimal", maximum_fraction_digits = 0), "<br>"
-
-        ))
-
-      # ---- 6·2 palette / breaks ---------------------------------------
-      map_data <- map_data |>
-        dplyr::mutate(asunum = dplyr::na_if(asunum, 0L))
-
-      n_asu <- max(map_data$asunum, na.rm = TRUE)
-      n_asu <- ifelse(is.finite(n_asu), n_asu, 0L)
-
-      
-
-      pal <- palette_logic(n_asu)
-
-      # ---- 6·3 build map ----------------------------------------------
-      mapgl::maplibre(style = mapgl::carto_style("positron")) |>
-        mapgl::fit_bounds(map_data, animate = FALSE) |>
-        mapgl::add_fill_layer(
-          id = "basemap",
-          source = map_data,
-          fill_color = pal$fill,
-          fill_opacity = 0.5,
-          fill_outline_color = "black",
-          tooltip = mapgl::concat(
-            "<strong>ASU Number: </strong>", mapgl::get_column("asunum"), "<br>",
-            "<strong>Tract GEOID: </strong>", mapgl::get_column("GEOID"), "<br>",
-            "<strong>UR: </strong>",
-            mapgl::number_format(mapgl::get_column("tract_ASU_urate"),
-              style = "decimal", maximum_fraction_digits = 2
-            ),
-            "%<br>",
-            "<strong>Unemp: </strong>",
-            mapgl::number_format(mapgl::get_column("tract_ASU_unemp"),
-              style = "decimal", maximum_fraction_digits = 0
-            ), "<br>"
-          )
-        ) |>
-        mapgl::add_legend(
-          "ASU Number",
-          values = pal$legend_vals,
-          colors = pal$legend_cols,
-          type   = "categorical"
+                               style = "decimal", maximum_fraction_digits = 0), "<br>"
         )
-    })
-  })
-  
-  # ---- end observeEvent -------------------------------------------------
-
-shiny::observeEvent(input$th_pass, {
-  shiny::req(th_state())
-  shiny::withProgress(message = "Running ASU pass…", value = 0, {
-    st <- tract_hunter_asu_pass(th_state(), verbose = TRUE)
-  })
-  th_state(st)
-  res <- tract_hunter_finalize(st)
-  full_data(res$full_data  )   ; full_data_reset(res$full_data_reset)
-  asu_data(res$asu_data    )   ; asu_tracts(res$asu_tracts)
-  asu_summary(res$asu_summary) ; map_geom(prep_map_data(res$full_data))
-  output$asu <- shiny::renderTable( asu_summary(),digits = 3 )
-  mapgl::maplibre_proxy("initial_map") |> mapgl::clear_layer("basemap")
-  output$initial_map <- mapgl::renderMaplibre({
-    shiny::req(map_geom())
-    map_data <- map_geom()
-    if (nrow(map_data) == 0) {
-      return(
-        mapgl::maplibre(style = mapgl::carto_style("positron")) |>
-        mapgl::add_control("No valid polygon geometry to display.", "top-left")
-      )
-    }
-    map_data <- map_data |>
-      dplyr::mutate(asunum = dplyr::na_if(asunum, 0L))
-    n_asu <- max(map_data$asunum, na.rm = TRUE)
-    n_asu <- ifelse(is.finite(n_asu), n_asu, 0L)
-    
-
-    palette_logic <- function(n_asu) {
-  if (n_asu == 0) {
-    list(fill = "#E0E0E0",
-         legend_vals = "(none)",
-         legend_cols = "#E0E0E0")
-
-  } else if (n_asu == 1) {
-    list(
-      fill  = mapgl::step_expr(column="asunum",
-                        base="#E0E0E0",
-                        stops="#7FC97F",
-                        values=1,
-                        na_color="#E0E0E0"),
-      legend_vals = 1,
-      legend_cols = "#7FC97F"
-    )
-
-  } else {
-    n_cat <- min(max(n_asu, 3L), 8L)          # 3-to-8 distinct hues
-    pal   <- RColorBrewer::brewer.pal(n_cat, "Accent")
-
-    # make colours exactly as long as the value vector
-    legend_cols <- rep_len(pal, n_asu)
-
-    breaks <- seq(1 + n_asu / n_cat, n_asu, length.out = n_cat - 1)
-
-    list(
-      fill = mapgl::step_expr(column   = "asunum",
-                       base     = pal[1],
-                       stops    = pal[-1],
-                       values   = breaks,
-                       na_color = "#E0E0E0"),
-      legend_vals = seq_len(n_asu),
-      legend_cols = legend_cols
-    )
-  }
-}
-    
-    pal <- palette_logic(n_asu)
-    mapgl::maplibre(style = mapgl::carto_style("positron")) |>
-      mapgl::fit_bounds(map_data, animate = FALSE) |>
-      mapgl::add_fill_layer(
-        id                 = "basemap",
-        source             = map_data,
-        fill_color         = pal$fill,
-        fill_opacity       = 0.5,
-        fill_outline_color = "black"
-      )
+      ) |>
+      mapgl::add_legend("ASU Number",
+                        values = pal$legend_vals,
+                        colors = pal$legend_cols,
+                        type   = "categorical")
   })
 })
+
+
 
 shiny::observeEvent(input$th_combine, {
   shiny::req(th_state())
