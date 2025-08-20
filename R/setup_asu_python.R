@@ -34,7 +34,16 @@ setup_asu_python <- function(force = FALSE) {
     }
   }
 
-  py_bin <- reticulate::miniconda_python()
+  # Determine Python binary ---------------------------------------------------
+  py_bin <- Sys.which("python")
+  if (py_bin == "") py_bin <- Sys.which("python3")
+  if (py_bin == "") {
+    py_bin <- if (.Platform$OS.type == "windows") {
+      file.path(miniconda_path, "python.exe")
+    } else {
+      file.path(miniconda_path, "bin", "python")
+    }
+  }
 
   # Create virtual environment ---------------------------------------------------------
   if (!reticulate::virtualenv_exists(venv_path)) {
