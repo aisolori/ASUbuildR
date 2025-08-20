@@ -10,22 +10,39 @@ editor_options:
     wrap: 72
 ---
 ```{r python_preamble, include=FALSE}
-# 1) Choose a private user venv and lock reticulate to it *before* loading anything
-venv <- file.path(Sys.getenv("LOCALAPPDATA"), "R", "reticulate", "asu_py311")
-pyexe <- file.path(venv, "Scripts", "python.exe")
+library(reticulate)
+library(processx)
 
-# Keep reticulate away from conda auto-detection
-Sys.setenv(
-  RETICULATE_MINICONDA_ENABLED = "FALSE",
-  RETICULATE_AUTOCONFIGURE     = "FALSE",
-  RETICULATE_PYTHON            = pyexe
-)
+# Check if Python environment is set up, prompt user if not
+venv_path <- file.path(rappdirs::user_data_dir("ASUbuildR"), "asu-cpsat-venv")
 
-# Create the venv if missing (uses system python; you can replace with an explicit 3.11 path if needed)
-if (!file.exists(pyexe)) {
-  reticulate::virtualenv_create(venv, python = "python3.11")
+python_ready <- FALSE
+
+# Check if virtual environment exists
+if (dir.exists(venv_path)) {
+  # Try to use it
+  tryCatch({
+    reticulate::use_virtualenv(venv_path, required = TRUE)
+    
+    # Check if packages are available
+    if (reticulate::py_module_available("ortools")) {
+      python_ready <- TRUE
+      message("[env] Python environment ready")
+    } else {
+      message("[env] Python packages not fully installed")
+    }
+  }, error = function(e) {
+    message("[env] Virtual environment exists but cannot be activated")
+  })
+} else {
+  message("[env] Python environment not set up")
+  message("[env] Users should run ASUbuildR::setup_asu_python() before using CP-SAT solver")
 }
+
+# Store the status for later use
+options(asu_python_ready = python_ready)
 ```
+
 ```{r setup, include=FALSE}
 # Figure out full paths to src/ C++ files, going up two levels
 src_cpp_files <- c("choose_best_neighbor.cpp",
@@ -64,6 +81,7 @@ if (is_dev_mode) {
 
   source(file.path(r_dir, "run_tract_hunter.R"))
   source(file.path(r_dir, "run_asu_original.r"))
+  source(file.path(r_dir,"setup_asu_python.R"))
 } else {
   message("→ Installed package mode: functions should already be available")
 }
@@ -71,23 +89,22 @@ if (is_dev_mode) {
 `%||%` <- function(a, b) if (!is.null(a) && length(a)) a else b
 
 
-# ── FORCE our own Python BEFORE reticulate is loaded ────────────────────
-# (Put this at the very top of the setup chunk)
+# ── Use virtual environment & import Python module ───────────────────
 
-library(reticulate)
-library(processx)
-py_config()  # should now show ...\asu_py311\Scripts\python.exe
 
-# install once; on subsequent runs this will no-op
-py_install(c("pandas","numpy","networkx","ortools"), pip = TRUE)
+# Use the virtual environment we set up in the preamble
+venv_path <- file.path(rappdirs::user_data_dir("ASUbuildR"), "asu-cpsat-venv")
+reticulate::use_virtualenv(venv_path, required = TRUE)
+py_config()  # should now show the venv python
 
-# import your module
+# Import your solver module from the package's inst/python
 asu_py <- import_from_path(
   module  = "asu_cpsat",
   path    = normalizePath("../../inst/python", winslash = "/", mustWork = FALSE),
   convert = TRUE
 )
 stopifnot(py_has_attr(asu_py, "build_many_asus_cpsat"))
+
 
 ## ---- tigris cache ----------------------------------------------------
 ## put cached TIGER/Line ZIPs in a per-user cache folder that is always
@@ -429,7 +446,7 @@ shiny::uiOutput("algo_blurb")
 shiny::htmlOutput("total_unemp")
 
 shiny::tableOutput("asu")
-shiny::verbatimTextOutput("cpsat_log_tail")
+#shiny::verbatimTextOutput("cpsat_log_tail")
 
 palette_logic <- function(n_asu) {
         if (n_asu == 0) {
@@ -504,11 +521,6 @@ shiny::observeEvent(input$process, {
   tlimit   <- if (is.null(input$cpsat_timelimit)) 1200   else as.integer(input$cpsat_timelimit)
   workers  <- if (is.null(input$cpsat_workers))   max(1L, parallel::detectCores()-5L) else as.integer(input$cpsat_workers)
   rel_gap  <- if (!is.null(input$cpsat_relgap) && !is.na(input$cpsat_relgap)) as.numeric(input$cpsat_relgap) else NA_real_
-
-  if (.Platform$OS.type == "windows" && workers > 1L) {
-    append_cpsat_log("[run] Windows detected; forcing workers=1 for stability.")
-    workers <- 1L
-  }
 
   append_cpsat_log(sprintf("[run] params: tau=%.6f pop=%d max=%d tlimit=%d workers=%d rel_gap=%s",
                            tau, pop_thr, max_asus, tlimit, workers,
@@ -636,20 +648,35 @@ print('[runner] OK', flush=True)
   writeLines(runner_code, runner)
   append_cpsat_log(paste0("[run] runner.py: ", runner))
 
-  # ---- 5) Locate Python from your locked venv --------------------------
+  # ---- 5) Locate Python from virtual environment --------------------------
   shiny::incProgress(0.05, detail = "Locating Python")
-  venv  <- file.path(Sys.getenv("LOCALAPPDATA"), "R", "reticulate", "asu_py311")
-  pyexe <- file.path(venv, "Scripts", "python.exe")
-  pybin <- if (file.exists(pyexe)) pyexe else Sys.which("python")
-  if (!nzchar(pybin)) {
+  
+  # Get the virtual environment path
+  venv_path <- file.path(rappdirs::user_data_dir("ASUbuildR"), "asu-cpsat-venv")
+  
+  # Find the Python executable in the venv
+  if (.Platform$OS.type == "windows") {
+    pybin <- file.path(venv_path, "Scripts", "python.exe")
+  } else {
+    pybin <- file.path(venv_path, "bin", "python")
+  }
+  
+  # Fallback to system Python if venv not found
+  if (!file.exists(pybin)) {
+    pybin <- Sys.which("python")
+    if (pybin == "") pybin <- Sys.which("python3")
+  }
+  
+  if (!nzchar(pybin) || !file.exists(pybin)) {
     shiny::showModal(shiny::modalDialog(
       title="Python not found",
-      "Could not find the asu_py311 venv or a python.exe on PATH.",
+      "Could not find the virtual environment or python executable.",
       easyClose=TRUE
     ))
     return(invisible(NULL))
   }
   append_cpsat_log(paste0("[run] Using Python: ", pybin))
+
 
   # ---- 6) Launch and STREAM output (processx::process) -----------------
   shiny::incProgress(0.35, detail = "Solving (streaming logs)…")
@@ -747,12 +774,6 @@ print('[runner] OK', flush=True)
 
 })
 
-
-
-
-
-
-
 shiny::observeEvent(input$th_combine, {
   shiny::req(th_state())
   shiny::withProgress(message = "Combining ASUs…", value = 0, {
@@ -818,11 +839,33 @@ output$total_unemp2 <- shiny::renderUI({
 })
 ```
 
-## Output {data-width="800"}
+## Solver Log {data-width="400"}
 
+```{r}
+# Show the log only when CP-SAT is selected
+shiny::conditionalPanel(
+  condition = "input.asu_algo === 'cpsat'",
+  shiny::wellPanel(
+    style = "height: 100vh; overflow-y: auto; background-color: #ffffff; font-family: monospace; font-size: 12px; padding: 10px;",
+    shiny::verbatimTextOutput("cpsat_log_tail", placeholder = TRUE)
+  )
+)
+
+# Show a placeholder when CP-SAT is not selected
+shiny::conditionalPanel(
+  condition = "input.asu_algo !== 'cpsat'",
+  shiny::div(
+    style = "padding: 20px; color: #666;",
+    shiny::HTML("CP-SAT solver log will appear here when the CP-SAT algorithm is selected and running.")
+  )
+)
+```
+
+## Map {data-width="400"}
 ```{r}
 mapgl::maplibreOutput("initial_map", height = "100vh")
 ```
+
 
 # Modify ASU Selections
 
