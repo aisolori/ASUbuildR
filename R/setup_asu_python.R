@@ -2,6 +2,7 @@
 #'
 #' This function sets up the Python environment needed for ASUbuildR,
 #' including installing Python if necessary and all required packages.
+#' Existing Miniconda installations are reused unless `force` is TRUE.
 #'
 #' @param force Logical. If TRUE, recreates the virtual environment even if it exists.
 #' @return Invisible NULL. Called for side effects.
@@ -31,11 +32,15 @@ setup_asu_python <- function(force = FALSE) {
   }
 
   if (!reticulate::py_available(initialize = FALSE)) {
-    message("Python not found. Installing Miniconda...")
-    message("This is a one-time installation and may take a few minutes...")
+    if (!reticulate::miniconda_exists() || force) {
+      message("Python not found. Installing Miniconda...")
+      message("This is a one-time installation and may take a few minutes...")
 
-    reticulate::install_miniconda()
-    message("Miniconda installed successfully!")
+      reticulate::install_miniconda(force = force)
+      message("Miniconda installed successfully!")
+    } else {
+      message("Python not found, but Miniconda is already installed.")
+    }
   }
 
   if (!dir.exists(venv_path)) {

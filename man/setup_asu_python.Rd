@@ -7,4 +7,5 @@
 }
 \value{Invisible NULL.}
 \description{Creates a Python virtual environment for ASUbuildR, installing Miniconda
-and required packages if necessary.}
+and required packages if necessary. Existing Miniconda installations are reused
+unless \code{force} is TRUE.}
