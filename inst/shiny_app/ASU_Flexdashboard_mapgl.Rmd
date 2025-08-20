@@ -386,10 +386,9 @@ palette_logic <- function(n_asu) {
             legend_cols = legend_cols
           )
         }
-      }
+  }
 
 shiny::observeEvent(input$process, {
-  
   ## 0 · Basic checks ----------------------------------------------------
   shiny::req(uploaded_data(), state(), tract_year())
 
@@ -409,8 +408,6 @@ shiny::observeEvent(input$process, {
 
   ## 1 · Wrap the whole long job in withProgress -------------------------
   shiny::withProgress(message = "Running ASU initialisation…", value = 0, {
-    
-    # Add force year = 2021 option for New England  # <-- you can remove this comment now
 
     ## 1a · Build tracts + neighbours (can take ~10–60 s the first time)
     shiny::incProgress(0.10, detail = "Downloading Census shapefiles…")
@@ -431,9 +428,9 @@ shiny::observeEvent(input$process, {
 
     # 2 · Run the chosen ASU algorithm ---------------------------------
     algo_choice <- shiny::isolate(input$asu_algo %||% "orig")
-    
-    join_flag <- isTRUE(input$join_touching)   # ← keep the flag you already built
-    
+
+    join_flag <- isTRUE(input$join_touching) # ← keep the flag you already built
+
     shiny::incProgress(0.05, detail = "Finding initial ASU seeds…")
     if (algo_choice == "orig") {
       res <- run_asu_original(tract_list, uploaded_data())
@@ -441,78 +438,79 @@ shiny::observeEvent(input$process, {
       shiny::withProgress(message = "Seeding & expanding…", value = 0, {
         th_tract_list(tract_list)
         th_bls_df(uploaded_data())
-        st <- tract_hunter_seed(th_tract_list(), th_bls_df(), verbose = TRUE)})
+        st <- tract_hunter_seed(th_tract_list(), th_bls_df(), verbose = TRUE)
+      })
       th_state(st)
       res <- tract_hunter_finalize(st)
     }
 
     ## 3 · Finish the bar
     shiny::incProgress(1, detail = "Finishing up…")
-  })  # ---- withProgress ends here  -------------------------------------
+  }) # ---- withProgress ends here  -------------------------------------
 
   ## 4 · Store results & draw map  --------------------------------------
   if (!is.null(res)) {
-    full_data(res$full_data  )   ; full_data_reset(res$full_data_reset)
-    asu_data(res$asu_data    )   ; asu_tracts(res$asu_tracts)
-    asu_summary(res$asu_summary) ; map_geom(prep_map_data(res$full_data))
+    full_data(res$full_data)
+    full_data_reset(res$full_data_reset)
+    asu_data(res$asu_data)
+    asu_tracts(res$asu_tracts)
+    asu_summary(res$asu_summary)
+    map_geom(prep_map_data(res$full_data))
 
-    output$asu <- shiny::renderTable( asu_summary(),digits = 3 )
+    output$asu <- shiny::renderTable(asu_summary(), digits = 3)
 
     ## 5. (Re‑)draw the first map ----------------------------------
 
-  output$initial_map <- mapgl::renderMaplibre({
+    output$initial_map <- mapgl::renderMaplibre({
+  shiny::req(map_geom())
+  map_data <- map_geom()
 
-    shiny::req(map_geom())
-    map_data <- map_geom()
-
-    if (nrow(map_data) == 0) {
-      return(
-        mapgl::maplibre(style = mapgl::carto_style("positron")) |>
+  if (nrow(map_data) == 0) {
+    return(
+      mapgl::maplibre(style = mapgl::carto_style("positron")) |>
         mapgl::add_control("No valid polygon geometry to display.", "top-left")
+    )
+  }
+
+  # Treat asunum==0 as NA for coloring, compute palette once
+  map_data <- map_data |>
+    dplyr::mutate(asunum = dplyr::na_if(asunum, 0L))
+
+  n_asu <- max(map_data$asunum, na.rm = TRUE)
+  n_asu <- ifelse(is.finite(n_asu), n_asu, 0L)
+  pal <- palette_logic(n_asu)
+
+  mapgl::maplibre(style = mapgl::carto_style("positron")) |>
+    mapgl::fit_bounds(map_data, animate = FALSE) |>
+    mapgl::add_fill_layer(
+      id = "basemap",
+      source = map_data,
+      fill_color = pal$fill,
+      fill_opacity = 0.5,
+      fill_outline_color = "black",
+      tooltip = mapgl::concat(
+        "<strong>ASU Number: </strong>", mapgl::get_column("asunum"), "<br>",
+        "<strong>Tract GEOID: </strong>", mapgl::get_column("GEOID"), "<br>",
+        "<strong>UR: </strong>",
+        mapgl::number_format(mapgl::get_column("tract_ASU_urate"),
+                             style = "decimal", maximum_fraction_digits = 2),
+        "%<br>",
+        "<strong>Unemp: </strong>",
+        mapgl::number_format(mapgl::get_column("tract_ASU_unemp"),
+                             style = "decimal", maximum_fraction_digits = 0),
+        "<br>"
       )
-    }
+    ) |>
+    mapgl::add_legend(
+      "ASU Number",
+      values = pal$legend_vals,
+      colors = pal$legend_cols,
+      type   = "categorical"
+    )
+})
 
-    # ---- 6·2 palette / breaks ---------------------------------------
-    map_data <- map_data |>
-      dplyr::mutate(asunum = dplyr::na_if(asunum, 0L))
-
-    n_asu <- max(map_data$asunum, na.rm = TRUE)
-    n_asu <- ifelse(is.finite(n_asu), n_asu, 0L)
-
-    pal <- palette_logic(n_asu)
-
-    # ---- 6·3 build map ----------------------------------------------
-    mapgl::maplibre(style = mapgl::carto_style("positron")) |>
-      mapgl::fit_bounds(map_data, animate = FALSE) |>
-      mapgl::add_fill_layer(
-        id                 = "basemap",
-        source             = map_data,
-        fill_color         = pal$fill,
-        fill_opacity       = 0.6,
-        fill_outline_color = "black",
-        tooltip = mapgl::concat(
-          "<strong>ASU Number: </strong>", mapgl::get_column("asunum"), "<br>",
-          "<strong>Tract GEOID: </strong>", mapgl::get_column("GEOID"),  "<br>",
-          "<strong>UR: </strong>",
-          mapgl::number_format(mapgl::get_column("tract_ASU_urate"),
-                        style = "decimal", maximum_fraction_digits = 2),
-          "%<br>",
-          "<strong>Unemp: </strong>",
-          mapgl::number_format(mapgl::get_column("tract_ASU_unemp"),
-                        style = "decimal", maximum_fraction_digits = 0), "<br>"
-        )
-      ) |>
-      mapgl::add_legend(
-        "ASU Number",
-        values = pal$legend_vals,
-        colors = pal$legend_cols,
-        type   = "categorical"
-      )
-  })
-
-}
-
-})  # ---- end observeEvent -------------------------------------------------
+  }
+}) # ---- end observeEvent -------------------------------------------------
 
 shiny::observeEvent(input$th_pass, {
   shiny::req(th_state())

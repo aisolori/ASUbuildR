@@ -194,12 +194,15 @@ combine_asu_groups_internal <- function(tract_data, nb) {
       stringsAsFactors = FALSE
     )
 
+    # Assign new sequential ASU numbers starting at 1
     new_ids <- lookup |>
-      dplyr::group_by(comp) |>
-      dplyr::summarize(new_asu = min(original_asu)) |>
-      dplyr::ungroup()
+      dplyr::distinct(comp) |>
+      dplyr::arrange(comp) |>
+      dplyr::mutate(new_asu = dplyr::row_number())
 
-    lookup <- lookup |> dplyr::left_join(new_ids, by = "comp")
+    # Join back to get final lookup
+    lookup <- lookup |>
+      dplyr::left_join(new_ids, by = "comp")
 
     tract_data <- tract_data |>
       dplyr::mutate(asunum = ifelse(!is.na(asunum),
