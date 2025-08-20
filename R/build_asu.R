@@ -23,7 +23,7 @@ build_asu <- function(
     verbose = interactive()
 ) {
   if (!reticulate::py_module_available("ortools"))
-    stop("Python env missing 'ortools'. Run ASUbuildR::asu_py_env_create() first.")
+    stop("Python env missing 'ortools'. Run ASUbuildR::setup_asu_python() first.")
 
   # Normalize neighbor indexing to 0-based
   if (is.null(neighbors)) stop("Provide `neighbors` as a list of integer vectors (contiguity).")

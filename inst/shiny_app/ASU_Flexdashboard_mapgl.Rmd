@@ -10,29 +10,25 @@ editor_options:
     wrap: 72
 ---
 ```{r python_preamble, include=FALSE}
-library(reticulate)
-
-# Always define this first so options() won't error
+# Initialize flag
 python_ready <- FALSE
 
+# Location for the package's virtualenv
 venv_path <- file.path(rappdirs::user_data_dir("ASUbuildR"), "asu-cpsat-venv")
 
-# Try to activate the venv and check for OR-Tools, but never abort knitting
-try({
-  if (dir.exists(venv_path)) {
-    # Don't force activation during knit; just try it
-    reticulate::use_virtualenv(venv_path, required = FALSE)
+# Try to verify existing environment; if unavailable, attempt setup
+python_ready <- tryCatch(ASUbuildR::check_asu_python(), error = function(e) FALSE)
 
-    if (reticulate::py_module_available("ortools")) {
-      python_ready <- TRUE
-      message("[env] Python environment ready")
-    } else {
-      message("[env] Virtualenv found, but 'ortools' is missing")
-    }
-  } else {
-    message("[env] Python environment not set up; run ASUbuildR::setup_asu_python()")
-  }
-}, silent = TRUE)
+if (!python_ready) {
+  try(ASUbuildR::setup_asu_python(), silent = TRUE)
+  python_ready <- tryCatch(ASUbuildR::check_asu_python(), error = function(e) FALSE)
+}
+
+if (python_ready) {
+  message("[env] Python environment ready")
+} else {
+  message("[env] Python environment not available; run ASUbuildR::setup_asu_python()")
+}
 
 # Store the flag for later chunks
 options(asu_python_ready = python_ready)
@@ -88,17 +84,22 @@ if (is_dev_mode) {
 
 
 # Use the virtual environment we set up in the preamble
-venv_path <- file.path(rappdirs::user_data_dir("ASUbuildR"), "asu-cpsat-venv")
-reticulate::use_virtualenv(venv_path, required = TRUE)
-py_config()  # should now show the venv python
+python_ready <- isTRUE(getOption("asu_python_ready"))
+if (python_ready) {
+  venv_path <- file.path(rappdirs::user_data_dir("ASUbuildR"), "asu-cpsat-venv")
+  reticulate::use_virtualenv(venv_path, required = TRUE)
+  py_config()  # should now show the venv python
 
-# Import your solver module from the package's inst/python
-asu_py <- import_from_path(
-  module  = "asu_cpsat",
-  path    = normalizePath("../../inst/python", winslash = "/", mustWork = FALSE),
-  convert = TRUE
-)
-stopifnot(py_has_attr(asu_py, "build_many_asus_cpsat"))
+  # Import your solver module from the package's inst/python
+  asu_py <- import_from_path(
+    module  = "asu_cpsat",
+    path    = normalizePath("../../inst/python", winslash = "/", mustWork = FALSE),
+    convert = TRUE
+  )
+  stopifnot(py_has_attr(asu_py, "build_many_asus_cpsat"))
+} else {
+  stop("Python environment not ready; run ASUbuildR::setup_asu_python()")
+}
 
 
 ## ---- tigris cache ----------------------------------------------------
