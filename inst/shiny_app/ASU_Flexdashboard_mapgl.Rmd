@@ -167,6 +167,7 @@ cpsat_df_csv     <- shiny::reactiveVal(NULL)
 cpsat_nb_json    <- shiny::reactiveVal(NULL)
 cpsat_out_json   <- shiny::reactiveVal(NULL)
 cpsat_log_file   <- shiny::reactiveVal(NULL)
+cpsat_running <- shiny::reactiveVal(FALSE)
 
 append_cpsat_log <- function(...) {
   line <- paste0(format(Sys.time(), "%H:%M:%S "), paste0(..., collapse = ""))
@@ -179,7 +180,11 @@ append_cpsat_log <- function(...) {
 
 # keep log output live even if hidden
 output$cpsat_log_tail <- shiny::renderText("")
-shiny::outputOptions(output, "cpsat_log_tail", suspendWhenHidden = FALSE)
+output$show_cpsat_log_flag <- shiny::renderText({
+  if (isTRUE(cpsat_running())) "true" else "false"
+})
+shiny::outputOptions(output, "show_cpsat_log_flag", suspendWhenHidden = FALSE)
+
 # ---- New England year override logic ---------------------------------
 # Make it available to the UI
 shiny::outputOptions(output, "is_new_england", suspendWhenHidden = FALSE)
@@ -502,6 +507,7 @@ shiny::observeEvent(input$process, {
   }
 
   shiny::withProgress(message = "Running OR-Tools CP-SAT…", value = 0, {
+  cpsat_running(TRUE)
   append_cpsat_log("[run] Button clicked (CP-SAT).")
 
   # ---- 1) Preconditions & parameters ----------------------------------
@@ -521,6 +527,8 @@ shiny::observeEvent(input$process, {
   tlimit   <- if (is.null(input$cpsat_timelimit)) 1200   else as.integer(input$cpsat_timelimit)
   workers  <- if (is.null(input$cpsat_workers))   max(1L, parallel::detectCores()-5L) else as.integer(input$cpsat_workers)
   rel_gap  <- if (!is.null(input$cpsat_relgap) && !is.na(input$cpsat_relgap)) as.numeric(input$cpsat_relgap) else NA_real_
+  
+  
 
   append_cpsat_log(sprintf("[run] params: tau=%.6f pop=%d max=%d tlimit=%d workers=%d rel_gap=%s",
                            tau, pop_thr, max_asus, tlimit, workers,
@@ -725,12 +733,24 @@ print('[runner] OK', flush=True)
       session$userData$cpsatObs$destroy()
 
       # ---- 7) Load results -> update map/reactives ---------------------
+      clean_sf_columns <- function(x) {
+        g <- sf::st_geometry(x)
+        df <- x |>
+          sf::st_drop_geometry() |>
+          dplyr::select(where(~ !is.list(.)))   # drop all list-cols
+        sf::st_as_sf(df, geometry = g, crs = sf::st_crs(x))
+      }
+      
       if (identical(status, 0L) && file.exists(cpsat_out_json())) {
         res <- jsonlite::fromJSON(cpsat_out_json())
         if (!is.null(res$asu_id) && length(res$asu_id) == nrow(merged_df)) {
+          
           asu_id <- as.integer(res$asu_id)
+          
           final_sf <- merged_sf |>
-            dplyr::mutate(asunum = ifelse(asu_id < 0L, 0L, as.integer(asu_id)))
+            dplyr::mutate(asunum = ifelse(asu_id < 0L, 0L, as.integer(asu_id))) |>
+            dplyr::select(-dplyr::any_of("continuous")) |>  # explicit belt-and-suspenders
+            clean_sf_columns()
 
           # update your existing reactives
           full_data(final_sf)
@@ -749,6 +769,8 @@ print('[runner] OK', flush=True)
                 .groups = "drop"
               )
           )
+          
+          
           map_geom({
             final_sf |>
               sf::st_make_valid() |>
@@ -760,6 +782,7 @@ print('[runner] OK', flush=True)
           })
           output$asu <- shiny::renderTable(asu_summary(), digits = 3)
           append_cpsat_log("[run] Solver finished OK; map/table updated.")
+          cpsat_running(FALSE)
           # (Re)draw your map via your existing renderMaplibre code
           # (your existing renderMaplibre('initial_map') will pick up updated reactives)
         } else {
@@ -839,31 +862,70 @@ output$total_unemp2 <- shiny::renderUI({
 })
 ```
 
-## Solver Log {data-width="400"}
 
 ```{r}
-# Show the log only when CP-SAT is selected
-shiny::conditionalPanel(
-  condition = "input.asu_algo === 'cpsat'",
-  shiny::wellPanel(
-    style = "height: 100vh; overflow-y: auto; background-color: #ffffff; font-family: monospace; font-size: 12px; padding: 10px;",
-    shiny::verbatimTextOutput("cpsat_log_tail", placeholder = TRUE)
+output$log_overlay <- shiny::renderUI({
+  if (!isTRUE(cpsat_running())) return(NULL)
+  shiny::absolutePanel(
+    top = 80, right = 20, width = 600, height = "70vh", draggable = TRUE,
+    style = "background:#fff; border:1px solid #ddd; box-shadow:0 2px 8px rgba(0,0,0,.15); overflow-y:auto; padding:10px;",
+    shiny::div(style="font-family:monospace; font-size:12px;",
+      shiny::strong("CP-SAT log"), shiny::br(), shiny::verbatimTextOutput("cpsat_log_tail")
+    )
   )
-)
+})
 
-# Show a placeholder when CP-SAT is not selected
-shiny::conditionalPanel(
-  condition = "input.asu_algo !== 'cpsat'",
-  shiny::div(
-    style = "padding: 20px; color: #666;",
-    shiny::HTML("CP-SAT solver log will appear here when the CP-SAT algorithm is selected and running.")
-  )
-)
+
 ```
 
-## Map {data-width="400"}
 ```{r}
+# -- GLOBAL map render that reacts to map_geom() --
+output$initial_map <- mapgl::renderMaplibre({
+  shiny::req(map_geom())
+  map_data <- map_geom()
+  if (nrow(map_data) == 0) {
+    return(
+      mapgl::maplibre(style = mapgl::carto_style("positron")) |>
+      mapgl::add_control("No valid polygon geometry to display.", "top-left")
+    )
+  }
+
+  # Replace 0 with NA so base color applies
+  map_data <- map_data |> dplyr::mutate(asunum = dplyr::na_if(asunum, 0L))
+
+  n_asu <- suppressWarnings(max(map_data$asunum, na.rm = TRUE))
+  n_asu <- ifelse(is.finite(n_asu), n_asu, 0L)
+
+  pal <- palette_logic(n_asu)
+
+  mapgl::maplibre(style = mapgl::carto_style("positron")) |>
+    mapgl::fit_bounds(map_data, animate = FALSE) |>
+    mapgl::add_fill_layer(
+      id                 = "basemap",
+      source             = map_data,
+      fill_color         = pal$fill,
+      fill_opacity       = 0.5,
+      fill_outline_color = "black",
+      tooltip = mapgl::concat(
+        "<strong>ASU Number: </strong>", mapgl::get_column("asunum"), "<br>",
+        "<strong>Tract GEOID: </strong>", mapgl::get_column("GEOID"), "<br>",
+        "<strong>Tract Population: </strong>", mapgl::number_format(mapgl::get_column("tract_pop_cur"), style = "decimal", maximum_fraction_digits = 0), "<br>",
+        "<strong>Tract Labor Force: </strong>", mapgl::number_format(mapgl::get_column("tract_ASU_clf"), style = "decimal", maximum_fraction_digits = 0), "<br>",
+        "<strong>Tract Unemployment Rate: </strong>", mapgl::number_format(mapgl::get_column("tract_ASU_urate"), style = "decimal", maximum_fraction_digits = 2), "%<br>",
+        "<strong>Tract Unemployment: </strong>", mapgl::number_format(mapgl::get_column("tract_ASU_unemp"), style = "decimal", maximum_fraction_digits = 0), "<br>"
+      )
+    )
+})
+```
+
+## Map {data-width="800"}
+```{r}
+# Map
 mapgl::maplibreOutput("initial_map", height = "100vh")
+
+# Log overlay (shows only while running)
+shiny::uiOutput("log_overlay")
+
 ```
 
 

@@ -2,6 +2,10 @@
 """
 asu_cpsat.py — Build Areas of Substantial Unemployment (ASUs) with OR-Tools CP-SAT.
 
+Modified to ensure:
+1. Seeds are selected from unassigned tracts with high unemployment rate
+2. Stops when no remaining unassigned tract has UR >= tau (6.45%)
+
 Two ways to provide adjacency (contiguity):
   A) Precomputed neighbors JSON (recommended on servers without a Geo stack)
      - JSON format: list of lists of tract indices (0- or 1-based). E.g., [[1,4],[2],...]
@@ -348,17 +352,34 @@ def build_many_asus_cpsat(
         if rem_idx.size < 2:
             break
 
-        # seeds with at least one remaining neighbor
-        deg_rem = np.array([np.sum(remaining[np.array(nb[i], dtype=int)]) for i in rem_idx])
-        cand_seeds = rem_idx[deg_rem > 0]
+        # MODIFIED: First filter for tracts with UR >= tau
+        rem_UR = UR[rem_idx]
+        high_ur_mask = rem_UR >= tau
+        
+        # If no remaining tract has UR >= tau, stop building ASUs
+        if not high_ur_mask.any():
+            if verbose:
+                print(f"\nNo remaining tracts have UR >= {tau*100:.2f}%. Stopping ASU creation.")
+            break
+        
+        # Filter to only consider high UR tracts as potential seeds
+        high_ur_rem_idx = rem_idx[high_ur_mask]
+        
+        # Among high UR tracts, find those with at least one remaining neighbor
+        deg_rem = np.array([np.sum(remaining[np.array(nb[i], dtype=int)]) for i in high_ur_rem_idx])
+        cand_seeds = high_ur_rem_idx[deg_rem > 0]
+        
         if cand_seeds.size == 0:
+            if verbose:
+                print(f"\nNo high-UR tracts (UR >= {tau*100:.2f}%) have remaining neighbors. Stopping.")
             break
 
-        # prioritize by UR then population
+        # Prioritize by UR (descending) then population (descending)
+        # Since we already filtered for high UR, this sorts among them
         order = np.lexsort((-df.loc[cand_seeds, "tract_pop2024"].to_numpy(), -UR[cand_seeds]))
         seed_pool = cand_seeds[order]
 
-        # pick first untried seed
+        # Pick first untried seed from high-UR candidates
         seed = None
         for s in seed_pool:
             if not tried[int(s)]:
@@ -366,7 +387,7 @@ def build_many_asus_cpsat(
                 break
         if seed is None:
             if verbose:
-                print("No remaining seeds produce a feasible window; stopping.")
+                print("No remaining high-UR seeds produce a feasible window; stopping.")
             break
 
         # Expand BFS window until pop threshold (with margin) or radius bound
@@ -385,7 +406,8 @@ def build_many_asus_cpsat(
         if verbose:
             su, sE = int(u[sub].sum()), int(E[sub].sum())
             URw = 100.0 * (0.0 if (su + sE) == 0 else su / (su + sE))
-            print(f"\n[ASU {k+1}] seed={seed} | window: r={r}, nodes={len(sub)}, pop={int(P[sub].sum())}, UR={URw:.2f}%")
+            seed_ur = 100.0 * UR[seed]
+            print(f"\n[ASU {k+1}] seed={seed} (UR={seed_ur:.2f}%) | window: r={r}, nodes={len(sub)}, pop={int(P[sub].sum())}, UR={URw:.2f}%")
 
         # Build local adjacency for nodes in 'sub'
         local_index = {g: i for i, g in enumerate(sub)}
@@ -447,7 +469,14 @@ def build_many_asus_cpsat(
         if verbose:
             su, sE, sP = int(u[S_improved].sum()), int(E[S_improved].sum()), int(P[S_improved].sum())
             URv = 100.0 * (0.0 if (su + sE) == 0 else su / (su + sE))
-            print(f"  ✓ ASU {k} committed: tracts={len(S_improved)}, pop={sP}, UR={URv:.3f}%, unemp={su}")
+            print(f"  [OK] ASU {k} committed: tracts={len(S_improved)}, pop={sP}, UR={URv:.3f}%, unemp={su}")
+
+    # Final summary if stopped due to no high-UR tracts
+    if verbose and k < max_asus:
+        rem_idx_final = np.where(remaining)[0]
+        if rem_idx_final.size > 0:
+            max_ur_remaining = UR[rem_idx_final].max() * 100
+            print(f"\nStopped after {k} ASUs. Max UR among {rem_idx_final.size} remaining tracts: {max_ur_remaining:.3f}%")
 
     return {"asu_id": asu_id, "n_asu": int(k)}
 
