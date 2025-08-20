@@ -10,24 +10,15 @@ editor_options:
     wrap: 72
 ---
 ```{r python_preamble, include=FALSE}
-# Initialize flag
-python_ready <- FALSE
-
-# Try to verify existing environment; if unavailable, attempt setup
-python_ready <- tryCatch(ASUbuildR::check_asu_python(), error = function(e) FALSE)
+python_ready <- tryCatch(
+  ASUbuildR::check_asu_python(),
+  error = function(e) { message("[env] ", e$message); FALSE }
+)
 
 if (!python_ready) {
-  try(ASUbuildR::setup_asu_python(force = TRUE), silent = TRUE)
-  python_ready <- tryCatch(ASUbuildR::check_asu_python(), error = function(e) FALSE)
-}
-
-if (python_ready) {
-  message("[env] Python environment ready")
-} else {
   message("[env] Python environment not available; run ASUbuildR::setup_asu_python()")
 }
 
-# Store the flag for later chunks
 options(asu_python_ready = python_ready)
 ```
 
@@ -77,51 +68,15 @@ if (is_dev_mode) {
 `%||%` <- function(a, b) if (!is.null(a) && length(a)) a else b
 
 
-# ── Use virtual environment & import Python module ───────────────────
-
-
-# Use the virtual environment we set up in the preamble
+# ── Use virtual environment ─────────────────────────────
 python_ready <- isTRUE(getOption("asu_python_ready"))
 if (python_ready) {
   venv_path <- file.path(rappdirs::user_data_dir("ASUbuildR"), "asu-cpsat-venv")
   reticulate::use_virtualenv(venv_path, required = TRUE)
-  py_config()  # should now show the venv python
-
-  # Import your solver module from the package's inst/python
-  asu_py <- import_from_path(
-    module  = "asu_cpsat",
-    path    = normalizePath("../../inst/python", winslash = "/", mustWork = FALSE),
-    convert = TRUE
-  )
-  stopifnot(py_has_attr(asu_py, "build_many_asus_cpsat"))
+  py_config()
 } else {
-  stop("Python environment not ready; run ASUbuildR::setup_asu_python()")
+  message("[env] CP-SAT features disabled (Python not available)")
 }
-
-
-## ---- tigris cache ----------------------------------------------------
-## put cached TIGER/Line ZIPs in a per-user cache folder that is always
-## writable, even after the package is installed read-only.
-
-# 1. choose a sensible user-cache path (rappdirs works everywhere)
-cache_dir <- rappdirs::user_cache_dir("ASUbuildR", "tigris")
-
-# 2. create it if it doesn't exist
-if (!dir.exists(cache_dir))
-  dir.create(cache_dir, recursive = TRUE, showWarnings = FALSE)
-
-# 3. tell tigris to use it *this session*
-options(tigris_cache_dir = cache_dir)
-
-# tell tigris to look there first before re‑downloading
-options(tigris_use_cache = TRUE)
-
-
-# cache every tigris download automatically
-options(
-  tigris_use_cache = TRUE,                 # turn caching on
-  tigris_class     = "sf"                  # always return sf objects
-)
 
 options(shiny.maxRequestSize = 50 * 1024^2)  # Set to 50MB or your desired limit
 
@@ -335,17 +290,17 @@ shiny::conditionalPanel(
 )
 
 # ---- algorithm picker -------------------------------------------------
+algo_choices <- c("Tract Hunter" = "mine", "Simple Snake" = "orig")
+if (isTRUE(getOption("asu_python_ready")))
+  algo_choices <- c(algo_choices, "CP-SAT (OR-Tools)" = "cpsat")
 shiny::radioButtons(
   inputId = "asu_algo",
   label   = "Choose algorithm",
-  choices = c(
-    "Tract Hunter"      = "mine",
-    "Simple Snake"      = "orig",
-    "CP-SAT (OR-Tools)" = "cpsat"
-  ),
+  choices = algo_choices,
   inline  = TRUE
 )
-
+if (!isTRUE(getOption("asu_python_ready")))
+  shiny::p("CP-SAT solver requires Python. Run ASUbuildR::setup_asu_python() to enable.")
 
 # -----------------------------------------------------------------------
 # main "Run" button (always visible)
@@ -567,6 +522,14 @@ shiny::observeEvent(input$process, {
 
     # --- CP-SAT branch (drop-in replacement) -------------------------------
 if (identical(algo_choice, "cpsat")) {
+  if (!isTRUE(getOption("asu_python_ready"))) {
+    shiny::showModal(shiny::modalDialog(
+      title = "Python not available",
+      "CP-SAT solver requires a working Python environment. Run ASUbuildR::setup_asu_python() and restart the app.",
+      easyClose = TRUE
+    ))
+    return(invisible(NULL))
+  }
   session <- shiny::getDefaultReactiveDomain()
 
   shiny::withProgress(message = "Running OR-Tools CP-SAT…", value = 0, {
@@ -662,7 +625,10 @@ if (identical(algo_choice, "cpsat")) {
 
     # ---- 4) Write runner.py -------------------------------------------
     shiny::incProgress(0.05, detail = "Preparing Python runner")
-    py_mod_path <- normalizePath(file.path("..","..","inst","python"), winslash="/", mustWork = TRUE)
+    py_mod_path <- system.file("python", package = "ASUbuildR")
+    if (py_mod_path == "") {
+      py_mod_path <- normalizePath(file.path("..","..","inst","python"), winslash="/", mustWork = TRUE)
+    }
     runner_code <- sprintf("
 import sys, os, json, math
 try:
