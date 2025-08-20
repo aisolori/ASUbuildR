@@ -1,10 +1,8 @@
 # Script to run ASU Flexdashboard RMD file
 # This script renders and launches the Shiny-based flexdashboard
 
-# Load required libraries
-library(rmarkdown)
-library(flexdashboard)
-library(shiny)
+# Dependencies are imported in the package's NAMESPACE; explicit library
+# calls are unnecessary and can cause side effects during package load.
 
 #' Launch ASU Flexdashboard Application
 #'
