@@ -72,6 +72,14 @@ launch_ASUbuildR <- function(rmd_file = NULL,
     stop(paste("File", rmd_file, "not found. Please check the file path or ensure the .Rmd file is in the correct location."))
   }
 
+  # Ensure Python environment is ready before launching
+  if (!check_asu_python()) {
+    setup_asu_python()
+    if (!check_asu_python()) {
+      stop("Python environment setup failed", call. = FALSE)
+    }
+  }
+
   # Print status message
   cat("Starting ASU Flexdashboard...\n")
   cat("File:", rmd_file, "\n")

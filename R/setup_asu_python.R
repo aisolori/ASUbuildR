@@ -38,7 +38,7 @@ setup_asu_python <- function(force = FALSE) {
   }
 
   # Create virtual environment
-  if (!dir.exists(venv_path) || force) {
+  if (force || !reticulate::virtualenv_exists(venv_path)) {
     message("Creating virtual environment...")
 
     reticulate::virtualenv_create(
@@ -77,8 +77,8 @@ setup_asu_python <- function(force = FALSE) {
 check_asu_python <- function() {
   venv_path <- file.path(rappdirs::user_data_dir("ASUbuildR"), "asu-cpsat-venv")
 
-  if (!dir.exists(venv_path)) {
-    message("Virtual environment not found.")
+  if (!reticulate::virtualenv_exists(venv_path)) {
+    message("Virtual environment not found or invalid.")
     message("Run setup_asu_python() to set up the Python environment.")
     return(FALSE)
   }
