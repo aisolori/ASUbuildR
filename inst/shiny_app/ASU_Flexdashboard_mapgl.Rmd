@@ -408,7 +408,6 @@ shiny::observeEvent(input$process, {
 
   ## 1 · Wrap the whole long job in withProgress -------------------------
   shiny::withProgress(message = "Running ASU initialisation…", value = 0, {
-
     ## 1a · Build tracts + neighbours (can take ~10–60 s the first time)
     shiny::incProgress(0.10, detail = "Downloading Census shapefiles…")
     
@@ -427,7 +426,11 @@ shiny::observeEvent(input$process, {
       dplyr::left_join(uploaded_data(), by = "GEOID")
 
     # 2 · Run the chosen ASU algorithm ---------------------------------
+
     algo_choice <- shiny::isolate(input$asu_algo)
+
+    algo_choice <- shiny::isolate(input$asu_algo %||% "orig")
+
 
     join_flag <- isTRUE(input$join_touching) # ← keep the flag you already built
 
@@ -455,7 +458,8 @@ shiny::observeEvent(input$process, {
     asu_data(res$asu_data)
     asu_tracts(res$asu_tracts)
     asu_summary(res$asu_summary)
-    map_geom(prep_map_data(res$full_data))}
+    map_geom(prep_map_data(res$full_data))
+
 
     output$asu <- shiny::renderTable(asu_summary(), digits = 3)
 
@@ -464,55 +468,14 @@ shiny::observeEvent(input$process, {
     output$initial_map <- mapgl::renderMaplibre({
       shiny::req(map_geom())
 
-    shiny::req(full_data())
-    map_data <- full_data()
+      map_data <- map_geom()
 
-    # ---- 6·1 geometry housekeeping ----------------------------------
-    map_data <- map_data |>
-      sf::st_make_valid() |>
-      sf::st_zm(what = "ZM", drop = TRUE) |>
-      dplyr::filter(!sf::st_is_empty(geometry)) |>
-      dplyr::mutate(geom_type = sf::st_geometry_type(geometry)) |>
-      dplyr::filter(geom_type %in% c("POLYGON", "MULTIPOLYGON")) |>
-      dplyr::select(-geom_type)
-
-    if (nrow(map_data) == 0) {
-      return(
-        mapgl::maplibre(style = mapgl::carto_style("positron")) |>
-        mapgl::add_control("No valid polygon geometry to display.", "top-left")
-      )
-    }
-
-    # ---- 6·2 palette / breaks ---------------------------------------
-    map_data <- map_data |>
-      dplyr::mutate(asunum = dplyr::na_if(asunum, 0L))
-
-    n_asu <- max(map_data$asunum, na.rm = TRUE)
-    n_asu <- ifelse(is.finite(n_asu), n_asu, 0L)
-
-    pal <- palette_logic(n_asu)
-
-    # ---- 6·3 build map ----------------------------------------------
-    mapgl::maplibre(style = mapgl::carto_style("positron")) |>
-      mapgl::fit_bounds(map_data, animate = FALSE) |>
-      mapgl::add_fill_layer(
-        id                 = "basemap",
-        source             = map_data,
-        fill_color         = pal$fill,
-        fill_opacity       = 0.6,
-        fill_outline_color = "black",
-        tooltip = mapgl::concat(
-          "<strong>ASU Number: </strong>", mapgl::get_column("asunum"), "<br>",
-          "<strong>Tract GEOID: </strong>", mapgl::get_column("GEOID"),  "<br>",
-          "<strong>UR: </strong>",
-          mapgl::number_format(mapgl::get_column("tract_ASU_urate"),
-                        style = "decimal", maximum_fraction_digits = 2),
-          "%<br>",
-          "<strong>Unemp: </strong>",
-          mapgl::number_format(mapgl::get_column("tract_ASU_unemp"),
-                        style = "decimal", maximum_fraction_digits = 0), "<br>"
-
-        ))
+      if (nrow(map_data) == 0) {
+        return(
+          mapgl::maplibre(style = mapgl::carto_style("positron")) |>
+            mapgl::add_control("No valid polygon geometry to display.", "top-left")
+        )
+      }
 
       # ---- 6·2 palette / breaks ---------------------------------------
       map_data <- map_data |>
@@ -555,9 +518,10 @@ shiny::observeEvent(input$process, {
           type   = "categorical"
         )
     })
-  })
-  
-  # ---- end observeEvent -------------------------------------------------
+  }
+}) 
+# ---- end observeEvent -------------------------------------------------
+
 
 shiny::observeEvent(input$th_pass, {
   shiny::req(th_state())
@@ -586,44 +550,7 @@ shiny::observeEvent(input$th_pass, {
     n_asu <- ifelse(is.finite(n_asu), n_asu, 0L)
     
 
-    palette_logic <- function(n_asu) {
-  if (n_asu == 0) {
-    list(fill = "#E0E0E0",
-         legend_vals = "(none)",
-         legend_cols = "#E0E0E0")
 
-  } else if (n_asu == 1) {
-    list(
-      fill  = mapgl::step_expr(column="asunum",
-                        base="#E0E0E0",
-                        stops="#7FC97F",
-                        values=1,
-                        na_color="#E0E0E0"),
-      legend_vals = 1,
-      legend_cols = "#7FC97F"
-    )
-
-  } else {
-    n_cat <- min(max(n_asu, 3L), 8L)          # 3-to-8 distinct hues
-    pal   <- RColorBrewer::brewer.pal(n_cat, "Accent")
-
-    # make colours exactly as long as the value vector
-    legend_cols <- rep_len(pal, n_asu)
-
-    breaks <- seq(1 + n_asu / n_cat, n_asu, length.out = n_cat - 1)
-
-    list(
-      fill = mapgl::step_expr(column   = "asunum",
-                       base     = pal[1],
-                       stops    = pal[-1],
-                       values   = breaks,
-                       na_color = "#E0E0E0"),
-      legend_vals = seq_len(n_asu),
-      legend_cols = legend_cols
-    )
-  }
-}
-    
     pal <- palette_logic(n_asu)
     mapgl::maplibre(style = mapgl::carto_style("positron")) |>
       mapgl::fit_bounds(map_data, animate = FALSE) |>
@@ -663,7 +590,6 @@ shiny::observeEvent(input$th_combine, {
     n_asu <- max(map_data$asunum, na.rm = TRUE)
     n_asu <- ifelse(is.finite(n_asu), n_asu, 0L)
     
-
 
     pal <- palette_logic(n_asu)
     mapgl::maplibre(style = mapgl::carto_style("positron")) |>
