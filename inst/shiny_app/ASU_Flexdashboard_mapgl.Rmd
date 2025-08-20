@@ -344,6 +344,42 @@ shiny::htmlOutput("total_unemp")
 
 shiny::tableOutput("asu")
 
+palette_logic <- function(n_asu) {
+        if (n_asu == 0) {
+          list(
+            fill = "#808080",
+            legend_vals = "(none)",
+            legend_cols = "#808080"
+          )
+        } else if (n_asu == 1) {
+          list(
+            fill = mapgl::step_expr(
+              column = "asunum",
+              base = "#808080",
+              stops = "#7FC97F",
+              values = 1,
+              na_color = "#444444"
+            ),
+            legend_vals = 1,
+            legend_cols = "#7FC97F"
+          )
+        } else {
+          pal <- RColorBrewer::brewer.pal(min(max(n_asu, 3L), 8L), "Accent")
+          legend_vals <- seq_len(n_asu)
+          legend_cols <- rep_len(pal, n_asu)
+
+          list(
+            fill = mapgl::match_expr(
+              column = "asunum",
+              values = legend_vals,
+              stops = legend_cols
+            ),
+            legend_vals = legend_vals,
+            legend_cols = legend_cols
+          )
+        }
+      }
+
 shiny::observeEvent(input$process, {
   
   ## 0 · Basic checks ----------------------------------------------------
@@ -444,44 +480,6 @@ shiny::observeEvent(input$process, {
     n_asu <- max(map_data$asunum, na.rm = TRUE)
     n_asu <- ifelse(is.finite(n_asu), n_asu, 0L)
 
-    palette_logic <- function(n_asu) {
-  if (n_asu == 0) {
-    list(fill = "#E0E0E0",
-         legend_vals = "(none)",
-         legend_cols = "#E0E0E0")
-
-  } else if (n_asu == 1) {
-    list(
-      fill  = mapgl::step_expr(column="asunum",
-                        base="#E0E0E0",
-                        stops="#7FC97F",
-                        values=1,
-                        na_color="#E0E0E0"),
-      legend_vals = 1,
-      legend_cols = "#7FC97F"
-    )
-
-  } else {
-    n_cat <- min(max(n_asu, 3L), 8L)          # 3-to-8 distinct hues
-    pal   <- RColorBrewer::brewer.pal(n_cat, "Accent")
-
-    # make colours exactly as long as the value vector
-    legend_cols <- rep_len(pal, n_asu)
-
-    breaks <- seq(1 + n_asu / n_cat, n_asu, length.out = n_cat - 1)
-
-    list(
-      fill = mapgl::step_expr(column   = "asunum",
-                       base     = pal[1],
-                       stops    = pal[-1],
-                       values   = breaks,
-                       na_color = "#E0E0E0"),
-      legend_vals = seq_len(n_asu),
-      legend_cols = legend_cols
-    )
-  }
-}
-
     pal <- palette_logic(n_asu)
 
     # ---- 6·3 build map ----------------------------------------------
@@ -550,44 +548,6 @@ shiny::observeEvent(input$th_pass, {
     n_asu <- max(map_data$asunum, na.rm = TRUE)
     n_asu <- ifelse(is.finite(n_asu), n_asu, 0L)
     
-    palette_logic <- function(n_asu) {
-  if (n_asu == 0) {
-    list(fill = "#E0E0E0",
-         legend_vals = "(none)",
-         legend_cols = "#E0E0E0")
-
-  } else if (n_asu == 1) {
-    list(
-      fill  = mapgl::step_expr(column="asunum",
-                        base="#E0E0E0",
-                        stops="#7FC97F",
-                        values=1,
-                        na_color="#E0E0E0"),
-      legend_vals = 1,
-      legend_cols = "#7FC97F"
-    )
-
-  } else {
-    n_cat <- min(max(n_asu, 3L), 8L)          # 3-to-8 distinct hues
-    pal   <- RColorBrewer::brewer.pal(n_cat, "Accent")
-
-    # make colours exactly as long as the value vector
-    legend_cols <- rep_len(pal, n_asu)
-
-    breaks <- seq(1 + n_asu / n_cat, n_asu, length.out = n_cat - 1)
-
-    list(
-      fill = mapgl::step_expr(column   = "asunum",
-                       base     = pal[1],
-                       stops    = pal[-1],
-                       values   = breaks,
-                       na_color = "#E0E0E0"),
-      legend_vals = seq_len(n_asu),
-      legend_cols = legend_cols
-    )
-  }
-}
-    
     pal <- palette_logic(n_asu)
     mapgl::maplibre(style = mapgl::carto_style("positron")) |>
       mapgl::fit_bounds(map_data, animate = FALSE) |>
@@ -650,44 +610,6 @@ shiny::observeEvent(input$th_combine, {
       dplyr::mutate(asunum = dplyr::na_if(asunum, 0L))
     n_asu <- max(map_data$asunum, na.rm = TRUE)
     n_asu <- ifelse(is.finite(n_asu), n_asu, 0L)
-    
-    palette_logic <- function(n_asu) {
-  if (n_asu == 0) {
-    list(fill = "#E0E0E0",
-         legend_vals = "(none)",
-         legend_cols = "#E0E0E0")
-
-  } else if (n_asu == 1) {
-    list(
-      fill  = mapgl::step_expr(column="asunum",
-                        base="#E0E0E0",
-                        stops="#7FC97F",
-                        values=1,
-                        na_color="#E0E0E0"),
-      legend_vals = 1,
-      legend_cols = "#7FC97F"
-    )
-
-  } else {
-    n_cat <- min(max(n_asu, 3L), 8L)          # 3-to-8 distinct hues
-    pal   <- RColorBrewer::brewer.pal(n_cat, "Accent")
-
-    # make colours exactly as long as the value vector
-    legend_cols <- rep_len(pal, n_asu)
-
-    breaks <- seq(1 + n_asu / n_cat, n_asu, length.out = n_cat - 1)
-
-    list(
-      fill = mapgl::step_expr(column   = "asunum",
-                       base     = pal[1],
-                       stops    = pal[-1],
-                       values   = breaks,
-                       na_color = "#E0E0E0"),
-      legend_vals = seq_len(n_asu),
-      legend_cols = legend_cols
-    )
-  }
-}
     
     pal <- palette_logic(n_asu)
     mapgl::maplibre(style = mapgl::carto_style("positron")) |>
@@ -1718,7 +1640,6 @@ shiny::observeEvent(input$review_txt, {
 # Export high-resolution images of ASUs for review.
 # Use reactlog package to monitor reactive interactions in the code for cleanup. https://mastering-shiny.org/reactive-graph.html
 ```
-
 
 # How to Use ASUbuildR
 
