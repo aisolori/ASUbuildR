@@ -1,0 +1,489 @@
+---
+title: "ASU CP‑SAT (inline, with visible logs)"
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: columns
+    vertical_layout: fill
+runtime: shiny
+---
+
+
+```{r setup, include=FALSE}
+# ---- R packages ----
+required_pkgs <- c(
+  "shiny","readxl","dplyr","stringr","jsonlite","sf","tigris","sfdep",
+  "flexdashboard","rappdirs","reticulate"
+)
+new <- setdiff(required_pkgs, rownames(installed.packages()))
+if (length(new)) install.packages(new, quiet = TRUE)
+invisible(lapply(required_pkgs, require, character.only = TRUE))
+
+# TIGER caching
+options(tigris_use_cache = TRUE, tigris_class = "sf")
+cache_dir <- rappdirs::user_cache_dir("ASUbuildR","tigris")
+if (!dir.exists(cache_dir)) dir.create(cache_dir, recursive = TRUE, showWarnings = FALSE)
+options(tigris_cache_dir = cache_dir)
+
+# ---- Python env (conda preferred) ----
+envname <- "asu-cpsat"
+conda_path <- tryCatch(reticulate::conda_binary(), error = function(e) "")
+if (isTRUE(nchar(conda_path) > 0)) {
+  envs <- tryCatch(reticulate::conda_list()$name, error = function(e) character(0))
+  if (!(envname %in% envs)) {
+    reticulate::conda_create(envname, packages = c("python=3.11"))
+  }
+  reticulate::use_condaenv(envname, required = TRUE)
+  # Ensure deps (pip because ortools wheels are reliable on Windows)
+  try({
+  reticulate::py_install(
+    c("protobuf==4.25.3","absl-py","immutabledict",
+      "numpy","pandas","networkx","ortools==9.9.3963"),
+    pip = TRUE, pip_options = c("--upgrade","--no-cache-dir","--no-user")
+  )
+  # Remove bad 'google' package if present (not protobuf)
+  py_run_string("
+import pkg_resources, subprocess, sys
+if any(d.project_name.lower()=='google' for d in pkg_resources.working_set):
+    subprocess.check_call([sys.executable,'-m','pip','uninstall','-y','google'])
+")
+}, silent = TRUE)
+
+} else {
+  warning("Conda not found; using system Python. Make sure pandas, numpy, networkx, ortools are installed.")
+}
+
+# Show bound interpreter in the knit log for sanity
+py_config()
+
+# ---- UI logging helpers ----
+log_buf <- shiny::reactiveVal("")
+append_log <- function(..., sep = "") {
+  txt <- paste0(..., sep)
+  old <- log_buf()
+  new <- paste0(old, if (nchar(old)) "\n" else "", txt)
+  # keep last ~6000 chars
+  if (nchar(new) > 6000) new <- substr(new, nchar(new) - 5999, nchar(new))
+  log_buf(new)
+}
+
+# ---------- Reactives & helpers ----------
+bls_df        <- shiny::reactiveVal(NULL)
+state_fips    <- shiny::reactiveVal(NULL)
+tracts_sf     <- shiny::reactiveVal(NULL)
+
+# paths & logging
+nb_json_path  <- shiny::reactiveVal(NULL)   # neighbors JSON path
+df_csv_path   <- shiny::reactiveVal(NULL)   # CSV path for BLS data
+out_json_path <- shiny::reactiveVal(NULL)   # solver results JSON path
+
+log_buf       <- shiny::reactiveVal("")     # live log text
+solver_proc   <- shiny::reactiveVal(NULL)   # processx::process handle
+solver_obs    <- shiny::reactiveVal(NULL)   # observer that tails the process
+
+
+
+# ---- LOGGING HELPERS (add once) --------------------------------------
+log_buf     <- shiny::reactiveVal("")
+solver_proc <- shiny::reactiveVal(NULL)
+
+append_log <- function(...) {
+  msg <- paste0(format(Sys.time(), "%H:%M:%S"), " ", paste0(..., collapse = ""))
+  cur <- log_buf()
+  new <- if (nzchar(cur)) paste(cur, msg, sep = "\n") else msg
+  # keep the last ~8000 chars for snappy UI
+  if (nchar(new) > 8000) new <- substr(new, nchar(new) - 7999, nchar(new))
+  log_buf(new)
+  output$log_tail <- shiny::renderText(new)
+}
+
+# Initialize and make sure it updates even when hidden
+output$log_tail <- shiny::renderText("")
+shiny::outputOptions(output, "log_tail", suspendWhenHidden = FALSE)
+
+```
+
+# Load BLS file & settings {data-width="350"}
+
+```{r}
+fileInput("xlsx", "Upload BLS XLSX (first sheet read):", accept = c(".xlsx",".xls"))
+numericInput("year", "Tract year (TIGER/Line)", value = 2024, min = 2010, max = 2024, step = 1)
+textInput("py_path", "Folder containing asu_cpsat.py", value = normalizePath("../../inst/python", winslash = "/", mustWork = FALSE))
+actionButton("build_nb", "1) Build neighbors (TIGER + queen)")
+hr()
+numericInput("tau", "UR threshold (τ)", value = 0.0645, min = 0, max = 1, step = 0.0001)
+numericInput("pop", "Population threshold", value = 10000, min = 0, step = 100)
+numericInput("max_asu", "Max ASUs", value = 30, min = 1, step = 1)
+numericInput("tlimit", "Time limit (sec) per window", value = 600, min = 10, step = 10)
+numericInput("workers", "Workers (keep 1 on Windows)", value = 1, min = 1, step = 1)
+textInput("relgap", "Relative gap (optional, blank = None)", value = "")
+actionButton("run", "2) Run OR‑Tools (CP‑SAT)")
+
+
+```
+
+# Data / Log / Summary
+
+## Preview (from XLSX)
+```{r}
+tableOutput("preview")
+textOutput("state_info")
+
+```
+
+## Live solver log
+```{r}
+verbatimTextOutput("log_tail", placeholder = TRUE)
+
+```
+
+## ASU summary
+```{r}
+tableOutput("asu_tbl")
+```
+
+```{r, include=FALSE}
+# Ensure the log panel is live even when hidden
+output$log_tail <- renderText(log_buf())
+shiny::outputOptions(output, "log_tail", suspendWhenHidden = FALSE)
+
+# ---- XLSX ingest ----
+observeEvent(input$xlsx, {
+  req(input$xlsx)
+  append_log("[UI] Reading XLSX (first sheet)…")
+  dat <- readxl::read_excel(input$xlsx$datapath, sheet = 1)
+
+  nm <- names(dat)
+  # Flexible GEOID handling
+  if ("geoid" %in% tolower(nm)) {
+    col <- nm[match("geoid", tolower(nm))]
+    dat <- dplyr::mutate(dat, GEOID = stringr::str_replace(as.character(.data[[col]]), "^14000US", ""))
+  } else if (all(c("st_fips","cnty_fips","tract_fips") %in% tolower(nm))) {
+    col_st   <- nm[match("st_fips", tolower(nm))]
+    col_cty  <- nm[match("cnty_fips", tolower(nm))]
+    col_trct <- nm[match("tract_fips", tolower(nm))]
+    dat <- dplyr::mutate(dat, GEOID = paste0(.data[[col_st]], .data[[col_cty]], .data[[col_trct]]))
+  } else if (!("GEOID" %in% nm)) {
+    append_log("[ERROR] Could not find geoid / GEOID or component FIPS columns.")
+    validate(need(FALSE, "Missing GEOID columns in XLSX."))
+  }
+
+  map_name <- function(options) {
+    hit <- intersect(options, tolower(nm))
+    if (length(hit)) nm[match(hit[1], tolower(nm))] else NA_character_
+  }
+  col_unemp <- map_name(c("tract_asu_unemp","asu_unemp","unemp","tract_unemp"))
+  col_emp   <- map_name(c("tract_asu_emp","asu_emp","emp","tract_emp"))
+  col_pop   <- map_name(c("tract_pop_cur","tract_pop2024","pop","population"))
+  need_cols <- c(col_unemp, col_emp, col_pop)
+  if (any(is.na(need_cols))) {
+    append_log("[ERROR] Missing one of unemployment/employment/population columns.")
+    validate(need(FALSE, "Missing unemployment/employment/population columns."))
+  }
+
+  dat2 <- dat |>
+    dplyr::transmute(
+      GEOID = GEOID,
+      tract_ASU_unemp = as.integer(.data[[col_unemp]]),
+      tract_ASU_emp   = as.integer(.data[[col_emp]]),
+      tract_pop2024   = as.integer(.data[[col_pop]])
+    ) |>
+    dplyr::filter(!is.na(GEOID))
+
+  bls_df(dat2)
+  st <- substr(dat2$GEOID[1], 1, 2)
+  state_fips(st)
+
+  append_log(paste0("[UI] XLSX rows: ", nrow(dat2), " | detected state FIPS: ", st))
+  output$preview <- renderTable(head(dat2, 20))
+  output$state_info <- renderText(paste0("Detected state FIPS from GEOID: ", st))
+})
+
+# ---- Build neighbors (queen contiguity over TIGER) ----
+observeEvent(input$build_nb, {
+  req(bls_df(), state_fips(), input$year)
+
+  withProgress(message = "Building neighbors…", value = 0, {
+    incProgress(0.05, detail = "Reading inputs")
+    append_log("[NB] Starting neighbor build…")
+
+    # 1) Pull TIGER/Line tracts for the detected state/year
+    incProgress(0.20, detail = "Downloading TIGER tracts")
+    append_log(paste0("[NB] Downloading TIGER tracts for state FIPS ", state_fips(),
+                      " (year=", input$year, ")…"))
+    tt <- tigris::tracts(state = state_fips(), year = input$year, progress_bar = FALSE)
+
+    # 2) Keep only tracts that appear in the uploaded BLS table
+    incProgress(0.35, detail = "Filtering to uploaded GEOIDs")
+    keep <- tt |>
+      dplyr::filter(GEOID %in% bls_df()$GEOID) |>
+      dplyr::select(GEOID, geometry)
+
+    if (nrow(keep) == 0) {
+      append_log("[NB][ERROR] After filtering, no tracts remain. Check your GEOIDs/Year/State.")
+      validate(need(FALSE, "No tracts left after filtering to your GEOIDs."))
+    }
+    append_log(paste0("[NB] Tracts kept: ", nrow(keep)))
+
+    # 3) Compute queen contiguity
+    incProgress(0.60, detail = "Computing queen contiguity")
+    append_log("[NB] Computing queen contiguity (sfdep::st_contiguity)…")
+    keep <- keep |>
+      dplyr::mutate(continuous = sfdep::st_contiguity(geometry))
+
+    # 4) Convert to 0-based list-of-lists (what the Python solver expects)
+    nb_list <- lapply(keep$continuous, function(iv) {
+      if (length(iv) == 0) list() else as.list(as.integer(iv - 1L))
+    })
+    append_log("[NB] Built 0-based neighbor lists.")
+
+    # 5) Create a run directory under temp, to keep files together
+    run_dir <- file.path(tempdir(), paste0("cpsat_", format(Sys.time(), "%Y%m%d_%H%M%S")))
+    dir.create(run_dir, showWarnings = FALSE, recursive = TRUE)
+
+    # 6) Save neighbors JSON
+    nb_path <- file.path(run_dir, "nb.json")
+    jsonlite::write_json(nb_list, nb_path, auto_unbox = TRUE, pretty = FALSE)
+    nb_json_path(nb_path)
+    append_log(paste0("[NB] Wrote neighbors JSON → ", nb_path))
+
+    # 7) Align the BLS data to the SAME order as the geometry
+    incProgress(0.75, detail = "Aligning BLS data to geometry order")
+    df_ord <- keep |>
+      sf::st_drop_geometry() |>
+      dplyr::select(GEOID) |>
+      dplyr::left_join(bls_df(), by = "GEOID")
+
+    # Basic sanity checks on required columns
+    need_cols <- c("GEOID","tract_ASU_unemp","tract_ASU_emp","tract_pop2024")
+    missing <- setdiff(need_cols, names(df_ord))
+    if (length(missing)) {
+      append_log(paste0("[NB][ERROR] Missing columns in aligned data: ",
+                        paste(missing, collapse = ", ")))
+      validate(need(FALSE, paste0("Missing columns after join: ", paste(missing, collapse = ", "))))
+    }
+
+    # 8) Save aligned CSV
+    df_path <- file.path(run_dir, "df.csv")
+    write.csv(df_ord[, need_cols], df_path, row.names = FALSE)
+    df_csv_path(df_path)
+    append_log(paste0("[NB] Wrote aligned CSV → ", df_path))
+
+    # 9) Pre-set output json path for later
+    out_json_path(file.path(run_dir, "out.json"))
+
+    incProgress(0.95, detail = "Done")
+    append_log(paste0("[NB] DONE. Files in: ", run_dir))
+    output$state_info <- renderText(
+      paste0("Neighbors built for ", nrow(keep), " tracts. Files in: ", run_dir)
+    )
+  })
+})
+
+# ---- Run CP-SAT inline (reticulate) with visible logs ----
+observeEvent(input$run, {
+  append_log("[run] Button clicked.")
+
+  # Pre-check data
+  if (is.null(bls_df()) || nrow(bls_df()) == 0) {
+    append_log("[run][error] No BLS data loaded. Upload XLSX first.")
+    return(invisible(NULL))
+  }
+
+  # Ensure tracts & neighbors exist
+  if (is.null(tracts_sf())) {
+    append_log("[run] No tracts_sf; building from TIGER now…")
+    st <- substr(bls_df()$GEOID[1], 1, 2)
+    try({
+      tt <- tigris::tracts(state = st, year = input$year, progress_bar = FALSE)
+      keep <- tt |> dplyr::filter(GEOID %in% bls_df()$GEOID)
+      keep <- keep |> dplyr::mutate(continuous = sfdep::st_contiguity(geometry))
+      tracts_sf(keep)
+      append_log(paste0("[run] Built tracts_sf with ", nrow(keep), " tracts."))
+    }, silent = TRUE)
+    if (is.null(tracts_sf())) {
+      append_log("[run][error] Could not build tracts_sf; click ‘Build neighbors’ first.")
+      return(invisible(NULL))
+    }
+  }
+
+  nb_list_local <- lapply(tracts_sf()$continuous, function(iv) {
+    if (length(iv) == 0) list() else as.list(as.integer(iv - 1L))
+  })
+
+  # Temp run dir + files
+  run_dir <- file.path(tempdir(), paste0("cpsat_", format(Sys.time(), "%Y%m%d_%H%M%S")))
+  dir.create(run_dir, recursive = TRUE, showWarnings = FALSE)
+  append_log("[run] Run folder: ", run_dir)
+
+  nb_path <- file.path(run_dir, "nb.json")
+  try(jsonlite::write_json(nb_list_local, nb_path, auto_unbox = TRUE), silent = TRUE)
+  if (!file.exists(nb_path)) { append_log("[run][error] Failed writing nb.json"); return(invisible(NULL)) }
+  nb_json_path(nb_path); append_log("[run] Wrote neighbors: ", nb_path)
+
+  df_ord <- tracts_sf() |>
+    sf::st_drop_geometry() |>
+    dplyr::select(GEOID) |>
+    dplyr::left_join(bls_df(), by = "GEOID")
+
+  df_path <- file.path(run_dir, "df.csv")
+  try(write.csv(df_ord[, c("GEOID","tract_ASU_unemp","tract_ASU_emp","tract_pop2024")], df_path, row.names = FALSE), silent = TRUE)
+  if (!file.exists(df_path)) { append_log("[run][error] Failed writing df.csv"); return(invisible(NULL)) }
+  df_csv_path(df_path); append_log("[run] Wrote data: ", df_path)
+
+  if (!nzchar(input$py_path) || !dir.exists(input$py_path)) {
+    append_log("[run][error] Invalid ‘Folder containing asu_cpsat.py’: ", input$py_path)
+    return(invisible(NULL))
+  }
+  py_mod_path <- normalizePath(input$py_path, winslash = "/", mustWork = TRUE)
+  append_log("[run] Python module folder: ", py_mod_path)
+
+  # Build runner.py
+  rel <- trimws(input$relgap); rel_py <- if (nchar(rel) == 0) "None" else rel
+  out_json <- file.path(run_dir, "out.json")
+  out_json_path(out_json)
+
+  runner <- file.path(run_dir, "runner.py")
+  runner_code <- sprintf("
+import sys, os, json, time, math
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except Exception:
+    pass
+os.environ['PYTHONUNBUFFERED'] = '1'
+
+print('[runner] starting…', flush=True)
+print('Python: ' + sys.version.replace('\\n',' '), flush=True)
+
+sys.path.insert(0, r'%s')
+print('[runner] module path added', flush=True)
+
+from asu_cpsat import build_many_asus_cpsat
+print('[runner] asu_cpsat imported OK', flush=True)
+
+import pandas as pd
+print('[runner] loading inputs…', flush=True)
+df = pd.read_csv(r'%s')
+with open(r'%s','r') as f:
+    nb = json.load(f)
+print(f'[runner] inputs: rows={len(df)} nb_lists={len(nb)}', flush=True)
+
+tau        = %s
+pop_thresh = %d
+max_asus   = %d
+time_limit = %d
+workers    = %d
+REL        = %s
+
+kwargs = dict(
+    df=df, nb=nb,
+    tau=tau, pop_thresh=pop_thresh,
+    max_asus=max_asus, time_limit=time_limit,
+    workers=workers, verbose=True
+)
+if REL is not None and not (isinstance(REL, float) and math.isnan(REL)):
+    kwargs['rel_gap'] = REL
+
+print(f'[runner] kwargs: tau={tau}, pop={pop_thresh}, max={max_asus}, tlimit={time_limit}, workers={workers}' + (' +rel_gap' if 'rel_gap' in kwargs else ''), flush=True)
+
+print('[runner] launching CP-SAT…', flush=True)
+res = build_many_asus_cpsat(**kwargs)
+print('[runner] solver finished. Writing JSON…', flush=True)
+with open(r'%s','w') as g:
+    json.dump(res, g)
+print('[runner] OK. Exiting.', flush=True)
+",
+    py_mod_path,
+    df_csv_path(),
+    nb_json_path(),
+    format(input$tau, scientific = FALSE),
+    as.integer(input$pop),
+    as.integer(input$max_asu),
+    as.integer(input$tlimit),
+    as.integer(input$workers),
+    rel_py,
+    out_json
+  )
+  writeLines(runner_code, runner)
+  append_log("[run] Wrote runner.py: ", runner)
+
+  # Launch Python
+  pybin <- tryCatch(reticulate::py_config()$python, error = function(e) "")
+  if (!nzchar(pybin)) { append_log("[run][error] No Python bound via reticulate."); return(invisible(NULL)) }
+  append_log("[run] Using Python: ", pybin)
+
+  px <- tryCatch({
+    processx::process$new(
+      command = pybin,
+      args    = c(runner),
+      stdout  = "|",
+      stderr  = "|",
+      windows_hide_window = TRUE,
+      env     = c(PYTHONUNBUFFERED = "1")
+    )
+  }, error = function(e) {
+    append_log("[run][error] Failed to start Python: ", conditionMessage(e))
+    NULL
+  })
+  if (is.null(px)) return(invisible(NULL))
+
+  solver_proc(px)
+  append_log("[run] Python started (pid=", px$get_pid(), "). Streaming…")
+
+  # Keep only one observer alive
+  old <- solver_obs()
+  if (!is.null(old)) try(old$destroy(), silent = TRUE)
+
+  tmr <- shiny::reactiveTimer(300)
+  ob <- shiny::observe({
+    tmr()
+    proc <- solver_proc()
+    if (is.null(proc)) return()
+
+    out <- try(proc$read_output_lines(), silent = TRUE)
+    err <- try(proc$read_error_lines(),  silent = TRUE)
+    if (!inherits(out, "try-error") && length(out)) append_log(paste(out, collapse = "\n"))
+    if (!inherits(err, "try-error") && length(err)) append_log(paste(err, collapse = "\n"))
+
+    if (!proc$is_alive()) {
+      out_all <- try(proc$read_all_output_lines(), silent = TRUE)
+      err_all <- try(proc$read_all_error_lines(),  silent = TRUE)
+      if (!inherits(out_all, "try-error") && length(out_all)) append_log(paste(out_all, collapse = "\n"))
+      if (!inherits(err_all, "try-error") && length(err_all)) append_log(paste(err_all, collapse = "\n"))
+
+      status <- proc$get_exit_status()
+      append_log("[run] Process exit status: ", status)
+      ob$destroy()
+
+      if (identical(status, 0L) && file.exists(out_json_path())) {
+        res <- jsonlite::fromJSON(out_json_path())
+        if (!is.null(res$asu_id)) {
+          df <- read.csv(df_path, stringsAsFactors = FALSE)
+          df$asunum <- ifelse(res$asu_id < 0, 0L, as.integer(res$asu_id))
+          sum_tbl <- df |>
+            dplyr::filter(asunum > 0) |>
+            dplyr::group_by(asunum) |>
+            dplyr::summarise(
+              Tracts              = dplyr::n(),
+              Population          = sum(tract_pop2024,   na.rm = TRUE),
+              `Labor Force`       = sum(tract_ASU_emp,   na.rm = TRUE) + sum(tract_ASU_unemp, na.rm = TRUE),
+              Unemployment        = sum(tract_ASU_unemp, na.rm = TRUE),
+              `Unemployment Rate` = round(Unemployment/`Labor Force`*100, 5),
+              .groups = "drop"
+            )
+          output$asu_tbl <- renderTable(sum_tbl, digits = 3)
+          append_log("[run] Solver finished OK. ASUs built: ", dplyr::n_distinct(sum_tbl$asunum))
+        } else {
+          append_log("[run][warn] Output JSON missing 'asu_id'.")
+        }
+      } else {
+        append_log("[run][error] Solver failed or no output JSON.")
+      }
+    }
+  })
+  solver_obs(ob)
+})
+
+
+
+
+```

@@ -9,6 +9,35 @@ editor_options:
   markdown: 
     wrap: 72
 ---
+```{r python_preamble, include=FALSE}
+library(reticulate)
+library(processx)
+
+# Always define this first so options() won't error
+python_ready <- FALSE
+
+venv_path <- file.path(rappdirs::user_data_dir("ASUbuildR"), "asu-cpsat-venv")
+
+# Try to activate the venv and check for OR-Tools, but never abort knitting
+try({
+  if (dir.exists(venv_path)) {
+    # Don't force activation during knit; just try it
+    reticulate::use_virtualenv(venv_path, required = FALSE)
+
+    if (reticulate::py_module_available("ortools")) {
+      python_ready <- TRUE
+      message("[env] Python environment ready")
+    } else {
+      message("[env] Virtualenv found, but 'ortools' is missing")
+    }
+  } else {
+    message("[env] Python environment not set up; run ASUbuildR::setup_asu_python()")
+  }
+}, silent = TRUE)
+
+# Store the flag for later chunks
+options(asu_python_ready = python_ready)
+```
 
 ```{r setup, include=FALSE}
 # Figure out full paths to src/ C++ files, going up two levels
@@ -48,9 +77,29 @@ if (is_dev_mode) {
 
   source(file.path(r_dir, "run_tract_hunter.R"))
   source(file.path(r_dir, "run_asu_original.r"))
+  source(file.path(r_dir,"setup_asu_python.R"))
 } else {
   message("→ Installed package mode: functions should already be available")
 }
+
+`%||%` <- function(a, b) if (!is.null(a) && length(a)) a else b
+
+
+# ── Use virtual environment & import Python module ───────────────────
+
+
+# Use the virtual environment we set up in the preamble
+venv_path <- file.path(rappdirs::user_data_dir("ASUbuildR"), "asu-cpsat-venv")
+reticulate::use_virtualenv(venv_path, required = TRUE)
+py_config()  # should now show the venv python
+
+# Import your solver module from the package's inst/python
+asu_py <- import_from_path(
+  module  = "asu_cpsat",
+  path    = normalizePath("../../inst/python", winslash = "/", mustWork = FALSE),
+  convert = TRUE
+)
+stopifnot(py_has_attr(asu_py, "build_many_asus_cpsat"))
 
 
 ## ---- tigris cache ----------------------------------------------------
@@ -93,17 +142,45 @@ selected_tracts <- shiny::reactiveVal(NULL)
 edit_table <- shiny::reactiveVal(NULL)
 edit_summary <- shiny::reactiveVal(NULL)
 current_selection <- shiny::reactiveVal(NULL)
-
 # New England Optional year selection logic
 output$is_new_england <- shiny::reactive({
-  if (is.null(state())) return(FALSE)
-  
+  if (is.null(state())) {
+    return(FALSE)
+  }
+
   # New England state FIPS codes
-  new_england_fips <- c("09", "23", "25", "33", "44", "50")  # CT, ME, MA, NH, RI, VT
-  
+  new_england_fips <- c("09", "23", "25", "33", "44", "50") # CT, ME, MA, NH, RI, VT
+
   state() %in% new_england_fips
 })
 
+# ---- CP-SAT logging + paths ----
+cpsat_log_buf    <- shiny::reactiveVal("")
+cpsat_solver_proc<- shiny::reactiveVal(NULL)
+cpsat_run_dir    <- shiny::reactiveVal(NULL)
+cpsat_df_csv     <- shiny::reactiveVal(NULL)
+cpsat_nb_json    <- shiny::reactiveVal(NULL)
+cpsat_out_json   <- shiny::reactiveVal(NULL)
+cpsat_log_file   <- shiny::reactiveVal(NULL)
+cpsat_running <- shiny::reactiveVal(FALSE)
+
+append_cpsat_log <- function(...) {
+  line <- paste0(format(Sys.time(), "%H:%M:%S "), paste0(..., collapse = ""))
+  old  <- cpsat_log_buf()
+  new  <- if (nzchar(old)) paste(old, line, sep = "\n") else line
+  if (nchar(new) > 12000) new <- substr(new, nchar(new) - 11999, nchar(new))
+  cpsat_log_buf(new)
+  output$cpsat_log_tail <- shiny::renderText(new)
+}
+
+# keep log output live even if hidden
+output$cpsat_log_tail <- shiny::renderText("")
+output$show_cpsat_log_flag <- shiny::renderText({
+  if (isTRUE(cpsat_running())) "true" else "false"
+})
+shiny::outputOptions(output, "show_cpsat_log_flag", suspendWhenHidden = FALSE)
+
+# ---- New England year override logic ---------------------------------
 # Make it available to the UI
 shiny::outputOptions(output, "is_new_england", suspendWhenHidden = FALSE)
 
@@ -265,10 +342,13 @@ shiny::radioButtons(
   inputId = "asu_algo",
   label   = "Choose algorithm",
   choices = c(
-    "Tract Hunter"  = "mine",
-    "Simple Snake"  = "orig"),
+    "Tract Hunter"      = "mine",
+    "Simple Snake"      = "orig",
+    "CP-SAT (OR-Tools)" = "cpsat"
+  ),
   inline  = TRUE
 )
+
 
 # -----------------------------------------------------------------------
 # main "Run" button (always visible)
@@ -295,12 +375,87 @@ shiny::conditionalPanel(
   )
 )
 
+# Conditional panel for CP-SAT algorithm options
+shiny::conditionalPanel(
+  condition = "input.asu_algo === 'cpsat'",
+  shiny::tagList(
+    shiny::hr(style = "margin: 0.8rem 0;"),
+    shiny::numericInput("cpsat_tau",       "UR threshold (τ)",          value = 0.0645, min = 0, max = 1, step = 0.0001),
+    shiny::numericInput("cpsat_pop",       "Population threshold",      value = 10000,  min = 0, step = 100),
+    shiny::numericInput("cpsat_max",       "Max ASUs",                  value = 30,     min = 1, step = 1),
+    shiny::numericInput("cpsat_timelimit", "Time limit (sec) per window", value = 1200, min = 1, step = 10),
+    shiny::numericInput("cpsat_workers",   "Parallel workers",          value = max(1, parallel::detectCores()-5), min = 1, step = 1),
+    shiny::numericInput("cpsat_relgap",    "Relative gap (optional)",   value = NA,     min = 0, step = 0.0001)
+  )
+)
+
+
 
 # ---- dynamic algorithm description -----------------------------------
 output$algo_blurb <- shiny::renderUI({
+  choice <- input$asu_algo %||% "orig"
 
-  if (is.null(input$asu_algo) || input$asu_algo == "orig") {
-    ## ───────── ORIGINAL METHOD ─────────
+  if (identical(choice, "cpsat")) {
+    ## ───────── CP-SAT (OR-Tools) METHOD ─────────
+    shiny::HTML(
+      "<p><strong>CP-SAT (OR-Tools) workflow</strong></p>
+       <p>
+         This option builds ASUs by solving a mixed-integer model over tract
+         adjacency. The app will:
+       </p>
+       <ul>
+         <li>Download Census tract shapes for the selected year and build
+             neighbour lists (contiguity).</li>
+         <li>Merge the BLS upload you provided (population, labor force,
+             employment, unemployment, rate).</li>
+         <li>Run the CP-SAT solver with your parameters:
+             <code>UR threshold (τ)</code>, <code>Population threshold</code>,
+             <code>Max ASUs</code>, <code>Time limit</code>, optional
+             <code>Relative gap</code>, and <code>Parallel workers</code>.</li>
+       </ul>
+       <p>
+         While solving, a live <em>CP-SAT log</em> panel appears (top-right)
+         showing progress. When the solver finishes, the map and summary table
+         update automatically; tracts with <code>asunum = 0</code> are not in
+         any ASU.
+       </p>
+       <p>
+         <strong>Requirements:</strong> a working Python environment with
+         OR-Tools. If it isn't available, you'll see a notice and can use
+         Tract Hunter or Simple Snake instead. For New England states, you may
+         need to switch the tract year to 2021 using the option shown above.
+       </p>
+       <p>
+         Click <em>Load tracts &amp; initialise</em> to start. You can refine
+         results on the <em>Modify ASU Selections</em> tab once the map renders.
+       </p>"
+    )
+
+  } else if (identical(choice, "mine")) {
+    ## ───────── TRACT-HUNTER METHOD ─────────
+    shiny::HTML(
+      "<p><strong>Tract Hunter workflow</strong></p>
+       <p>Because Tract Hunter works in stages, the interface exposes those
+          stages as separate buttons:</p>
+       <ul>
+         <li><em>Load tracts &amp; initialise</em><br>
+             ▸ downloads shapefiles, merges the BLS file, then runs the
+             <strong>Seed + Expand</strong> step automatically. This should only be run once.</li>
+         <li><em>Run Hunter</em><br>
+             ▸ performs the optimisation/trade pass that adds
+             high-unemployment neighbours and drops low-unemployment ones until
+             every ASU is as close as possible to the
+             <code>6.45%</code> threshold.</li>
+         <li><em>Combine Groups</em><br>
+             ▸ merges adjacent ASUs that share a boundary. Connected ASUs allow for more tracts to be added, so whenever ASUs are merged it is advisable to run another pass with the Tract Hunter.</li>
+       </ul>
+       <p>You can stop after any step to inspect the map, or run the buttons
+          in sequence for the full, automatic workflow. We suggest iteratively running the Run Hunter and Combine Groups steps until Total Unemployment in ASUs no longer increases. Each step updates the
+          colour map and the unemployment totals shown on the right.</p>"
+    )
+
+  } else {
+    ## ───────── SIMPLE SNAKE (ORIGINAL) METHOD ─────────
     shiny::HTML(
       "<p>
         This button will launch two processes, which will take up to 5&nbsp;minutes
@@ -311,7 +466,7 @@ output$algo_blurb <- shiny::renderUI({
         appropriate state and year. Next, after combining the BLS file with these
         shapefiles, it will iteratively search for contiguous geographic regions
         until the combined unemployment rate in each region is as close to
-        6.45 % as possible.
+        6.45% as possible.
       </p>
       <p>
         When this process is complete, a map will appear to the right, and a
@@ -324,199 +479,400 @@ output$algo_blurb <- shiny::renderUI({
         Once this step is done, you may proceed to the next step.
       </p>"
     )
-
-  } else {
-    ## ───────── TRACT-HUNTER METHOD ─────────
-    shiny::HTML(
-      "<p><strong>Tract Hunter workflow</strong></p>
-       <p>Because Tract Hunter works in stages, the interface exposes those
-          stages as separate buttons:</p>
-       <ul>
-         <li><em>Load tracts & initialise</em><br>
-             ▸ downloads shapefiles, merges the BLS file, then runs the
-             <strong>Seed + Expand</strong> step automatically. This should only be run once.</li>
-         <li><em>Run Hunter</em><br>
-             ▸ performs the optimisation/trade pass that adds
-             high-unemployment neighbours and drops low-unemployment ones until
-             every ASU is as close as possible to the
-             <code>6.45%</code> threshold.</li>
-         <li><em>Combine Groups</em><br>
-             ▸ merges adjacent ASUs that share a boundary. Connected ASUs allow for more tracts to be added, so whenever ASUs are merged it is advisable to run another pass with the Tract Hunter.</li>
-       </ul>
-       <p>You can stop after any step to inspect the map, or run the buttons
-          in sequence for the full, automatic workflow. We suggest iteratively running the Run Hunter and Combine Groups steps until Total Unemployment in ASUs no longer increases.  Each step updates the
-          colour map and the unemployment totals shown on the right.</p>"
-    )
   }
 })
+
 
 shiny::uiOutput("algo_blurb")
 
 shiny::htmlOutput("total_unemp")
 
 shiny::tableOutput("asu")
+#shiny::verbatimTextOutput("cpsat_log_tail")
 
 palette_logic <- function(n_asu) {
-        if (n_asu == 0) {
-          list(
-            fill = "#808080",
-            legend_vals = "(none)",
-            legend_cols = "#808080"
-          )
-        } else if (n_asu == 1) {
-          list(
-            fill = mapgl::step_expr(
-              column = "asunum",
-              base = "#808080",
-              stops = "#7FC97F",
-              values = 1,
-              na_color = "#444444"
-            ),
-            legend_vals = 1,
-            legend_cols = "#7FC97F"
-          )
-        } else {
-          pal <- RColorBrewer::brewer.pal(min(max(n_asu, 3L), 8L), "Accent")
-          legend_vals <- seq_len(n_asu)
-          legend_cols <- rep_len(pal, n_asu)
+  if (n_asu == 0) {
+    list(
+      fill = "#808080",
+      legend_vals = "(none)",
+      legend_cols = "#808080"
+    )
+  } else if (n_asu == 1) {
+    list(
+      fill = mapgl::step_expr(
+        column = "asunum",
+        base = "#808080",
+        stops = "#7FC97F",
+        values = 1,
+        na_color = "#444444"
+      ),
+      legend_vals = 1,
+      legend_cols = "#7FC97F"
+    )
+  } else {
+    pal <- RColorBrewer::brewer.pal(min(max(n_asu, 3L), 8L), "Accent")
+    legend_vals <- seq_len(n_asu)
+    legend_cols <- rep_len(pal, n_asu)
 
-          list(
-            fill = mapgl::match_expr(
-              column = "asunum",
-              values = legend_vals,
-              stops = legend_cols
-            ),
-            legend_vals = legend_vals,
-            legend_cols = legend_cols
-          )
-        }
+    list(
+      fill = mapgl::match_expr(
+        column = "asunum",
+        values = legend_vals,
+        stops = legend_cols
+      ),
+      legend_vals = legend_vals,
+      legend_cols = legend_cols
+    )
   }
+}
+
+
 
 shiny::observeEvent(input$process, {
-  ## 0 · Basic checks ----------------------------------------------------
+  ## 0) Basic checks ------------------------------------------------------
   shiny::req(uploaded_data(), state(), tract_year())
 
-  # Determine which year to use
-  selected_year <- tract_year()  # default to detected year
-  
-  # Check if this is New England and user selected 2021
+  # Determine year (NE override)
+  selected_year <- tract_year()
   state_val <- state()
   if (!is.null(state_val) && length(state_val) > 0) {
-    new_england_fips <- c("09", "23", "25", "33", "44", "50")
-    if (state_val %in% new_england_fips && 
-        !is.null(input$ne_year_choice) && 
+    new_england_fips <- c("09","23","25","33","44","50")
+    if (state_val %in% new_england_fips &&
+        !is.null(input$ne_year_choice) &&
         input$ne_year_choice == "2021") {
       selected_year <- "2021"
     }
   }
 
+  # ensure 'res' exists even if something returns early
+  res <- NULL
+
   ## 1 · Wrap the whole long job in withProgress -------------------------
   shiny::withProgress(message = "Running ASU initialisation…", value = 0, {
     ## 1a · Build tracts + neighbours (can take ~10–60 s the first time)
     shiny::incProgress(0.10, detail = "Downloading Census shapefiles…")
-    
-    # CHANGE THIS LINE FROM:
-    # tract_list <- tigris::tracts(state = state(), year = tract_year()) |>
-    # TO:
+
+    # use selected_year (handles New England override)
     tract_list <- tigris::tracts(state = state(), year = selected_year) |>
       dplyr::mutate(
         row_num    = dplyr::row_number(),
         continuous = sfdep::st_contiguity(geometry)
       )
 
-    ## 1b · Merge the BLS data
+    ## 1b · Merge the BLS data (kept for potential checks/debug)
     shiny::incProgress(0.05, detail = "Merging BLS unemployment data…")
     data_merge <- tract_list |>
       dplyr::left_join(uploaded_data(), by = "GEOID")
 
-    # 2 · Run the chosen ASU algorithm ---------------------------------
+    ## 2 · Run the chosen ASU algorithm ---------------------------------
     algo_choice <- shiny::isolate(input$asu_algo)
     if (is.null(algo_choice) || identical(algo_choice, "")) algo_choice <- "orig"
 
+    # --- CP-SAT branch (drop-in replacement) -------------------------------
+if (identical(algo_choice, "cpsat")) {
+  session <- shiny::getDefaultReactiveDomain()
 
-    join_flag <- isTRUE(input$join_touching) # ← keep the flag you already built
+  shiny::withProgress(message = "Running OR-Tools CP-SAT…", value = 0, {
+    cpsat_running(TRUE)
+    append_cpsat_log("[run] Button clicked (CP-SAT).")
+
+    # ---- 1) Preconditions & parameters --------------------------------
+    shiny::req(uploaded_data(), state(), tract_year())
+    sel_year <- selected_year              # from your earlier NE override logic
+    st_fips  <- state()
+
+    tau      <- if (is.null(input$cpsat_tau))       0.0645 else as.numeric(input$cpsat_tau)
+    pop_thr  <- if (is.null(input$cpsat_pop))       10000  else as.integer(input$cpsat_pop)
+    max_asus <- if (is.null(input$cpsat_max))       30     else as.integer(input$cpsat_max)
+    tlimit   <- if (is.null(input$cpsat_timelimit)) 1200   else as.integer(input$cpsat_timelimit)
+    workers  <- if (is.null(input$cpsat_workers))   max(1L, parallel::detectCores()-5L) else as.integer(input$cpsat_workers)
+    rel_gap  <- if (!is.null(input$cpsat_relgap) && !is.na(input$cpsat_relgap)) as.numeric(input$cpsat_relgap) else NA_real_
+
+    append_cpsat_log(sprintf("[run] params: tau=%.6f pop=%d max=%d limit=%ds workers=%d rel_gap=%s",
+                             tau, pop_thr, max_asus, tlimit, workers,
+                             if (is.na(rel_gap)) "None" else as.character(rel_gap)))
+
+    # ---- 2) Build tracts + neighbors ----------------------------------
+    shiny::incProgress(0.15, detail = "Downloading tracts & building neighbors")
+    append_cpsat_log(sprintf("[NB] Downloading TIGER tracts for state %s (year=%s)…", st_fips, sel_year))
+
+    tr_sf <- tigris::tracts(state = st_fips, year = sel_year, progress_bar = FALSE) |>
+      dplyr::mutate(continuous = sfdep::st_contiguity(geometry))
+
+    # Join with uploaded BLS
+    cols_needed <- c("GEOID","tract_ASU_unemp","tract_ASU_emp","tract_pop_cur","tract_ASU_clf","tract_ASU_urate")
+    miss <- setdiff(cols_needed, names(uploaded_data()))
+    if (length(miss)) {
+      shiny::showModal(shiny::modalDialog(
+        title="Input problem", paste("Uploaded data missing:", paste(miss, collapse=", ")), easyClose=TRUE
+      ))
+      cpsat_running(FALSE)
+      return(invisible(NULL))
+    }
+
+    merged_sf <- tr_sf |>
+      dplyr::left_join(uploaded_data(), by="GEOID")
+
+    merged_df <- merged_sf |> sf::st_drop_geometry()
+    append_cpsat_log(sprintf("[NB] Tracts kept: %d (after join)", nrow(merged_df)))
+
+    # Dataframe for Python
+    df_py <- merged_df |>
+      dplyr::transmute(
+        geoid           = GEOID,
+        tract_ASU_unemp = as.integer(tract_ASU_unemp),
+        tract_ASU_emp   = as.integer(tract_ASU_emp),
+        tract_pop2024   = as.integer(tract_pop_cur)
+      )
+
+    if (anyNA(df_py$tract_ASU_unemp) || anyNA(df_py$tract_ASU_emp) || anyNA(df_py$tract_pop2024)) {
+      shiny::showModal(shiny::modalDialog(
+        title="Input problem",
+        "NA found after integer coercion (unemp/emp/pop). Fix the input file.",
+        easyClose=TRUE
+      ))
+      cpsat_running(FALSE)
+      return(invisible(NULL))
+    }
+
+    # 0-based neighbor lists
+    nb_lists <- lapply(merged_sf$continuous, function(iv) {
+      if (length(iv) == 0) list() else as.list(as.integer(iv) - 1L)
+    })
+
+    # ---- 3) Temp run folder + files ------------------------------------
+    shiny::incProgress(0.10, detail = "Writing inputs")
+    run_dir <- file.path(tempdir(), paste0("cpsat_", format(Sys.time(), "%Y%m%d_%H%M%S")))
+    dir.create(run_dir, recursive = TRUE, showWarnings = FALSE)
+
+    df_csv   <- file.path(run_dir, "df.csv")
+    nb_json  <- file.path(run_dir, "nb.json")
+    out_json <- file.path(run_dir, "out.json")
+    runner   <- file.path(run_dir, "runner.py")
+
+    utils::write.csv(df_py, df_csv, row.names = FALSE)
+    jsonlite::write_json(nb_lists, nb_json, auto_unbox = TRUE)
+
+    cpsat_run_dir(run_dir)
+    cpsat_df_csv(df_csv)
+    cpsat_nb_json(nb_json)
+    cpsat_out_json(out_json)
+    cpsat_log_file(NULL)   # streaming logs; no file needed
+
+    append_cpsat_log(paste0("[run] Folder: ", run_dir))
+    append_cpsat_log(paste0("[run] df.csv: ", df_csv))
+    append_cpsat_log(paste0("[run] nb.json: ", nb_json))
+
+    # ---- 4) Write runner.py -------------------------------------------
+    shiny::incProgress(0.05, detail = "Preparing Python runner")
+    py_mod_path <- normalizePath(file.path("..","..","inst","python"), winslash="/", mustWork = TRUE)
+    runner_code <- sprintf("
+import sys, os, json, math
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except Exception:
+    pass
+os.environ.setdefault('PYTHONUNBUFFERED','1')
+os.environ.setdefault('OMP_NUM_THREADS','1')
+os.environ.setdefault('MKL_NUM_THREADS','1')
+os.environ.setdefault('OPENBLAS_NUM_THREADS','1')
+print('[runner] starting'); print('Python:', sys.version.replace('\\n',' '))
+
+sys.path.insert(0, r'%s')
+print('[runner] module path added')
+
+from asu_cpsat import build_many_asus_cpsat
+import pandas as pd
+
+df = pd.read_csv(r'%s')
+with open(r'%s','r') as f:
+    nb = json.load(f)
+print(f'[runner] inputs: rows={{len(df)}} nb_lists={{len(nb)}}')
+
+kwargs = dict(
+    df=df, nb=nb,
+    tau=%s, pop_thresh=%d, max_asus=%d,
+    time_limit=%d, workers=%d, verbose=True
+)
+REL = %s
+if REL is not None and not (isinstance(REL, float) and math.isnan(REL)):
+    kwargs['rel_gap'] = REL
+print('[runner] launching CP-SAT…', flush=True)
+res = build_many_asus_cpsat(**kwargs)
+print('[runner] solver finished; writing json', flush=True)
+
+asu_id = res['asu_id'] if isinstance(res, dict) else getattr(res,'asu_id')
+asu_id = [int(x) for x in asu_id]
+with open(r'%s','w') as g:
+    json.dump({'asu_id': asu_id}, g)
+print('[runner] OK', flush=True)
+",
+      py_mod_path, df_csv, nb_json,
+      format(tau, scientific = FALSE), pop_thr, max_asus, tlimit, workers,
+      if (is.na(rel_gap)) "None" else as.character(rel_gap),
+      out_json
+    )
+    writeLines(runner_code, runner)
+    append_cpsat_log(paste0("[run] runner.py: ", runner))
+
+    # ---- 5) Locate Python in the venv ---------------------------------
+    shiny::incProgress(0.05, detail = "Locating Python")
+    venv_path <- file.path(rappdirs::user_data_dir("ASUbuildR"), "asu-cpsat-venv")
+    if (.Platform$OS.type == "windows") {
+      pybin <- file.path(venv_path, "Scripts", "python.exe")
+    } else {
+      pybin <- file.path(venv_path, "bin", "python")
+    }
+    if (!file.exists(pybin)) {
+      pybin <- Sys.which("python")
+      if (pybin == "") pybin <- Sys.which("python3")
+    }
+    if (!nzchar(pybin) || !file.exists(pybin)) {
+      shiny::showModal(shiny::modalDialog(
+        title="Python not found",
+        "Could not find the virtual environment or python executable.",
+        easyClose=TRUE
+      ))
+      cpsat_running(FALSE)
+      return(invisible(NULL))
+    }
+    append_cpsat_log(paste0("[run] Using Python: ", pybin))
+
+    # ---- 6) Launch and STREAM output ----------------------------------
+    shiny::incProgress(0.35, detail = "Solving (streaming logs)…")
+    env_map <- c(
+      PYTHONUNBUFFERED = "1",
+      OMP_NUM_THREADS  = "1",
+      MKL_NUM_THREADS  = "1",
+      OPENBLAS_NUM_THREADS = "1"
+    )
+    px <- processx::process$new(
+      command = pybin,
+      args    = c(runner),
+      stdout  = "|",
+      stderr  = "|",
+      windows_hide_window = TRUE,
+      env     = env_map
+    )
+    cpsat_solver_proc(px)
+    append_cpsat_log(sprintf("[run] Python started (pid=%s). Streaming…", px$get_pid()))
+
+    # stream logs and finalize when done
+    if (!is.null(session$userData$cpsatObs)) {
+      try(session$userData$cpsatObs$destroy(), silent = TRUE)
+    }
+    tmr <- shiny::reactiveTimer(300)
+    session$userData$cpsatObs <- shiny::observe({
+      tmr()
+      px <- cpsat_solver_proc()
+      shiny::req(!is.null(px))
+
+      out <- try(px$read_output_lines(), silent = TRUE)
+      err <- try(px$read_error_lines(),  silent = TRUE)
+      if (!inherits(out,"try-error") && length(out)) append_cpsat_log(paste(out, collapse="\n"))
+      if (!inherits(err,"try-error") && length(err)) append_cpsat_log(paste(err, collapse="\n"))
+
+      if (!px$is_alive()) {
+        # drain remaining
+        out_all <- try(px$read_all_output_lines(), silent = TRUE)
+        err_all <- try(px$read_all_error_lines(),  silent = TRUE)
+        if (!inherits(out_all,"try-error") && length(out_all)) append_cpsat_log(paste(out_all, collapse="\n"))
+        if (!inherits(err_all,"try-error") && length(err_all)) append_cpsat_log(paste(err_all, collapse="\n"))
+
+        status <- px$get_exit_status()
+        append_cpsat_log(paste0("[run] Exit status: ", status))
+        session$userData$cpsatObs$destroy()
+
+        # ---- 7) Load results -> update map/reactives -------------------
+        clean_sf_columns <- function(x) {
+          g <- sf::st_geometry(x)
+          df <- x |>
+            sf::st_drop_geometry() |>
+            dplyr::select(where(~ !is.list(.)))
+          sf::st_as_sf(df, geometry = g, crs = sf::st_crs(x))
+        }
+
+        if (identical(status, 0L) && file.exists(cpsat_out_json())) {
+          resj <- jsonlite::fromJSON(cpsat_out_json())
+          if (!is.null(resj$asu_id) && length(resj$asu_id) == nrow(merged_df)) {
+            asu_id <- as.integer(resj$asu_id)
+
+            final_sf <- merged_sf |>
+              dplyr::mutate(asunum = ifelse(asu_id < 0L, 0L, as.integer(asu_id))) |>
+              dplyr::select(-dplyr::any_of("continuous")) |>
+              clean_sf_columns()
+
+            # update reactives used by the rest of the app
+            full_data(final_sf)
+            full_data_reset(final_sf)
+            asu_summary(
+              final_sf |>
+                sf::st_drop_geometry() |>
+                dplyr::filter(asunum > 0) |>
+                dplyr::group_by(asunum) |>
+                dplyr::summarise(
+                  Tracts              = dplyr::n(),
+                  Population          = sum(tract_pop_cur,   na.rm = TRUE),
+                  `Labor Force`       = sum(tract_ASU_clf,   na.rm = TRUE),
+                  Unemployment        = sum(tract_ASU_unemp, na.rm = TRUE),
+                  `Unemployment Rate` = round(Unemployment/`Labor Force`*100, 5),
+                  .groups = "drop"
+                )
+            )
+            output$asu <- shiny::renderTable(asu_summary(), digits = 3)
+            append_cpsat_log("[run] Solver finished OK; map/table updated.")
+          } else {
+            append_cpsat_log("[run][warn] Output JSON invalid or length mismatch.")
+          }
+        } else {
+          append_cpsat_log("[run][error] Solver failed or out.json missing.")
+        }
+
+        cpsat_running(FALSE)
+      }
+    })
+  })
+
+  # stop the parent observer here so non-CP-SAT code below doesn’t run
+  return(invisible(NULL))
+}
+# --- end CP-SAT branch --------------------------------------------------
+
+
+    # (kept for backward-compat, even if not used directly)
+    join_flag <- isTRUE(input$join_touching)
 
     shiny::incProgress(0.05, detail = "Finding initial ASU seeds…")
-    if (algo_choice == "orig") {
+    if (identical(algo_choice, "orig")) {
       res <- run_asu_original(tract_list, uploaded_data())
     } else {
       shiny::withProgress(message = "Seeding & expanding…", value = 0, {
         th_tract_list(tract_list)
         th_bls_df(uploaded_data())
         st <- tract_hunter_seed(th_tract_list(), th_bls_df(), verbose = TRUE)
+        th_state(st)
       })
-      th_state(st)
-      res <- tract_hunter_finalize(st)
+      res <- tract_hunter_finalize(th_state())
     }
 
     ## 3 · Finish the bar
     shiny::incProgress(1, detail = "Finishing up…")
   }) # ---- withProgress ends here  -------------------------------------
 
-  ## 4 · Store results & draw map  --------------------------------------
+  ## 4 · Store results & update UI ---------------------------------------
   if (!is.null(res)) {
+    # These slots are expected from run_asu_original()/tract_hunter_finalize()
     full_data(res$full_data)
     full_data_reset(res$full_data_reset)
     asu_data(res$asu_data)
     asu_tracts(res$asu_tracts)
     asu_summary(res$asu_summary)
 
-    output$asu <- shiny::renderTable(asu_summary(), digits = 3)}
-
-    ### a. (Re‑)draw the first map ----------------------------------
-  output$initial_map <- mapgl::renderMaplibre({
-   shiny::req(map_geom())
-   map_data <- map_geom()
-
-   if (nrow(map_data) == 0) {
-     return(
-       mapgl::maplibre(style = mapgl::carto_style("positron")) |>
-         mapgl::add_control("No valid polygon geometry to display.", "top-left")
-     )
-   }
-
-   # Treat asunum==0 as NA for coloring, compute palette once
-   map_data <- map_data |>
-     dplyr::mutate(asunum = dplyr::na_if(asunum, 0L))
-
-   n_asu <- max(map_data$asunum, na.rm = TRUE)
-   n_asu <- ifelse(is.finite(n_asu), n_asu, 0L)
-   pal <- palette_logic(n_asu)
-
-   ## Create the map with the computed palette------------------------
-   mapgl::maplibre(style = mapgl::carto_style("positron")) |>
-     mapgl::fit_bounds(map_data, animate = FALSE) |>
-     mapgl::add_fill_layer(
-       id = "basemap",
-       source = map_data,
-       fill_color = pal$fill,
-       fill_opacity = 0.5,
-       fill_outline_color = "black",
-       tooltip = mapgl::concat(
-         "<strong>ASU Number: </strong>", mapgl::get_column("asunum"), "<br>",
-         "<strong>Tract GEOID: </strong>", mapgl::get_column("GEOID"), "<br>",
-         "<strong>UR: </strong>",
-         mapgl::number_format(mapgl::get_column("tract_ASU_urate"),
-           style = "decimal", maximum_fraction_digits = 2
-         ),
-         "%<br>",
-         "<strong>Unemp: </strong>",
-         mapgl::number_format(mapgl::get_column("tract_ASU_unemp"),
-           style = "decimal", maximum_fraction_digits = 0
-         ),
-         "<br>"
-       )
-     ) |>
-     mapgl::add_legend(
-       "ASU Number",
-       values = pal$legend_vals,
-       colors = pal$legend_cols,
-       type   = "categorical"
-     )
- })
-##-------------------------------------------------------------------------
-  
+    output$asu <- shiny::renderTable(asu_summary(), digits = 3)
+    # The global renderMaplibre for output$initial_map will react to full_data()
+  }
 })
+
 
 shiny::observeEvent(input$th_pass, {
   shiny::req(th_state())
@@ -529,50 +885,8 @@ shiny::observeEvent(input$th_pass, {
   asu_data(res$asu_data    )   ; asu_tracts(res$asu_tracts)
   asu_summary(res$asu_summary) ; 
   output$asu <- shiny::renderTable( asu_summary(),digits = 3 )
-  mapgl::maplibre_proxy("initial_map") |> mapgl::clear_layer("basemap")
-  output$initial_map <- mapgl::renderMaplibre({
-    shiny::req(map_geom())
-    map_data <- map_geom()
-    if (nrow(map_data) == 0) {
-      return(
-        mapgl::maplibre(style = mapgl::carto_style("positron")) |>
-        mapgl::add_control("No valid polygon geometry to display.", "top-left")
-      )
-    }
-    map_data <- map_data |>
-      dplyr::mutate(asunum = dplyr::na_if(asunum, 0L))
-    n_asu <- max(map_data$asunum, na.rm = TRUE)
-    n_asu <- ifelse(is.finite(n_asu), n_asu, 0L)
-    
-    pal <- palette_logic(n_asu)
-    mapgl::maplibre(style = mapgl::carto_style("positron")) |>
-      mapgl::fit_bounds(map_data, animate = FALSE) |>
-      mapgl::add_fill_layer(
-        id                 = "basemap",
-        source             = map_data,
-        fill_color         = pal$fill,
-        fill_opacity       = 0.5,
-        fill_outline_color = "black",
-        tooltip = mapgl::concat(
-          "<strong>ASU Number: </strong>", mapgl::get_column("asunum"), "<br>",
-          "<strong>Tract GEOID: </strong>", mapgl::get_column("GEOID"),  "<br>",
-          "<strong>UR: </strong>",
-          mapgl::number_format(mapgl::get_column("tract_ASU_urate"),
-                        style = "decimal", maximum_fraction_digits = 2),
-          "%<br>",
-          "<strong>Unemp: </strong>",
-          mapgl::number_format(mapgl::get_column("tract_ASU_unemp"),
-                        style = "decimal", maximum_fraction_digits = 0), "<br>"
-        )
-      ) |>
-      mapgl::add_legend(
-        "ASU Number",
-        values = pal$legend_vals,
-        colors = pal$legend_cols,
-        type   = "categorical"
-      )
-  })
-})
+  mapgl::maplibre_proxy("initial_map") |> mapgl::clear_layer("basemap")})
+  
 
 shiny::observeEvent(input$th_combine, {
   shiny::req(th_state())
@@ -586,49 +900,7 @@ shiny::observeEvent(input$th_combine, {
   asu_summary(res$asu_summary) ; 
   output$asu <- shiny::renderTable( asu_summary(),digits = 3 )
   mapgl::maplibre_proxy("initial_map") |> mapgl::clear_layer("basemap")
-  output$initial_map <- mapgl::renderMaplibre({
-    shiny::req(map_geom())
-    map_data <- map_geom()
-    if (nrow(map_data) == 0) {
-      return(
-        mapgl::maplibre(style = mapgl::carto_style("positron")) |>
-        mapgl::add_control("No valid polygon geometry to display.", "top-left")
-      )
-    }
-    map_data <- map_data |>
-      dplyr::mutate(asunum = dplyr::na_if(asunum, 0L))
-    n_asu <- max(map_data$asunum, na.rm = TRUE)
-    n_asu <- ifelse(is.finite(n_asu), n_asu, 0L)
-    
-
-    pal <- palette_logic(n_asu)
-    mapgl::maplibre(style = mapgl::carto_style("positron")) |>
-      mapgl::fit_bounds(map_data, animate = FALSE) |>
-      mapgl::add_fill_layer(
-        id                 = "basemap",
-        source             = map_data,
-        fill_color         = pal$fill,
-        fill_opacity       = 0.5,
-        fill_outline_color = "black",
-        tooltip = mapgl::concat(
-          "<strong>ASU Number: </strong>", mapgl::get_column("asunum"), "<br>",
-          "<strong>Tract GEOID: </strong>", mapgl::get_column("GEOID"),  "<br>",
-          "<strong>UR: </strong>",
-          mapgl::number_format(mapgl::get_column("tract_ASU_urate"),
-                        style = "decimal", maximum_fraction_digits = 2),
-          "%<br>",
-          "<strong>Unemp: </strong>",
-          mapgl::number_format(mapgl::get_column("tract_ASU_unemp"),
-                        style = "decimal", maximum_fraction_digits = 0), "<br>"
-        )
-      ) |>
-      mapgl::add_legend(
-        "ASU Number",
-        values = pal$legend_vals,
-        colors = pal$legend_cols,
-        type   = "categorical"
-      )
-  })
+  
 })
 
 #-------Total Unemployment Box --------------------------------
@@ -655,11 +927,72 @@ output$total_unemp2 <- shiny::renderUI({
 })
 ```
 
-## Output {data-width="800"}
 
 ```{r}
-mapgl::maplibreOutput("initial_map", height = "100vh")
+output$log_overlay <- shiny::renderUI({
+  if (!isTRUE(cpsat_running())) return(NULL)
+  shiny::absolutePanel(
+    top = 80, right = 20, width = 600, height = "70vh", draggable = TRUE,
+    style = "background:#fff; border:1px solid #ddd; box-shadow:0 2px 8px rgba(0,0,0,.15); overflow-y:auto; padding:10px;",
+    shiny::div(style="font-family:monospace; font-size:12px;",
+      shiny::strong("CP-SAT log"), shiny::br(), shiny::verbatimTextOutput("cpsat_log_tail")
+    )
+  )
+})
+
+
 ```
+
+```{r}
+# -- GLOBAL map render that reacts to map_geom() --
+output$initial_map <- mapgl::renderMaplibre({
+  shiny::req(map_geom())
+  map_data <- map_geom()
+  if (nrow(map_data) == 0) {
+    return(
+      mapgl::maplibre(style = mapgl::carto_style("positron")) |>
+      mapgl::add_control("No valid polygon geometry to display.", "top-left")
+    )
+  }
+
+  # Replace 0 with NA so base color applies
+  map_data <- map_data |> dplyr::mutate(asunum = dplyr::na_if(asunum, 0L))
+
+  n_asu <- suppressWarnings(max(map_data$asunum, na.rm = TRUE))
+  n_asu <- ifelse(is.finite(n_asu), n_asu, 0L)
+
+  pal <- palette_logic(n_asu)
+
+  mapgl::maplibre(style = mapgl::carto_style("positron")) |>
+    mapgl::fit_bounds(map_data, animate = FALSE) |>
+    mapgl::add_fill_layer(
+      id                 = "basemap",
+      source             = map_data,
+      fill_color         = pal$fill,
+      fill_opacity       = 0.5,
+      fill_outline_color = "black",
+      tooltip = mapgl::concat(
+        "<strong>ASU Number: </strong>", mapgl::get_column("asunum"), "<br>",
+        "<strong>Tract GEOID: </strong>", mapgl::get_column("GEOID"), "<br>",
+        "<strong>Tract Population: </strong>", mapgl::number_format(mapgl::get_column("tract_pop_cur"), style = "decimal", maximum_fraction_digits = 0), "<br>",
+        "<strong>Tract Labor Force: </strong>", mapgl::number_format(mapgl::get_column("tract_ASU_clf"), style = "decimal", maximum_fraction_digits = 0), "<br>",
+        "<strong>Tract Unemployment Rate: </strong>", mapgl::number_format(mapgl::get_column("tract_ASU_urate"), style = "decimal", maximum_fraction_digits = 2), "%<br>",
+        "<strong>Tract Unemployment: </strong>", mapgl::number_format(mapgl::get_column("tract_ASU_unemp"), style = "decimal", maximum_fraction_digits = 0), "<br>"
+      )
+    )
+})
+```
+
+## Map {data-width="800"}
+```{r}
+# Map
+mapgl::maplibreOutput("initial_map", height = "100vh")
+
+# Log overlay (shows only while running)
+shiny::uiOutput("log_overlay")
+
+```
+
 
 # Modify ASU Selections
 
@@ -1099,9 +1432,6 @@ shiny::observeEvent(input$load_data, {
   
   # Update full_data with the loaded data
   full_data(loaded_data)
-  
-  # Trigger map re-render with new data
-  initial_map_data(loaded_data)
   
   # Provide feedback to the user
   shiny::showModal(shiny::modalDialog(
