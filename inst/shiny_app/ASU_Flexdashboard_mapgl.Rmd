@@ -13,14 +13,11 @@ editor_options:
 # Initialize flag
 python_ready <- FALSE
 
-# Location for the package's virtualenv
-venv_path <- file.path(rappdirs::user_data_dir("ASUbuildR"), "asu-cpsat-venv")
-
 # Try to verify existing environment; if unavailable, attempt setup
 python_ready <- tryCatch(ASUbuildR::check_asu_python(), error = function(e) FALSE)
 
 if (!python_ready) {
-  try(ASUbuildR::setup_asu_python(), silent = TRUE)
+  try(ASUbuildR::setup_asu_python(force = TRUE), silent = TRUE)
   python_ready <- tryCatch(ASUbuildR::check_asu_python(), error = function(e) FALSE)
 }
 

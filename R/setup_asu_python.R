@@ -14,21 +14,22 @@
 #' # Force reinstall
 #' setup_asu_python(force = TRUE)
 #' }
+venv_exists <- function(path) {
+  file.exists(file.path(path, "pyvenv.cfg"))
+}
+
 setup_asu_python <- function(force = FALSE) {
 
   message("Setting up Python environment for ASUbuildR...")
 
-  # Define paths
   app_dir <- rappdirs::user_data_dir("ASUbuildR")
   venv_path <- file.path(app_dir, "asu-cpsat-venv")
 
-  # Remove existing environment if force = TRUE
-  if (force && dir.exists(venv_path)) {
+  if (dir.exists(venv_path) && (force || !venv_exists(venv_path))) {
     message("Removing existing virtual environment...")
     unlink(venv_path, recursive = TRUE, force = TRUE)
   }
 
-  # Check if Python is available, install if not
   if (!reticulate::py_available(initialize = FALSE)) {
     message("Python not found. Installing Miniconda...")
     message("This is a one-time installation and may take a few minutes...")
@@ -37,8 +38,7 @@ setup_asu_python <- function(force = FALSE) {
     message("Miniconda installed successfully!")
   }
 
-  # Create virtual environment
-  if (!dir.exists(venv_path) || force) {
+  if (!dir.exists(venv_path)) {
     message("Creating virtual environment...")
 
     reticulate::virtualenv_create(
@@ -48,9 +48,8 @@ setup_asu_python <- function(force = FALSE) {
 
     message("Virtual environment created successfully!")
   } else {
-    message("Virtual environment already exists. Use force=TRUE to recreate.")
+    message("Virtual environment already exists.")
 
-    # Still check for packages
     reticulate::use_virtualenv(venv_path, required = TRUE)
 
     required <- c("numpy", "pandas", "networkx", "ortools")
@@ -77,8 +76,8 @@ setup_asu_python <- function(force = FALSE) {
 check_asu_python <- function() {
   venv_path <- file.path(rappdirs::user_data_dir("ASUbuildR"), "asu-cpsat-venv")
 
-  if (!dir.exists(venv_path)) {
-    message("Virtual environment not found.")
+  if (!venv_exists(venv_path)) {
+    message("Virtual environment not found or invalid.")
     message("Run setup_asu_python() to set up the Python environment.")
     return(FALSE)
   }
