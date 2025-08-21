@@ -122,11 +122,11 @@
   info <- suppressWarnings(system2(conda_bin, c("info", "--envs"), stdout = TRUE))
   env_path <- NA_character_
   if (length(info)) {
-    line <- info[grepl(sprintf("\\s%s\\s", env_name), info)]
+    line <- info[grepl(sprintf("[[:space:]]%s[[:space:]]", env_name), info)]
     if (length(line)) {
-      toks <- strsplit(trimws(line), "\s+")[[1]]
-      env_path <- toks[length(toks)]
-    }
+        toks <- strsplit(trimws(line), "[[:space:]]+")[[1]]
+        env_path <- toks[length(toks)]
+      }
   }
   list(env_name = env_name, env_path = env_path)
 }
