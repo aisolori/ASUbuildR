@@ -56,10 +56,18 @@ setup_asu_python <- function(force = FALSE) {
   # Install required packages ----------------------------------------------------------
   pkgs <- c("ortools", "pandas", "numpy", "setuptools", "wheel")
   ok <- FALSE
+
+  # Try conda first and ensure only conda-forge is used (avoids ToS prompts)
   try({
-    reticulate::py_install(pkgs, envname = venv_path, method = "conda")
+    reticulate::conda_install(
+      envname = venv_path,
+      packages = pkgs,
+      channel = "conda-forge",
+      "--override-channels"
+    )
     ok <- TRUE
   }, silent = TRUE)
+
   if (!ok) {
     message("Conda installation failed or unavailable; trying pip...")
     try({
@@ -67,6 +75,7 @@ setup_asu_python <- function(force = FALSE) {
       ok <- TRUE
     }, silent = TRUE)
   }
+
   if (!ok) {
     message("Automatic installation failed. Please install these packages in",
             " the environment located at ", venv_path, ":",
