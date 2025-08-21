@@ -28,7 +28,8 @@ setup_asu_python <- function(force = FALSE) {
     unlink(venv_path, recursive = TRUE, force = TRUE)
   }
 
-  # Check if Python is available, install if not
+  # Ensure Python interpreter is available
+  python <- NULL
   if (!reticulate::py_available(initialize = FALSE)) {
     conda_path <- tryCatch(reticulate::miniconda_path(), error = function(e) "")
     if (!nzchar(conda_path) || !dir.exists(conda_path)) {
@@ -39,6 +40,14 @@ setup_asu_python <- function(force = FALSE) {
     } else {
       message("Using existing Miniconda installation at ", conda_path)
     }
+    python <- reticulate::miniconda_python()
+    if (!file.exists(python)) {
+      message("Installing Python...")
+      reticulate::install_python()
+      python <- reticulate::miniconda_python()
+    }
+  } else {
+    python <- reticulate::py_config()$python
   }
 
   # Create virtual environment
@@ -47,6 +56,7 @@ setup_asu_python <- function(force = FALSE) {
 
     reticulate::virtualenv_create(
       envname = venv_path,
+      python = python,
       packages = c("numpy", "pandas", "networkx", "ortools==9.9.3963")
     )
 
