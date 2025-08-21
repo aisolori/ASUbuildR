@@ -30,11 +30,15 @@ setup_asu_python <- function(force = FALSE) {
 
   # Check if Python is available, install if not
   if (!reticulate::py_available(initialize = FALSE)) {
-    message("Python not found. Installing Miniconda...")
-    message("This is a one-time installation and may take a few minutes...")
-
-    reticulate::install_miniconda()
-    message("Miniconda installed successfully!")
+    conda_path <- tryCatch(reticulate::miniconda_path(), error = function(e) "")
+    if (!nzchar(conda_path) || !dir.exists(conda_path)) {
+      message("Python not found. Installing Miniconda...")
+      message("This is a one-time installation and may take a few minutes...")
+      reticulate::install_miniconda()
+      message("Miniconda installed successfully!")
+    } else {
+      message("Using existing Miniconda installation at ", conda_path)
+    }
   }
 
   # Create virtual environment
