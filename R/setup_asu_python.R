@@ -28,13 +28,26 @@ setup_asu_python <- function(force = FALSE) {
     unlink(venv_path, recursive = TRUE, force = TRUE)
   }
 
-  # Check if Python is available, install if not
+  # Ensure Python interpreter is available
+  python <- NULL
   if (!reticulate::py_available(initialize = FALSE)) {
-    message("Python not found. Installing Miniconda...")
-    message("This is a one-time installation and may take a few minutes...")
-
-    reticulate::install_miniconda()
-    message("Miniconda installed successfully!")
+    conda_path <- tryCatch(reticulate::miniconda_path(), error = function(e) "")
+    if (!nzchar(conda_path) || !dir.exists(conda_path)) {
+      message("Python not found. Installing Miniconda...")
+      message("This is a one-time installation and may take a few minutes...")
+      reticulate::install_miniconda()
+      message("Miniconda installed successfully!")
+    } else {
+      message("Using existing Miniconda installation at ", conda_path)
+    }
+    python <- reticulate::miniconda_python()
+    if (!file.exists(python)) {
+      message("Installing Python...")
+      reticulate::install_python()
+      python <- reticulate::miniconda_python()
+    }
+  } else {
+    python <- reticulate::py_config()$python
   }
 
   # Create virtual environment
@@ -43,6 +56,7 @@ setup_asu_python <- function(force = FALSE) {
 
     reticulate::virtualenv_create(
       envname = venv_path,
+      python = python,
       packages = c("numpy", "pandas", "networkx", "ortools==9.9.3963")
     )
 
@@ -83,7 +97,25 @@ check_asu_python <- function() {
     return(FALSE)
   }
 
-  reticulate::use_virtualenv(venv_path, required = TRUE)
+  is_venv <- file.exists(file.path(venv_path, "pyvenv.cfg")) &&
+    (dir.exists(file.path(venv_path, "bin")) || dir.exists(file.path(venv_path, "Scripts")))
+
+  if (!is_venv) {
+    message("Directory exists but is not a valid Python virtual environment.")
+    message("Run setup_asu_python(force = TRUE) to recreate it.")
+    return(FALSE)
+  }
+
+  ok <- tryCatch({
+    reticulate::use_virtualenv(venv_path, required = TRUE)
+    TRUE
+  }, error = function(e) {
+    message("Failed to activate Python environment: ", e$message)
+    message("Run setup_asu_python(force = TRUE) to recreate it.")
+    FALSE
+  })
+
+  if (!ok) return(FALSE)
 
   required <- c("numpy", "pandas", "networkx", "ortools")
   available <- sapply(required, reticulate::py_module_available)

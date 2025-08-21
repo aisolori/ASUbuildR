@@ -1,4 +1,6 @@
 export(launch_ASUbuildR)
+export(setup_asu_python)
+export(check_asu_python)
 useDynLib(ASUbuildR, .registration = TRUE)
 importFrom(Rcpp, sourceCpp)
 
