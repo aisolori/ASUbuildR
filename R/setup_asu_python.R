@@ -1,9 +1,11 @@
 #' Setup Python Environment for ASUbuildR
 #'
 #' This function sets up the Python environment needed for ASUbuildR
-#' using a conda environment from the \emph{conda-forge} channel. It
-#' checks for an existing conda installation (installing Miniconda if
-#' necessary) and ensures all required packages are available.
+#' using a conda environment that relies solely on the
+#' \emph{conda-forge} channel (avoiding channels that require Terms of
+#' Service acceptance). It checks for an existing conda installation
+#' (installing Miniconda if necessary) and ensures all required packages
+#' are available.
 #'
 #' @param force Logical. If TRUE, recreates the conda environment even if it exists.
 #' @return Invisible NULL. Called for side effects.
@@ -44,12 +46,15 @@ setup_asu_python <- function(force = FALSE) {
     envs <- setdiff(envs, env_name)
   }
 
-  # Create conda environment if needed (using conda-forge channel)
+  # Path to conda executable
+  conda_bin <- reticulate::conda_binary()
+
+  # Create conda environment if needed (using only the conda-forge channel)
   if (!(env_name %in% envs)) {
     message("Creating conda environment '", env_name, "' via conda-forge...")
-    reticulate::conda_create(envname = env_name,
-                             packages = "python=3.11",
-                             forge = TRUE)
+    system2(conda_bin,
+            c("create", "--yes", "--name", env_name, "python=3.11",
+              "--quiet", "--override-channels", "-c", "conda-forge"))
     message("Conda environment created successfully!")
   } else {
     message("Conda environment already exists. Use force=TRUE to recreate.")
@@ -57,11 +62,10 @@ setup_asu_python <- function(force = FALSE) {
 
   # Ensure required packages are installed
   message("Installing required Python packages from conda-forge...")
-  reticulate::conda_install(envname = env_name,
-                            packages = c("numpy", "pandas",
-                                         "networkx", "ortools"),
-                            forge = TRUE,
-                            pip = FALSE)
+  pkgs <- c("numpy", "pandas", "networkx", "ortools")
+  system2(conda_bin,
+          c("install", "--yes", "--name", env_name, pkgs,
+            "--quiet", "--override-channels", "-c", "conda-forge"))
 
   reticulate::use_condaenv(env_name, required = TRUE)
 
