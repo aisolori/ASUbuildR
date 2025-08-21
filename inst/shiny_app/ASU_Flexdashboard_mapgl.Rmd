@@ -91,10 +91,10 @@ if (is_dev_mode) {
 reticulate::use_condaenv(env_name, required = TRUE)
 py_config()  # should now show the env python
 
-# Import your solver module from the package's inst/python
+# Import the bundled solver module
 asu_py <- import_from_path(
   module  = "asu_cpsat",
-  path    = normalizePath("../../inst/python", winslash = "/", mustWork = FALSE),
+  path    = system.file("python", package = "ASUbuildR"),
   convert = TRUE
 )
 stopifnot(py_has_attr(asu_py, "build_many_asus_cpsat"))
