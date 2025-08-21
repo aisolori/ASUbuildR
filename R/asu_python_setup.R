@@ -111,13 +111,14 @@ asu_py_env_create <- function(env_name = "asubuildr",
   }
 
   # Optional: print versions
-  reticulate::py_run_string(
-    "import sys, ortools, pandas, numpy; \
-print('Python', sys.version.split()[0]); \
-print('ortools', ortools.__version__); \
-print('pandas', pandas.__version__); \
-print('numpy', numpy.__version__)"
-  )
+  reticulate::py_run_string("
+import sys, ortools, pandas, numpy
+print('Python', sys.version.split()[0])
+print('ortools', ortools.__version__)
+print('pandas', pandas.__version__)
+print('numpy', numpy.__version__)
+")
+
 
   message("✓ Python env ready: ", env_name,
           " (", .conda_env_path(conda_bin, env_name) %||% "<path unknown>", ")")
