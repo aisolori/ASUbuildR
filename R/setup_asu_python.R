@@ -112,7 +112,8 @@
     conda_bin,
     c(
       "install", "--yes", "--name", env_name,
-      "numpy", "pandas", "pip", "ortools",
+      "protobuf==4.25.3", "absl-py", "immutabledict",
+      "numpy", "pandas", "networkx", "ortools==9.9.3963", "pip",
       "--override-channels", "-c", "conda-forge"
     ),
     stdout = TRUE, stderr = TRUE
