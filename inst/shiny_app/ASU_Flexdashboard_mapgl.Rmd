@@ -16,20 +16,10 @@ library(processx)
 # Always define this first so options() won't error
 python_ready <- FALSE
 
-venv_path <- file.path(rappdirs::user_data_dir("ASUbuildR"), "asu-cpsat-venv")
-
-# Try to activate the venv and check for OR-Tools, but never abort knitting
 try({
-  if (dir.exists(venv_path)) {
-    # Don't force activation during knit; just try it
-    reticulate::use_virtualenv(venv_path, required = FALSE)
-
-    if (reticulate::py_module_available("ortools")) {
-      python_ready <- TRUE
-      message("[env] Python environment ready")
-    } else {
-      message("[env] Virtualenv found, but 'ortools' is missing")
-    }
+  if (ASUbuildR::check_asu_python()) {
+    python_ready <- TRUE
+    message("[env] Python environment ready")
   } else {
     message("[env] Python environment not set up; run ASUbuildR::setup_asu_python()")
   }
@@ -89,9 +79,8 @@ if (is_dev_mode) {
 
 
 # Use the virtual environment we set up in the preamble
-venv_path <- file.path(rappdirs::user_data_dir("ASUbuildR"), "asu-cpsat-venv")
-reticulate::use_virtualenv(venv_path, required = TRUE)
-py_config()  # should now show the venv python
+reticulate::use_condaenv("asu-cpsat-venv", required = TRUE)
+py_config()  # should now show the env python
 
 # Import your solver module from the package's inst/python
 asu_py <- import_from_path(
@@ -717,20 +706,15 @@ print('[runner] OK', flush=True)
 
     # ---- 5) Locate Python in the venv ---------------------------------
     shiny::incProgress(0.05, detail = "Locating Python")
-    venv_path <- file.path(rappdirs::user_data_dir("ASUbuildR"), "asu-cpsat-venv")
-    if (.Platform$OS.type == "windows") {
-      pybin <- file.path(venv_path, "Scripts", "python.exe")
-    } else {
-      pybin <- file.path(venv_path, "bin", "python")
-    }
-    if (!file.exists(pybin)) {
+    pybin <- reticulate::py_config()$python
+    if (!nzchar(pybin) || !file.exists(pybin)) {
       pybin <- Sys.which("python")
       if (pybin == "") pybin <- Sys.which("python3")
     }
     if (!nzchar(pybin) || !file.exists(pybin)) {
       shiny::showModal(shiny::modalDialog(
         title="Python not found",
-        "Could not find the virtual environment or python executable.",
+        "Could not find the conda environment or python executable.",
         easyClose=TRUE
       ))
       cpsat_running(FALSE)
