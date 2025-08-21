@@ -91,7 +91,7 @@
 #' @keywords internal
 .ensure_asu_env <- function(conda_bin, env_name = "asu-cpsat-venv") {
   out <- suppressWarnings(system2(conda_bin, c("env", "list"), stdout = TRUE))
-  has_env <- any(grepl(sprintf("^%s\s", env_name), out)) ||
+  has_env <- any(grepl(sprintf("^%s\\s", env_name), out)) ||
     any(grepl(sprintf("/%s$", env_name), out))
 
   if (!has_env) {
@@ -121,7 +121,7 @@
   info <- suppressWarnings(system2(conda_bin, c("info", "--envs"), stdout = TRUE))
   env_path <- NA_character_
   if (length(info)) {
-    line <- info[grepl(sprintf("\s%s\s", env_name), info)]
+    line <- info[grepl(sprintf("\\s%s\\s", env_name), info)]
     if (length(line)) {
       toks <- strsplit(trimws(line), "\s+")[[1]]
       env_path <- toks[length(toks)]
