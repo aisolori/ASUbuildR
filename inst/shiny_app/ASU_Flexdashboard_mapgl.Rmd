@@ -71,8 +71,6 @@ if (is_dev_mode) {
 # ── Use virtual environment ─────────────────────────────
 python_ready <- isTRUE(getOption("asu_python_ready"))
 if (python_ready) {
-  venv_path <- file.path(rappdirs::user_data_dir("ASUbuildR"), "asu-cpsat-venv")
-  reticulate::use_virtualenv(venv_path, required = TRUE)
   py_config()
 } else {
   message("[env] CP-SAT features disabled (Python not available)")
