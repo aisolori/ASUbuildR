@@ -1,8 +1,9 @@
 #' Create (or reuse) a Python env for ASUbuildR and install deps
 #'
 #' Installs Python 3.11 and required packages (ortools, numpy, pandas, networkx),
-#' then activates the environment for the current R session. Uses conda by default
-#' when available and falls back to virtualenv.
+#' then activates the environment for the current R session. When conda is
+#' available it uses only the \emph{conda-forge} channel (avoiding channels that
+#' require Terms of Service acceptance); otherwise it falls back to virtualenv.
 #'
 #' @param env_name Character. Name of the environment. Default "asubuildr".
 #' @param engine Character. One of "auto", "conda", "virtualenv".
@@ -25,25 +26,31 @@ asu_py_env_create <- function(env_name = "asubuildr",
     # Ensure Miniconda exists; install if needed
     reticulate::miniconda_path()  # triggers bootstrap if missing
 
+    conda_bin <- reticulate::conda_binary()
+
     # Create env with Python 3.11 if it doesn't exist
     envs <- reticulate::conda_list()$name
     if (!env_name %in% envs) {
       message("• Creating conda env '", env_name, "' (python=3.11, channel conda-forge)…")
-      reticulate::conda_create(envname = env_name, packages = "python=3.11")
+      system2(conda_bin,
+              c("create", "--yes", "--name", env_name, "python=3.11",
+                "--quiet", "--override-channels", "-c", "conda-forge"))
     } else {
       message("• Reusing existing conda env: ", env_name)
     }
 
     # Prefer conda-forge for core packages; pip fallback if needed
     message("• Installing core packages via conda-forge…")
-    tryCatch(
-      reticulate::conda_install(envname = env_name, packages = pkgs,
-                                channel = "conda-forge", pip = FALSE),
-      error = function(e) {
-        message("  ↪ conda install had an issue (", e$message, "). Falling back to pip…")
-        reticulate::py_install(pkgs, envname = env_name, method = "conda", pip = TRUE)
-      }
-    )
+    status <- tryCatch(
+      system2(conda_bin,
+              c("install", "--yes", "--name", env_name, pkgs,
+                "--quiet", "--override-channels", "-c", "conda-forge")),
+      error = function(e) e)
+    if (inherits(status, "error") || !identical(status, 0L)) {
+      msg <- if (inherits(status, "error")) status$message else "non-zero exit status"
+      message("  ↪ conda install had an issue (", msg, "). Falling back to pip…")
+      reticulate::py_install(pkgs, envname = env_name, method = "conda", pip = TRUE)
+    }
 
     # Activate in this session
     reticulate::use_condaenv(env_name, required = TRUE)

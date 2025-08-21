@@ -1,9 +1,13 @@
 #' Setup Python Environment for ASUbuildR
 #'
-#' This function sets up the Python environment needed for ASUbuildR,
-#' including installing Python if necessary and all required packages.
+#' This function sets up the Python environment needed for ASUbuildR
+#' using a conda environment that relies solely on the
+#' \emph{conda-forge} channel (avoiding channels that require Terms of
+#' Service acceptance). It checks for an existing conda installation
+#' (installing Miniconda if necessary) and ensures all required packages
+#' are available.
 #'
-#' @param force Logical. If TRUE, recreates the virtual environment even if it exists.
+#' @param force Logical. If TRUE, recreates the conda environment even if it exists.
 #' @return Invisible NULL. Called for side effects.
 #' @export
 #' @examples
@@ -18,49 +22,52 @@ setup_asu_python <- function(force = FALSE) {
 
   message("Setting up Python environment for ASUbuildR...")
 
-  # Define paths
-  app_dir <- rappdirs::user_data_dir("ASUbuildR")
-  venv_path <- file.path(app_dir, "asu-cpsat-venv")
+  env_name <- "asu-cpsat"
 
-  # Remove existing environment if force = TRUE
-  if (force && dir.exists(venv_path)) {
-    message("Removing existing virtual environment...")
-    unlink(venv_path, recursive = TRUE, force = TRUE)
-  }
-
-  # Check if Python is available, install if not
-  if (!reticulate::py_available(initialize = FALSE)) {
-    message("Python not found. Installing Miniconda...")
+  # Determine whether conda is available; if not, install Miniconda
+  have_conda <- tryCatch(!is.na(reticulate::conda_binary()), error = function(e) FALSE)
+  if (!have_conda) {
+    message("Conda not found. Installing Miniconda...")
     message("This is a one-time installation and may take a few minutes...")
-
     reticulate::install_miniconda()
+    have_conda <- TRUE
     message("Miniconda installed successfully!")
   }
 
-  # Create virtual environment
-  if (!dir.exists(venv_path) || force) {
-    message("Creating virtual environment...")
-
-    reticulate::virtualenv_create(
-      envname = venv_path,
-      packages = c("numpy", "pandas", "networkx", "ortools==9.9.3963")
-    )
-
-    message("Virtual environment created successfully!")
-  } else {
-    message("Virtual environment already exists. Use force=TRUE to recreate.")
-
-    # Still check for packages
-    reticulate::use_virtualenv(venv_path, required = TRUE)
-
-    required <- c("numpy", "pandas", "networkx", "ortools")
-    missing <- required[!sapply(required, reticulate::py_module_available)]
-
-    if (length(missing) > 0) {
-      message("Installing missing packages: ", paste(missing, collapse = ", "))
-      reticulate::py_install(missing, envname = venv_path, pip = TRUE)
-    }
+  if (!have_conda) {
+    stop("Conda installation failed; cannot set up Python environment.")
   }
+
+  # Remove existing environment if force = TRUE
+  envs <- reticulate::conda_list()$name
+  if (force && env_name %in% envs) {
+    message("Removing existing conda environment...")
+    reticulate::conda_remove(envname = env_name, packages = "--all")
+    envs <- setdiff(envs, env_name)
+  }
+
+  # Path to conda executable
+  conda_bin <- reticulate::conda_binary()
+
+  # Create conda environment if needed (using only the conda-forge channel)
+  if (!(env_name %in% envs)) {
+    message("Creating conda environment '", env_name, "' via conda-forge...")
+    system2(conda_bin,
+            c("create", "--yes", "--name", env_name, "python=3.11",
+              "--quiet", "--override-channels", "-c", "conda-forge"))
+    message("Conda environment created successfully!")
+  } else {
+    message("Conda environment already exists. Use force=TRUE to recreate.")
+  }
+
+  # Ensure required packages are installed
+  message("Installing required Python packages from conda-forge...")
+  pkgs <- c("numpy", "pandas", "networkx", "ortools")
+  system2(conda_bin,
+          c("install", "--yes", "--name", env_name, pkgs,
+            "--quiet", "--override-channels", "-c", "conda-forge"))
+
+  reticulate::use_condaenv(env_name, required = TRUE)
 
   message("\nPython setup complete!")
   message("You can now run launch_ASUbuildR()")
@@ -75,15 +82,16 @@ setup_asu_python <- function(force = FALSE) {
 #' @return Logical. TRUE if properly configured, FALSE otherwise.
 #' @export
 check_asu_python <- function() {
-  venv_path <- file.path(rappdirs::user_data_dir("ASUbuildR"), "asu-cpsat-venv")
+  env_name <- "asu-cpsat"
 
-  if (!dir.exists(venv_path)) {
-    message("Virtual environment not found.")
+  envs <- reticulate::conda_list()$name
+  if (!(env_name %in% envs)) {
+    message("Conda environment not found.")
     message("Run setup_asu_python() to set up the Python environment.")
     return(FALSE)
   }
 
-  reticulate::use_virtualenv(venv_path, required = TRUE)
+  reticulate::use_condaenv(env_name, required = TRUE)
 
   required <- c("numpy", "pandas", "networkx", "ortools")
   available <- sapply(required, reticulate::py_module_available)
