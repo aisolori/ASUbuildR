@@ -22,7 +22,8 @@ You can install the development version of ASUbuildR from
 
 ``` r
 # install.packages("remotes")
-remotes::install_github("schmidtDETR/ASUbuildR")
+# Install from your GitHub repo
+remotes::install_github("aisolori/ASUbuildR")
 ```
 
 ## Running the Application
