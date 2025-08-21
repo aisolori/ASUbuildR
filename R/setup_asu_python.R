@@ -83,7 +83,25 @@ check_asu_python <- function() {
     return(FALSE)
   }
 
-  reticulate::use_virtualenv(venv_path, required = TRUE)
+  is_venv <- file.exists(file.path(venv_path, "pyvenv.cfg")) &&
+    (dir.exists(file.path(venv_path, "bin")) || dir.exists(file.path(venv_path, "Scripts")))
+
+  if (!is_venv) {
+    message("Directory exists but is not a valid Python virtual environment.")
+    message("Run setup_asu_python(force = TRUE) to recreate it.")
+    return(FALSE)
+  }
+
+  ok <- tryCatch({
+    reticulate::use_virtualenv(venv_path, required = TRUE)
+    TRUE
+  }, error = function(e) {
+    message("Failed to activate Python environment: ", e$message)
+    message("Run setup_asu_python(force = TRUE) to recreate it.")
+    FALSE
+  })
+
+  if (!ok) return(FALSE)
 
   required <- c("numpy", "pandas", "networkx", "ortools")
   available <- sapply(required, reticulate::py_module_available)
