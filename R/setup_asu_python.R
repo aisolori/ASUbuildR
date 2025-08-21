@@ -70,6 +70,16 @@
 
 #' @keywords internal
 .configure_conda_forge <- function(conda_bin) {
+  condarc_path <- file.path(Sys.getenv("HOME"), ".condarc")
+  condarc <- paste(
+    "channels:",
+    "  - conda-forge",
+    "channel_priority: strict",
+    "default_channels: []",
+    "custom_channels: {}",
+    sep = "\n"
+  )
+  writeLines(condarc, condarc_path)
   suppressWarnings(try(system2(conda_bin, c("config", "--remove", "channels", "defaults"))))
   suppressWarnings(try(system2(conda_bin, c("config", "--remove", "channels", "https://repo.anaconda.com/pkgs/main"))))
   suppressWarnings(try(system2(conda_bin, c("config", "--remove", "channels", "https://repo.anaconda.com/pkgs/r"))))
@@ -81,42 +91,45 @@
 #' @keywords internal
 .ensure_asu_env <- function(conda_bin, env_name = "asu-cpsat-venv") {
   out <- suppressWarnings(system2(conda_bin, c("env", "list"), stdout = TRUE))
-  has_env <- any(grepl(sprintf("^%s\\s", env_name), out)) ||
+  has_env <- any(grepl(sprintf("^%s\s", env_name), out)) ||
     any(grepl(sprintf("/%s$", env_name), out))
 
   if (!has_env) {
     message(sprintf("Creating Conda env '%s' with Python 3.10...", env_name))
-    system2(conda_bin, c("create", "--yes", "--name", env_name, "python=3.10"),
-            stdout = TRUE, stderr = TRUE)
+    system2(
+      conda_bin,
+      c(
+        "create", "--yes", "--name", env_name, "python=3.10",
+        "--override-channels", "-c", "conda-forge"
+      ),
+      stdout = TRUE, stderr = TRUE
+    )
   } else {
     message(sprintf("Conda env '%s' already exists.", env_name))
   }
 
-  reticulate::conda_install(
-    env_name,
+  system2(
+    conda_bin,
     c(
-      "protobuf==4.25.3",
-      "absl-py",
-      "immutabledict",
-      "numpy",
-      "pandas",
-      "networkx",
-      "ortools==9.9.3963"
+      "install", "--yes", "--name", env_name,
+      "numpy", "pandas", "pip", "ortools",
+      "--override-channels", "-c", "conda-forge"
     ),
-    channel = "conda-forge"
+    stdout = TRUE, stderr = TRUE
   )
 
   info <- suppressWarnings(system2(conda_bin, c("info", "--envs"), stdout = TRUE))
   env_path <- NA_character_
   if (length(info)) {
-    line <- info[grepl(sprintf("\\s%s\\s", env_name), info)]
+    line <- info[grepl(sprintf("\s%s\s", env_name), info)]
     if (length(line)) {
-      toks <- strsplit(trimws(line), "\\s+")[[1]]
+      toks <- strsplit(trimws(line), "\s+")[[1]]
       env_path <- toks[length(toks)]
     }
   }
   list(env_name = env_name, env_path = env_path)
 }
+
 
 #' @keywords internal
 .use_asu_env <- function(env_name = "asu-cpsat-venv") {
@@ -124,8 +137,7 @@
   ok1 <- reticulate::py_module_available("ortools")
   ok2 <- reticulate::py_module_available("pandas")
   ok3 <- reticulate::py_module_available("numpy")
-  ok4 <- reticulate::py_module_available("networkx")
-  if (!all(ok1, ok2, ok3, ok4)) {
+  if (!all(ok1, ok2, ok3)) {
     stop("Conda env is active, but required modules are missing.")
   }
   invisible(TRUE)
@@ -155,7 +167,7 @@ setup_asu_python <- function() {
   )
   .write_state(state)
 
-  reticulate::py_run_string("import sys, ortools, pandas, numpy, networkx; \\nprint('Python', sys.version.split()[0]); \\nprint('ortools', ortools.__version__); \\nprint('pandas', pandas.__version__); \\nprint('numpy', numpy.__version__); \\nprint('networkx', networkx.__version__)")
+  reticulate::py_run_string("import sys, ortools, pandas, numpy; \\nprint('Python', sys.version.split()[0]); \\nprint('ortools', ortools.__version__); \\nprint('pandas', pandas.__version__); \\nprint('numpy', numpy.__version__)")
 
   invisible(TRUE)
 }
@@ -175,8 +187,7 @@ check_asu_python <- function() {
   ok <- all(
     reticulate::py_module_available("ortools"),
     reticulate::py_module_available("pandas"),
-    reticulate::py_module_available("numpy"),
-    reticulate::py_module_available("networkx")
+    reticulate::py_module_available("numpy")
   )
   if (!ok) {
     message("ASUbuildR: Python environment not ready. Run ASUbuildR::setup_asu_python().")

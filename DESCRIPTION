@@ -38,12 +38,11 @@ Imports:
     crayon,
     Rcpp
 LinkingTo: Rcpp
-SystemRequirements: C++11; Python (>= 3.9) with packages: ortools, numpy, pandas, networkx
+SystemRequirements: C++11; Python (>= 3.10) with packages: ortools, numpy, pandas
 Suggests: knitr
 VignetteBuilder: knitr
 Config/reticulate: list(packages = list(
     list(package = "ortools"),
     list(package = "numpy"),
-    list(package = "pandas"),
-    list(package = "networkx")
+    list(package = "pandas")
   ))
