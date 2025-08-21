@@ -31,12 +31,9 @@ setup_asu_python <- function(force = FALSE) {
   # Ensure conda is available -------------------------------------------------
   conda <- tryCatch(reticulate::conda_binary(), error = function(e) "")
   if (!nzchar(conda) || force) {
-    mc_path <- reticulate::miniconda_path()
-    if (!dir.exists(mc_path) || force) {
-      message("Installing Miniconda (one-time operation)...")
-      tryCatch(reticulate::install_miniconda(force = force),
-               error = function(e) stop("Miniconda installation failed: ", e$message))
-    }
+    message("Installing Miniconda (one-time operation)...")
+    tryCatch(reticulate::install_miniconda(force = TRUE),
+             error = function(e) stop("Miniconda installation failed: ", e$message))
     conda <- reticulate::conda_binary()
   }
 

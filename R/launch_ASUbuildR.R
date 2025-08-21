@@ -37,51 +37,16 @@ launch_ASUbuildR <- function(rmd_file = NULL,
 
   # If no file specified, use the package's built-in dashboard
   if (is.null(rmd_file)) {
-    # Try installed package location first
     rmd_file <- system.file("shiny_app", "ASU_Flexdashboard_mapgl.Rmd",
-                            package = "ASUbuildR")  # Replace with your actual package name
-
-    # If not found (development mode), try local inst directory
-    if (rmd_file == "" || !file.exists(rmd_file)) {
-      # Look for the file in development directory structure
-      dev_file <- file.path("inst", "shiny_app", "ASU_Flexdashboard_mapgl.Rmd")
-      if (file.exists(dev_file)) {
-        rmd_file <- dev_file
-      } else {
-        # Try alternative development paths
-        alt_paths <- c(
-          "inst/shiny_app/ASU_Flexdashboard_mapgl.Rmd",  # Your original name
-          #"R/ASU_Flexdashboard_mapgl.Rmd",  # Current location
-          "ASU_Flexdashboard_mapgl.Rmd"     # Working directory
-        )
-
-        for (path in alt_paths) {
-          if (file.exists(path)) {
-            rmd_file <- path
-            break
-          }
-        }
-      }
-    }
+                            package = "ASUbuildR")
   }
 
-  # Check if the RMD file exists
   if (!file.exists(rmd_file)) {
-    stop(paste("File", rmd_file, "not found. Please check the file path or ensure the .Rmd file is in the correct location."))
+    stop("Dashboard Rmd not found; reinstall ASUbuildR or provide a valid file path.")
   }
 
-  # Print status message
-  cat("Starting ASU Flexdashboard...\n")
-  cat("File:", rmd_file, "\n")
-
-  # Run the flexdashboard with shiny
-  # This will render and launch the dashboard in the browser
   rmarkdown::run(
     file = rmd_file,
-    shiny_args = list(
-      host = host,
-      port = port,
-      launch.browser = launch.browser
-    )
+    shiny_args = list(host = host, port = port, launch.browser = launch.browser)
   )
 }
