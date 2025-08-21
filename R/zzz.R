@@ -1,6 +1,5 @@
 .onLoad <- function(libname, pkgname) {
-  ready <- tryCatch(check_asu_python(quiet = TRUE), error = function(e) FALSE)
-  options(asu_python_ready = ready)
+  options(asu_python_env = asu_venv_path(), asu_python_ready = FALSE)
 
   cache_dir <- rappdirs::user_cache_dir("ASUbuildR", "tigris")
   if (!dir.exists(cache_dir)) {
@@ -10,6 +9,11 @@
 }
 
 .onAttach <- function(libname, pkgname) {
+  if (interactive()) {
+    ready <- tryCatch(check_asu_python(quiet = TRUE), error = function(e) FALSE)
+    options(asu_python_ready = ready)
+  }
+
   if (!isTRUE(getOption("asu_python_ready"))) {
     packageStartupMessage("Python environment not ready. Run ASUbuildR::setup_asu_python() to enable CP-SAT features.")
   } else {

@@ -16,6 +16,13 @@ python_ready <- tryCatch(
 )
 
 if (!python_ready) {
+  python_ready <- tryCatch(
+    ASUbuildR::setup_asu_python(),
+    error = function(e) { message("[env] ", e$message); FALSE }
+  )
+}
+
+if (!python_ready) {
   message("[env] Python environment not available; run ASUbuildR::setup_asu_python()")
 }
 
@@ -68,7 +75,7 @@ if (is_dev_mode) {
 `%||%` <- function(a, b) if (!is.null(a) && length(a)) a else b
 
 
-# ── Use virtual environment ─────────────────────────────
+# ── Use Python environment ─────────────────────────────
 python_ready <- isTRUE(getOption("asu_python_ready"))
 if (python_ready) {
   py_config()

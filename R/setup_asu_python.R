@@ -8,9 +8,9 @@ asu_venv_path <- function() {
 #' installs Miniconda if necessary and then attempts to create a conda
 #' environment at ``asu-cpsat-venv`` containing the required Python packages
 #' (``ortools``, ``pandas``, ``numpy``, ``setuptools`` and ``wheel``). If the
-#' conda-based setup fails, a Python virtualenv with the same name is created and
-#' the packages are installed via ``pip``. The final environment location is
-#' stored in ``options('asu_python_env')`` for later use.
+#' conda-based setup fails, the user is advised to install the packages
+#' manually. The final environment location is stored in
+#' ``options('asu_python_env')`` for later use.
 #'
 #' @param force Recreate the environment even if it already exists.
 #' @return Logical. ``TRUE`` if the environment is ready, ``FALSE`` otherwise.
@@ -44,48 +44,50 @@ setup_asu_python <- function(force = FALSE) {
   }
 
   pkgs <- c("ortools", "pandas", "numpy", "setuptools", "wheel")
-  ok <- FALSE
-
-  # Prefer conda env using only conda-forge ----------------------------------
   conda <- tryCatch(reticulate::conda_binary(), error = function(e) "")
-  if (nzchar(conda)) {
-    if (!dir.exists(venv_path)) {
-      message("Creating conda environment at ", venv_path)
-      try({
-        reticulate::conda_create(venv_path, packages = pkgs,
-                                 forge = TRUE, channel = "conda-forge",
-                                 conda = conda)
-        ok <- TRUE
-      }, silent = TRUE)
-    } else {
-      message("Conda environment already exists; ensuring packages are installed")
-      try({
-        reticulate::conda_install(venv_path, pkgs,
-                                  channel = "conda-forge", forge = TRUE,
-                                  conda = conda)
-        ok <- TRUE
-      }, silent = TRUE)
-    }
-  }
 
-  # Fallback to virtualenv + pip ---------------------------------------------
-  if (!ok) {
-    message("Conda setup failed; trying virtualenv with pip...")
-    if (!reticulate::virtualenv_exists(venv_path)) {
-      reticulate::virtualenv_create(venv_path, python = py_bin)
-    }
-    try({
-      reticulate::py_install(pkgs, envname = venv_path, method = "virtualenv")
-      ok <- TRUE
-    }, silent = TRUE)
-  }
-
-  if (!ok) {
-    message("Automatic installation failed. Please install these packages in",
-            " the environment located at ", venv_path, ":",
-            paste(pkgs, collapse = ", "))
+  if (!nzchar(conda)) {
+    message("Conda not available. Ensure reticulate can locate conda.")
     options(asu_python_env = venv_path, asu_python_ready = FALSE)
     return(FALSE)
+  }
+
+  if (!dir.exists(venv_path) || force) {
+    if (dir.exists(venv_path) && force) {
+      message("Removing existing environment...")
+      unlink(venv_path, recursive = TRUE, force = TRUE)
+    }
+    message("Creating conda environment at ", venv_path)
+    created <- tryCatch({
+      reticulate::conda_create(venv_path, packages = pkgs,
+                               forge = TRUE, channel = "conda-forge",
+                               conda = conda)
+      TRUE
+    }, error = function(e) {
+      message("Automatic installation failed. Please install these packages in",
+              " the environment located at ", venv_path, ":",
+              paste(pkgs, collapse = ", "))
+      FALSE
+    })
+    if (!created) {
+      options(asu_python_env = venv_path, asu_python_ready = FALSE)
+      return(FALSE)
+    }
+  } else {
+    message("Conda environment already exists; ensuring packages are installed")
+    installed <- tryCatch({
+      reticulate::conda_install(venv_path, pkgs,
+                                channel = "conda-forge", forge = TRUE,
+                                conda = conda)
+      TRUE
+    }, error = function(e) {
+      message("Package installation failed: ", e$message)
+      FALSE
+    })
+    if (!installed) {
+      options(asu_python_env = venv_path, asu_python_ready = FALSE)
+      return(FALSE)
+    }
   }
 
   options(asu_python_env = venv_path)
@@ -114,19 +116,12 @@ check_asu_python <- function(quiet = FALSE) {
     return(FALSE)
   }
 
-  ok <- FALSE
-  try({
+  ok <- try({
     reticulate::use_condaenv(venv_path, required = TRUE)
-    ok <- TRUE
+    TRUE
   }, silent = TRUE)
-  if (!ok) {
-    try({
-      reticulate::use_virtualenv(venv_path, required = TRUE)
-      ok <- TRUE
-    }, silent = TRUE)
-  }
 
-  if (!ok) {
+  if (!isTRUE(ok)) {
     msg("Failed to activate Python environment at ", venv_path)
     options(asu_python_ready = FALSE)
     return(FALSE)

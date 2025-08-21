@@ -7,5 +7,5 @@
 }
 \value{Logical TRUE if the environment is ready, otherwise FALSE.}
 \description{Creates or repairs the isolated Python environment used by ASUbuildR.
-Installs Miniconda when needed and installs required packages (\code{ortools}, \code{pandas}, \code{numpy}, \code{setuptools}, \code{wheel}) in a dedicated directory called \code{asu-cpsat-venv}. Package installation prefers conda with the \code{conda-forge} channel and falls back to a virtualenv with pip. The environment path is recorded in \code{options("asu_python_env")}.
+Installs Miniconda when needed and installs required packages (\code{ortools}, \code{pandas}, \code{numpy}, \code{setuptools}, \code{wheel}) in a dedicated directory called \code{asu-cpsat-venv}. Package installation uses conda with the \code{conda-forge} channel; if this fails, a message is emitted so users can install the packages manually. The environment path is recorded in \code{options("asu_python_env")}.
 }
