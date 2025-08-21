@@ -10,5 +10,5 @@ setup_asu_python(force = FALSE)
 \item{force}{Logical. If TRUE, recreates the conda environment even if it exists.}
 }
 \description{
-This function sets up the Python environment needed for ASUbuildR using a conda environment. It checks for an existing conda installation (installing Miniconda if necessary) and ensures all required packages are available.
+This function sets up the Python environment needed for ASUbuildR using a conda environment from the \emph{conda-forge} channel. It checks for an existing conda installation (installing Miniconda if necessary) and ensures all required packages are available.
 }

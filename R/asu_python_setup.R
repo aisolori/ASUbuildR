@@ -1,8 +1,8 @@
 #' Create (or reuse) a Python env for ASUbuildR and install deps
 #'
 #' Installs Python 3.11 and required packages (ortools, numpy, pandas, networkx),
-#' then activates the environment for the current R session. Uses conda by default
-#' when available and falls back to virtualenv.
+#' then activates the environment for the current R session. Uses conda via the
+#' conda-forge channel by default when available and falls back to virtualenv.
 #'
 #' @param env_name Character. Name of the environment. Default "asubuildr".
 #' @param engine Character. One of "auto", "conda", "virtualenv".
@@ -29,7 +29,9 @@ asu_py_env_create <- function(env_name = "asubuildr",
     envs <- reticulate::conda_list()$name
     if (!env_name %in% envs) {
       message("• Creating conda env '", env_name, "' (python=3.11, channel conda-forge)…")
-      reticulate::conda_create(envname = env_name, packages = "python=3.11")
+      reticulate::conda_create(envname = env_name,
+                               packages = "python=3.11",
+                               forge = TRUE)
     } else {
       message("• Reusing existing conda env: ", env_name)
     }
@@ -37,8 +39,10 @@ asu_py_env_create <- function(env_name = "asubuildr",
     # Prefer conda-forge for core packages; pip fallback if needed
     message("• Installing core packages via conda-forge…")
     tryCatch(
-      reticulate::conda_install(envname = env_name, packages = pkgs,
-                                channel = "conda-forge", pip = FALSE),
+      reticulate::conda_install(envname = env_name,
+                                packages = pkgs,
+                                forge = TRUE,
+                                pip = FALSE),
       error = function(e) {
         message("  ↪ conda install had an issue (", e$message, "). Falling back to pip…")
         reticulate::py_install(pkgs, envname = env_name, method = "conda", pip = TRUE)

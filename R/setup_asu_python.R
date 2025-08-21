@@ -1,9 +1,9 @@
 #' Setup Python Environment for ASUbuildR
 #'
 #' This function sets up the Python environment needed for ASUbuildR
-#' using a conda environment. It checks for an existing conda
-#' installation (installing Miniconda if necessary) and ensures all
-#' required packages are available.
+#' using a conda environment from the \emph{conda-forge} channel. It
+#' checks for an existing conda installation (installing Miniconda if
+#' necessary) and ensures all required packages are available.
 #'
 #' @param force Logical. If TRUE, recreates the conda environment even if it exists.
 #' @return Invisible NULL. Called for side effects.
@@ -44,22 +44,24 @@ setup_asu_python <- function(force = FALSE) {
     envs <- setdiff(envs, env_name)
   }
 
-  # Create conda environment if needed
+  # Create conda environment if needed (using conda-forge channel)
   if (!(env_name %in% envs)) {
-    message("Creating conda environment '", env_name, "'...")
-    reticulate::conda_create(envname = env_name, packages = "python=3.11")
+    message("Creating conda environment '", env_name, "' via conda-forge...")
+    reticulate::conda_create(envname = env_name,
+                             packages = "python=3.11",
+                             forge = TRUE)
     message("Conda environment created successfully!")
   } else {
     message("Conda environment already exists. Use force=TRUE to recreate.")
   }
 
   # Ensure required packages are installed
-  message("Installing required Python packages...")
+  message("Installing required Python packages from conda-forge...")
   reticulate::conda_install(envname = env_name,
-                            packages = c("numpy", "pandas", "networkx"),
-                            channel = "conda-forge", pip = FALSE)
-  reticulate::py_install("ortools==9.9.3963", envname = env_name,
-                         method = "conda", pip = TRUE)
+                            packages = c("numpy", "pandas",
+                                         "networkx", "ortools"),
+                            forge = TRUE,
+                            pip = FALSE)
 
   reticulate::use_condaenv(env_name, required = TRUE)
 
