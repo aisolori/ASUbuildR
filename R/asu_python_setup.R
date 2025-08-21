@@ -1,97 +1,141 @@
-#' Create (or reuse) a Python env for ASUbuildR and install deps
+# ---- helpers ---------------------------------------------------------------
+
+# quiet system2 (hide "CondaKeyError: 'channels' not present" noise)
+.run_quiet <- function(cmd, args) {
+  tf <- tempfile()
+  on.exit(unlink(tf), add = TRUE)
+  res <- tryCatch(system2(cmd, args, stdout = tf, stderr = tf), error = function(e) 1L)
+  if (is.null(res)) 0L else res
+}
+
+# force conda-forge only to avoid Anaconda TOS
+.configure_conda_forge <- function(conda_bin) {
+  condarc_path <- file.path(Sys.getenv("HOME"), ".condarc")
+  writeLines(
+    paste(
+      "channels:",
+      "  - conda-forge",
+      "channel_priority: strict",
+      "default_channels: []",
+      "custom_channels: {}",
+      sep = "\n"
+    ),
+    condarc_path
+  )
+
+  .run_quiet(conda_bin, c("config","--remove","channels","defaults"))
+  .run_quiet(conda_bin, c("config","--remove","channels","https://repo.anaconda.com/pkgs/main"))
+  .run_quiet(conda_bin, c("config","--remove","channels","https://repo.anaconda.com/pkgs/r"))
+
+  # keep these visible (or wrap in .run_quiet if you want them quiet too)
+  system2(conda_bin, c("config","--add","channels","conda-forge"), stdout = TRUE, stderr = TRUE)
+  system2(conda_bin, c("config","--set","channel_priority","strict"), stdout = TRUE, stderr = TRUE)
+  invisible(TRUE)
+}
+
+# robust env path via JSON
+.conda_env_path <- function(conda_bin, env_name) {
+  txt <- suppressWarnings(system2(conda_bin, c("info","--envs","--json"), stdout = TRUE))
+  if (!length(txt)) return(NA_character_)
+  dat <- tryCatch(jsonlite::fromJSON(paste(txt, collapse = "\n")), error = function(e) NULL)
+  if (is.null(dat) || is.null(dat$envs)) return(NA_character_)
+  cand <- dat$envs[grepl(sprintf("/%s$", env_name), dat$envs)]
+  if (length(cand)) cand[[1]] else NA_character_
+}
+
+# ---- main API --------------------------------------------------------------
+
+#' Create (or reuse) a Python env for ASUbuildR and install deps (conda only)
 #'
-#' Installs Python 3.11 and required packages (ortools, numpy, pandas, networkx),
-#' then activates the environment for the current R session. Uses conda by default
-#' when available and falls back to virtualenv.
+#' Installs Python 3.11 and required packages (ortools, numpy, pandas, networkx)
+#' into a conda env, then activates it for the current R session.
+#' Uses **conda only** (no virtualenv fallback) and forces conda-forge to avoid TOS prompts.
 #'
 #' @param env_name Character. Name of the environment. Default "asubuildr".
-#' @param engine Character. One of "auto", "conda", "virtualenv".
+#' @param engine Character. One of "auto", "conda", "virtualenv". If not "conda",
+#'   an error is thrown (no virtualenv fallback by design).
 #' @return (invisible) env_name
 #' @export
 asu_py_env_create <- function(env_name = "asubuildr",
-                              engine = c("auto", "conda", "virtualenv")) {
+                              engine   = c("auto","conda","virtualenv")) {
   engine <- match.arg(engine)
-  pkgs   <- c("ortools", "numpy", "pandas", "networkx")
 
-  # Decide engine
+  # We only support conda; block virtualenv by design
   have_conda <- tryCatch(!is.na(reticulate::conda_binary()), error = function(e) FALSE)
-  if (engine == "auto") {
-    engine <- if (have_conda) "conda" else "virtualenv"
-  }
+  if (engine == "auto") engine <- "conda"
+  if (engine != "conda") stop("asu_py_env_create supports conda only (no virtualenv fallback).", call. = FALSE)
 
-  message("• Using engine: ", engine)
+  # Ensure conda exists (install Miniconda if needed)
+  if (!have_conda) reticulate::install_miniconda()
+  conda_bin <- reticulate::conda_binary()
+  if (is.na(conda_bin)) stop("Conda not available after install_miniconda().", call. = FALSE)
 
-  if (engine == "conda") {
-    # Ensure Miniconda exists; install if needed
-    reticulate::miniconda_path()  # triggers bootstrap if missing
+  # Force conda-forge only (avoid Anaconda TOS)
+  .configure_conda_forge(conda_bin)
 
-    # Create env with Python 3.11 if it doesn't exist
-    envs <- reticulate::conda_list()$name
-    if (!env_name %in% envs) {
-      message("• Creating conda env '", env_name, "' (python=3.11, channel conda-forge)…")
-      reticulate::conda_create(envname = env_name, packages = "python=3.11")
-    } else {
-      message("• Reusing existing conda env: ", env_name)
-    }
-
-    # Prefer conda-forge for core packages; pip fallback if needed
-    message("• Installing core packages via conda-forge…")
-    tryCatch(
-      reticulate::conda_install(envname = env_name, packages = pkgs,
-                                channel = "conda-forge", pip = FALSE),
-      error = function(e) {
-        message("  ↪ conda install had an issue (", e$message, "). Falling back to pip…")
-        reticulate::py_install(pkgs, envname = env_name, method = "conda", pip = TRUE)
-      }
+  # Create env if missing — pass --override-channels to guarantee conda-forge only
+  envs <- tryCatch(reticulate::conda_list()$name, error = function(e) character())
+  if (!env_name %in% envs) {
+    message("• Creating conda env '", env_name, "' (python=3.11)…")
+    st <- system2(
+      conda_bin,
+      c("create","--yes","--name", env_name, "python=3.11",
+        "--override-channels","-c","conda-forge"),
+      stdout = TRUE, stderr = TRUE
     )
-
-    # Activate in this session
-    reticulate::use_condaenv(env_name, required = TRUE)
-
-  } else {
-    # virtualenv path + Python
-    # Install a session-local Python 3.11 if needed
-    py <- reticulate::install_python(version = "3.11")
-    venvs <- tryCatch(reticulate::virtualenv_list(), error = function(e) character())
-    if (!env_name %in% venvs) {
-      message("• Creating virtualenv '", env_name, "' (python=3.11)…")
-      reticulate::virtualenv_create(envname = env_name, python = py)
-    } else {
-      message("• Reusing existing virtualenv: ", env_name)
+    if (!is.null(attr(st, "status")) && attr(st, "status") != 0L) {
+      stop("conda create failed; see logs above.", call. = FALSE)
     }
-
-    # Activate
-    reticulate::use_virtualenv(env_name, required = TRUE)
-
-    # Install via pip
-    message("• Installing core packages via pip…")
-    reticulate::py_install(pkgs, envname = env_name, method = "virtualenv", pip = TRUE)
+  } else {
+    message("• Reusing existing conda env: ", env_name)
   }
 
-  # Verify imports (Python side)
-  ok <- asu_py_check(silent = TRUE)
-  if (!ok) stop("Python environment created but imports failed; see messages above.", call. = FALSE)
+  # Install core packages (conda syntax; no '==')
+  pkgs <- c("numpy","pandas","networkx","ortools","pip")
+  st2 <- system2(
+    conda_bin,
+    c("install","--yes","--name", env_name, pkgs,
+      "--override-channels","-c","conda-forge"),
+    stdout = TRUE, stderr = TRUE
+  )
+  if (!is.null(attr(st2, "status")) && attr(st2, "status") != 0L) {
+    stop("conda install failed; see logs above.", call. = FALSE)
+  }
 
-  message("✓ Python env ready: ", env_name)
+  # Activate env for this session
+  reticulate::use_condaenv(env_name, required = TRUE)
+
+  # Verify imports
+  if (!asu_py_check(silent = TRUE)) {
+    stop("Python environment created but imports failed; see messages above.", call. = FALSE)
+  }
+
+  # Optional: print versions
+  reticulate::py_run_string("
+import sys, ortools, pandas, numpy
+print('Python', sys.version.split()[0])
+print('ortools', ortools.__version__)
+print('pandas', pandas.__version__)
+print('numpy', numpy.__version__)
+")
+
+
+  message("✓ Python env ready: ", env_name,
+          " (", .conda_env_path(conda_bin, env_name) %||% "<path unknown>", ")")
   invisible(env_name)
 }
 
-#' Activate an existing ASUbuildR Python env for this R session
+#' Activate an existing ASUbuildR Python env for this R session (conda only)
 #' @param env_name Character. Environment name.
-#' @param engine   Character. One of "auto","conda","virtualenv"
+#' @param engine   Character. Must be "conda" (or "auto", which resolves to conda).
 #' @return logical TRUE if success
 #' @export
 asu_py_use <- function(env_name = "asubuildr", engine = c("auto","conda","virtualenv")) {
   engine <- match.arg(engine)
-  have_conda <- tryCatch(!is.na(reticulate::conda_binary()), error = function(e) FALSE)
-  if (engine == "auto") engine <- if (have_conda) "conda" else "virtualenv"
+  if (engine == "auto") engine <- "conda"
+  if (engine != "conda") stop("asu_py_use supports conda only.", call. = FALSE)
 
-  if (engine == "conda") {
-    reticulate::use_condaenv(env_name, required = TRUE)
-  } else {
-    reticulate::use_virtualenv(env_name, required = TRUE)
-  }
-
+  reticulate::use_condaenv(env_name, required = TRUE)
   asu_py_check()
 }
 
@@ -101,10 +145,9 @@ asu_py_use <- function(env_name = "asubuildr", engine = c("auto","conda","virtua
 #' @return logical TRUE if all good
 #' @export
 asu_py_check <- function(silent = FALSE) {
-  need <- c("ortools", "numpy", "pandas", "networkx")
+  need <- c("ortools","numpy","pandas","networkx")
   ok <- TRUE
 
-  # Check core modules
   for (m in need) {
     if (!reticulate::py_module_available(m)) {
       ok <- FALSE
@@ -114,17 +157,13 @@ asu_py_check <- function(silent = FALSE) {
     }
   }
 
-  # Try importing our packaged solver module
-  # (inst/python/asu_cpsat.py via system.file)
+  # Try importing packaged solver module if present
   py_dir <- system.file("python", package = "ASUbuildR")
   if (nzchar(py_dir) && dir.exists(py_dir)) {
     try({
       reticulate::import_from_path("asu_cpsat", path = py_dir, delay_load = TRUE)
       if (!silent) message("✓ asu_cpsat is importable from: ", py_dir)
     }, silent = silent)
-  } else {
-    ok <- FALSE
-    if (!silent) message("✗ Could not locate packaged python dir (system.file('python', 'ASUbuildR'))")
   }
 
   if (!silent) {
@@ -139,5 +178,5 @@ asu_py_check <- function(silent = FALSE) {
   isTRUE(ok)
 }
 
-# small helper: %||%
+# helper: %||%
 `%||%` <- function(x, y) if (is.null(x) || is.na(x) || identical(x, "")) y else x
