@@ -663,7 +663,8 @@ if (identical(algo_choice, "cpsat")) {
 
     # ---- 4) Write runner.py -------------------------------------------
     shiny::incProgress(0.05, detail = "Preparing Python runner")
-    py_mod_path <- normalizePath(file.path("..","..","inst","python"), winslash="/", mustWork = TRUE)
+    py_mod_path <- normalizePath(system.file("python", package = "ASUbuildR"),
+                                 winslash = "/", mustWork = TRUE)
     runner_code <- sprintf("
 import sys, os, json, math
 try:
