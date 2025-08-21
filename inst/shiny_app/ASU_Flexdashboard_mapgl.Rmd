@@ -88,9 +88,11 @@ if (is_dev_mode) {
 # ── Use virtual environment & import Python module ───────────────────
 
 
-# Use the virtual environment we set up in the preamble
-venv_path <- file.path(rappdirs::user_data_dir("ASUbuildR"), "asu-cpsat-venv")
-reticulate::use_virtualenv(venv_path, required = TRUE)
+# Ensure the Python environment is available
+if (!ASUbuildR::check_asu_python()) {
+  ASUbuildR::setup_asu_python()
+  stopifnot(ASUbuildR::check_asu_python())
+}
 py_config()  # should now show the venv python
 
 # Import your solver module from the package's inst/python
