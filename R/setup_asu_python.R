@@ -5,11 +5,11 @@ asu_venv_path <- function() {
 #' Setup Python Environment for ASUbuildR
 #'
 #' Creates or repairs the Python environment used by ASUbuildR. The function
-#' installs Miniconda if necessary and then attempts to create a conda
-#' environment at ``asu-cpsat-venv`` containing the required Python packages
-#' (``ortools``, ``pandas``, ``numpy``, ``setuptools`` and ``wheel``). If the
-#' conda-based setup fails, the user is advised to install the packages
-#' manually. The final environment location is stored in
+#' ensures Miniconda is available (installing it when necessary) and then
+#' creates a conda environment at ``asu-cpsat-venv`` containing the required
+#' Python packages (``ortools``, ``pandas``, ``numpy``, ``setuptools`` and
+#' ``wheel``). If the automated setup fails, the user is advised to install the
+#' packages manually. The final environment location is stored in
 #' ``options('asu_python_env')`` for later use.
 #'
 #' @param force Recreate the environment even if it already exists.
@@ -26,25 +26,19 @@ setup_asu_python <- function(force = FALSE) {
     unlink(venv_path, recursive = TRUE, force = TRUE)
   }
 
-  # Ensure a Python binary is available --------------------------------------
-  py_bin <- Sys.which("python")
-  if (py_bin == "") py_bin <- Sys.which("python3")
-  if (py_bin == "") {
+  pkgs <- c("ortools", "pandas", "numpy", "setuptools", "wheel")
+
+  # Ensure conda is available -------------------------------------------------
+  conda <- tryCatch(reticulate::conda_binary(), error = function(e) "")
+  if (!nzchar(conda) || force) {
     mc_path <- reticulate::miniconda_path()
     if (!dir.exists(mc_path) || force) {
       message("Installing Miniconda (one-time operation)...")
       tryCatch(reticulate::install_miniconda(force = force),
                error = function(e) stop("Miniconda installation failed: ", e$message))
     }
-    py_bin <- if (.Platform$OS.type == "windows") {
-      file.path(mc_path, "python.exe")
-    } else {
-      file.path(mc_path, "bin", "python")
-    }
+    conda <- reticulate::conda_binary()
   }
-
-  pkgs <- c("ortools", "pandas", "numpy", "setuptools", "wheel")
-  conda <- tryCatch(reticulate::conda_binary(), error = function(e) "")
 
   if (!nzchar(conda)) {
     message("Conda not available. Ensure reticulate can locate conda.")
