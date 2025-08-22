@@ -26,11 +26,13 @@ setup_asu_python <- function(force = FALSE) {
 
   # Determine whether conda is available; if not, install Miniconda
   have_conda <- tryCatch(!is.na(reticulate::conda_binary()), error = function(e) FALSE)
+  just_installed <- FALSE
   if (!have_conda) {
     message("Conda not found. Installing Miniconda...")
     message("This is a one-time installation and may take a few minutes...")
-    reticulate::install_miniconda()
+    reticulate::install_miniconda(update = FALSE)
     have_conda <- TRUE
+    just_installed <- TRUE
     message("Miniconda installed successfully!")
   }
 
@@ -48,6 +50,13 @@ setup_asu_python <- function(force = FALSE) {
 
   # Path to conda executable
   conda_bin <- reticulate::conda_binary()
+
+  # Ensure base conda uses only conda-forge when freshly installed
+  if (just_installed) {
+    system2(conda_bin,
+            c("update", "--name", "base", "conda", "--yes",
+              "--quiet", "--override-channels", "-c", "conda-forge"))
+  }
 
   # Create conda environment if needed (using only the conda-forge channel)
   if (!(env_name %in% envs)) {
