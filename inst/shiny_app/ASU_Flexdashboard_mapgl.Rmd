@@ -1102,17 +1102,34 @@ output$total_unemp2 <- shiny::renderUI({
 
 
 ```{r}
+# In your setup chunk, ensure this is working correctly:
 output$log_overlay <- shiny::renderUI({
   if (!isTRUE(cpsat_running())) return(NULL)
+  
   shiny::absolutePanel(
+    id = "cpsat_log_panel",
     top = 80, right = 20, width = 800, height = "70vh", draggable = TRUE,
-    style = "background:#fff; border:1px solid #ddd; box-shadow:0 2px 8px rgba(0,0,0,.15); overflow-y:auto; padding:10px;",
-    shiny::div(style="font-family:monospace; font-size:12px;",
-      shiny::strong("CP-SAT log"), shiny::br(), shiny::verbatimTextOutput("cpsat_log_tail")
-    )
+    style = "background:#fff; border:1px solid #ddd; box-shadow:0 2px 8px rgba(0,0,0,.15); overflow-y:auto; padding:10px; z-index:1000;",
+    shiny::div(
+      style = "font-family:monospace; font-size:12px; white-space:pre-wrap;",
+      shiny::strong("CP-SAT log"), shiny::br(), 
+      shiny::verbatimTextOutput("cpsat_log_tail", placeholder = FALSE)
+    ),
+    shiny::actionButton("close_log", "Close", class = "btn-sm")
   )
 })
 
+# Add this observer to handle closing the log manually
+shiny::observeEvent(input$close_log, {
+  cpsat_running(FALSE)
+})
+
+# Make sure the log text stays updated
+shiny::observe({
+  cpsat_log_buf()  # Depend on this reactive value
+  # Instead of session$flushReact(), use invalidateLater
+  shiny::invalidateLater(100)  # Check for updates every 100ms
+})
 
 ```
 
