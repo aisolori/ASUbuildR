@@ -878,9 +878,16 @@ shiny::observeEvent(input$th_pass, {
   res <- tract_hunter_finalize(st)
   full_data(res$full_data  )   ; full_data_reset(res$full_data_reset)
   asu_data(res$asu_data    )   ; asu_tracts(res$asu_tracts)
-  asu_summary(res$asu_summary) ; 
+  asu_summary(res$asu_summary) ;
   output$asu <- shiny::renderTable( asu_summary(),digits = 3 )
-  mapgl::maplibre_proxy("initial_map") |> mapgl::clear_layer("basemap")})
+  map_data <- prep_map_data(res$full_data)
+  n_asu <- suppressWarnings(max(map_data$asunum, na.rm = TRUE))
+  n_asu <- ifelse(is.finite(n_asu), n_asu, 0L)
+  pal <- palette_logic(n_asu)
+  mapgl::maplibre_proxy("initial_map") |>
+    mapgl::set_data("basemap", map_data) |>
+    mapgl::set_paint_property("basemap", "fill-color", pal$fill)
+})
   
 
 shiny::observeEvent(input$th_combine, {
@@ -892,10 +899,16 @@ shiny::observeEvent(input$th_combine, {
   res <- tract_hunter_finalize(st)
   full_data(res$full_data  )   ; full_data_reset(res$full_data_reset)
   asu_data(res$asu_data    )   ; asu_tracts(res$asu_tracts)
-  asu_summary(res$asu_summary) ; 
+  asu_summary(res$asu_summary) ;
   output$asu <- shiny::renderTable( asu_summary(),digits = 3 )
-  mapgl::maplibre_proxy("initial_map") |> mapgl::clear_layer("basemap")
-  
+  map_data <- prep_map_data(res$full_data)
+  n_asu <- suppressWarnings(max(map_data$asunum, na.rm = TRUE))
+  n_asu <- ifelse(is.finite(n_asu), n_asu, 0L)
+  pal <- palette_logic(n_asu)
+  mapgl::maplibre_proxy("initial_map") |>
+    mapgl::set_data("basemap", map_data) |>
+    mapgl::set_paint_property("basemap", "fill-color", pal$fill)
+
 })
 
 #-------Total Unemployment Box --------------------------------
@@ -1336,46 +1349,21 @@ refresh_edit_map <- function() {
   data <- map_geom()
   scheme <- calculate_color_scheme(data)
 
+  color_expr <- mapgl::step_expr(
+    column = "asunum",
+    base   = "#E0E0E0",
+    stops  = scheme$colors,
+    values = scheme$breaks,
+    na_color = "#E0E0E0"
+  )
+
   mapgl::maplibre_proxy("edit_map") |>
-    mapgl::clear_layer("basemap") |>
-    mapgl::clear_layer("selected") |>
-    mapgl::clear_layer("highlighted") |>
-    mapgl::add_fill_layer(
-      id = "basemap",
-      source = data,
-      fill_color = mapgl::step_expr(
-        column = "asunum",
-        base   = "#E0E0E0",
-        stops  = scheme$colors,
-        values = scheme$breaks,
-        na_color = "#E0E0E0"
-      ),
-      fill_opacity       = 0.5,
-      fill_outline_color = "black",
-      tooltip = mapgl::concat(
-        "<strong>ASU Number: </strong>", mapgl::get_column("asunum"), "<br>",
-        "<strong>Tract GEOID: </strong>", mapgl::get_column("GEOID"), "<br>",
-        "<strong>Tract Unemployment Rate: </strong>",
-        mapgl::number_format(mapgl::get_column("tract_ASU_urate"), style="decimal", maximum_fraction_digits=2), "%<br>",
-        "<strong>Tract Unemployment: </strong>",
-        mapgl::number_format(mapgl::get_column("tract_ASU_unemp"), style="decimal", maximum_fraction_digits=0), "<br>"
-      )
-    ) |>
-    mapgl::add_line_layer(
-      id          = "selected",
-      source      = data,
-      line_color  = "red",
-      line_width  = 2,
-      line_opacity= 1,
-      filter      = list("==", c("get","GEOID"), "__NONE__")
-    ) |>
-    mapgl::add_fill_layer(
-      id          = "highlighted",
-      source      = data,
-      fill_color  = "black",
-      fill_opacity= 0.8,
-      filter      = list("==", c("get","GEOID"), "__NONE__")
-    ) |>
+    mapgl::set_data("basemap", data) |>
+    mapgl::set_paint_property("basemap", "fill-color", color_expr) |>
+    mapgl::set_data("selected", data) |>
+    mapgl::set_data("highlighted", data) |>
+    mapgl::set_filter("selected", list("==", c("get", "GEOID"), "__NONE__")) |>
+    mapgl::set_filter("highlighted", list("==", c("get", "GEOID"), "__NONE__")) |>
     mapgl::fit_bounds(data, animate = TRUE)
 }
 
@@ -1437,53 +1425,22 @@ shiny::observeEvent(input$load_data, {
   
   # Calculate new color scheme using helper function
   color_scheme <- calculate_color_scheme(loaded_data)
-  
-  # OPTIMIZATION: For data loading, we need to recreate layers but preserve zoom
-  # Store current map state if possible
-  current_zoom <- NULL  # Would need to get from map state if available
-  current_center <- NULL
-  
-  # Update the map layers (necessary when loading completely new data)
+
+  color_expr <- mapgl::step_expr(
+    column = "asunum",
+    base = "#E0E0E0",
+    stops = color_scheme$colors,
+    values = color_scheme$breaks,
+    na_color = "#E0E0E0"
+  )
+
   mapgl::maplibre_proxy("edit_map") |>
-    mapgl::clear_layer("basemap") |>
-    mapgl::clear_layer("highlighted") |>
-    mapgl::clear_layer("selected") |>
-    mapgl::add_fill_layer(
-      id = "basemap",
-      source = loaded_data,
-      fill_color = mapgl::step_expr(
-        column = "asunum",
-        base = "#E0E0E0",
-        stops = color_scheme$colors,
-        values = color_scheme$breaks,
-        na_color = "#E0E0E0"
-      ),
-      fill_opacity = 0.5,
-      fill_outline_color = "black",
-      tooltip = mapgl::concat(
-        "<strong>ASU Number: </strong>", mapgl::get_column("asunum"), "<br>",
-        "<strong>Tract GEOID: </strong>", mapgl::get_column("GEOID"), "<br>",
-        "<strong>Tract Population: </strong>", mapgl::number_format(mapgl::get_column("tract_pop_cur"), style = "decimal", maximum_fraction_digits = 0), "<br>",
-        "<strong>Tract Labor Force: </strong>", mapgl::number_format(mapgl::get_column("tract_ASU_clf"), style = "decimal", maximum_fraction_digits = 0), "<br>",
-        "<strong>Tract Unemployment Rate: </strong>", mapgl::number_format(mapgl::get_column("tract_ASU_urate"), style = "decimal", maximum_fraction_digits = 2), "%<br>",
-        "<strong>Tract Unemployment: </strong>", mapgl::number_format(mapgl::get_column("tract_ASU_unemp"), style = "decimal", maximum_fraction_digits = 0), "<br>"
-      )
-    ) |>
-    mapgl::add_line_layer(
-      id = "selected",
-      source = loaded_data,
-      line_color = "red",
-      line_width = 3,
-      line_opacity = 1,
-      filter = list("==", c("get", "GEOID"), "__NONE__")
-    ) |>
-    mapgl::add_fill_layer(
-      id = "highlighted",
-      source = loaded_data,
-      fill_color = "black",
-      fill_opacity = 0.8,
-      filter = list("==", c("get", "GEOID"), "__NONE__")
-    ) |>
+    mapgl::set_data("basemap", loaded_data) |>
+    mapgl::set_paint_property("basemap", "fill-color", color_expr) |>
+    mapgl::set_data("highlighted", loaded_data) |>
+    mapgl::set_data("selected", loaded_data) |>
+    mapgl::set_filter("highlighted", list("==", c("get", "GEOID"), "__NONE__")) |>
+    mapgl::set_filter("selected", list("==", c("get", "GEOID"), "__NONE__")) |>
     mapgl::fit_bounds(loaded_data, animate = TRUE)
   
   # Clear any existing selections/highlights
