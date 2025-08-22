@@ -32,8 +32,6 @@ importFrom(utils, head, capture.output, write.table, write.csv)
 importFrom(stats, quantile)
 
 ## python functions
-export(asu_py_env_create)
 export(build_asu)
-export(asu_py_use)
 export(setup_asu_python)
 export(check_asu_python)
