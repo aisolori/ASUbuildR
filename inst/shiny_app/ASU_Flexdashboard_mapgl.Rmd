@@ -356,10 +356,9 @@ update_map_with_data <- function(map_id = "edit_map", new_data = NULL) {
 ```
 
 # Data Initialization
-
 ## Controls {data-width="150"}
 
-This screen allows you to import the BLS-provided ASU file, generally named like *NV_asu23.xlsx* which will be the only external data import step necessary. The script will read the file, extract the state and corresponding year, and standardize the column names to avoid annual updates to the script.
+This screen allows you to import the BLS-provided ASU file, generally named like _NV_asu23.xlsx_ which will be the only external data import step necessary. The script will read the file and extract the state. You can specify which year of Census tract boundaries to use below.
 
 If the necessary data is not in columns **A through AB** within the Excel file, this process will not work correctly.
 
@@ -370,8 +369,18 @@ Note: at this time, ASUbuildR assumes a state is using county-based census tract
 ```{r}
 shiny::fileInput("file", "Choose Excel File", accept = c(".xls", ".xlsx"))
 
-shiny::textOutput("selected_state")
+# Add numeric input for tract year
+shiny::numericInput("tract_year_input", 
+                     "Census Tract Year:", 
+                     value = 2023, 
+                     min = 2010, 
+                     max = 2024, 
+                     step = 1)
 
+shiny::helpText("Select the year of Census tract boundaries to use. 
+                 For New England states, 2021 is the last year with NECTA-based tracts.")
+
+shiny::textOutput("selected_state")
 shiny::textOutput("selected_year")
 ```
 
@@ -382,6 +391,7 @@ shiny::tableOutput("data_preview")
 
 shiny::observeEvent(input$file, {
   shiny::req(input$file)
+  
   df <- readxl::read_excel(input$file$datapath, range = "A2:AB25000", col_names = excel_names) |>
     dplyr::filter(!is.na(geoid)) |>
     dplyr::mutate(GEOID = stringr::str_remove(geoid, "14000US")) |>
@@ -394,7 +404,7 @@ shiny::observeEvent(input$file, {
            tract_ASU_clf,
            tract_ASU_emp,
            tract_ASU_unemp,
-           tract_ASU_urate) |> 
+           tract_ASU_urate) |>
     dplyr::mutate(
       tract_pop_cur = as.integer(tract_pop_cur),
       tract_ASU_clf = as.integer(tract_ASU_clf),
@@ -409,23 +419,23 @@ shiny::observeEvent(input$file, {
     unique() |>
     state()
   
-  readxl::read_excel(input$file$datapath, range = "H1:H1", col_names = "year") |>
-    dplyr::pull(year) |>
-    stringr::str_remove("tract_pop") |>
-    tract_year()
-  
   output$data_preview <- shiny::renderTable({
-    head(uploaded_data(),50)
+    head(uploaded_data(), 50)
   })
   
   output$selected_state <- shiny::renderText({
     paste0("Selected FIPS is: ", state())
   })
+})
+
+# Update tract_year reactiveVal when input changes
+shiny::observeEvent(input$tract_year_input, {
+  tract_year(as.character(input$tract_year_input))
   
   output$selected_year <- shiny::renderText({
     paste0("Tract Population Year is: ", tract_year())
   })
-})
+}, ignoreInit = FALSE)
 ```
 
 # Load Initial ASU
@@ -438,20 +448,21 @@ shiny::conditionalPanel(
   condition = "output.is_new_england === true",
   shiny::tagList(
     shiny::hr(style = "margin: 0.8rem 0;"),
-    shiny::h5("New England Year Selection"),
+    shiny::h5("New England Year Override"),
     shiny::radioButtons(
       inputId = "ne_year_choice",
-      label   = "Choose tract year:",
+      label   = "Override tract year for New England:",
       choices = list(
-        "Use detected year (default)" = "detected",
-        "Use 2021 (last NECTA year)"  = "2021"
+        "Use selected year from Data Initialization" = "detected",
+        "Force 2021 (last NECTA year)" = "2021"
       ),
       selected = "detected",
       inline = FALSE
     ),
     shiny::p(
       style = "font-size: 0.9em; color: #666;",
-      "Note: 2021 is the last year NECTA-based tracts were available for New England states."
+      "Note: 2021 is the last year NECTA-based tracts were available for New England states. 
+       You may have already selected 2021 in the Data Initialization tab."
     )
   )
 )
