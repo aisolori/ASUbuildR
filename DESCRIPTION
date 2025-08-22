@@ -30,6 +30,7 @@ Imports:
     stringr,
     sf,
     sfdep,
+    rmapshaper,
     shiny,
     tigris,
     glue,
