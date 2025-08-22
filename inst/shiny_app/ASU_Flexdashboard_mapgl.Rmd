@@ -498,11 +498,14 @@ shiny::conditionalPanel(
   condition = "input.asu_algo === 'mine'",
   shiny::tagList(
     shiny::hr(style = "margin: 0.8rem 0;"),
+    shiny::numericInput("drop_quantile", "Drop Quantile (%)",
+                        value = 10, min = 0, max = 100),
     shiny::div(
       class = "btn-group",           # keep them on one line
       style = "width: 100%;",
       shiny::actionButton("th_pass",    "Run Hunter",     class = "btn-secondary"),
-      shiny::actionButton("th_combine", "Combine Groups",   class = "btn-secondary")
+      shiny::actionButton("th_combine", "Combine Groups",   class = "btn-secondary"),
+      shiny::actionButton("th_dropout", "Drop Quantile",   class = "btn-secondary")
     )
   )
 )
@@ -1074,6 +1077,91 @@ shiny::observeEvent(input$th_combine, {
   
   # Efficient update instead of clearing layers
   update_map_efficiently("initial_map")
+})
+
+shiny::observeEvent(input$th_dropout, {
+  shiny::req(th_state())
+  q <- input$drop_quantile / 100
+  shiny::withProgress(message = "Dropping ASUs…", value = 0, {
+    st <- tract_hunter_dropout(th_state(), q)
+  })
+  th_state(st)
+  res <- tract_hunter_finalize(st)
+  full_data(res$full_data  )   ; full_data_reset(res$full_data_reset)
+  asu_data(res$asu_data    )   ; asu_tracts(res$asu_tracts)
+  asu_summary(res$asu_summary) ; map_data_dbg(res$full_data)
+  output$asu <- shiny::renderTable( asu_summary(),digits = 3 )
+  mapgl::maplibre_proxy("initial_map") |> mapgl::clear_layer("basemap")
+  output$initial_map <- mapgl::renderMaplibre({
+    shiny::req(full_data())
+    map_data <- full_data()
+    map_data <- map_data |>
+      sf::st_make_valid() |>
+      sf::st_zm(what = "ZM", drop = TRUE) |>
+      dplyr::filter(!sf::st_is_empty(geometry)) |>
+      dplyr::mutate(geom_type = sf::st_geometry_type(geometry)) |>
+      dplyr::filter(geom_type %in% c("POLYGON", "MULTIPOLYGON")) |>
+      dplyr::select(-geom_type)
+    if (nrow(map_data) == 0) {
+      return(
+        mapgl::maplibre(style = mapgl::carto_style("positron")) |>
+        mapgl::add_control("No valid polygon geometry to display.", "top-left")
+      )
+    }
+    map_data <- map_data |>
+      dplyr::mutate(asunum = dplyr::na_if(asunum, 0L))
+    n_asu <- max(map_data$asunum, na.rm = TRUE)
+    n_asu <- ifelse(is.finite(n_asu), n_asu, 0L)
+
+    palette_logic <- function(n_asu) {
+  if (n_asu == 0) {
+    list(fill = "#808080",
+         legend_vals = "(none)",
+         legend_cols = "#808080")
+
+  } else if (n_asu == 1) {
+    list(
+      fill  = mapgl::step_expr(column="asunum",
+                        base="#808080",
+                        stops="#7FC97F",
+                        values=1,
+                        na_color="#444444"),
+      legend_vals = 1,
+      legend_cols = "#7FC97F"
+    )
+
+  } else {
+    n_cat <- min(max(n_asu, 3L), 8L)          # 3-to-8 distinct hues
+    pal   <- RColorBrewer::brewer.pal(n_cat, "Accent")
+
+    # make colours exactly as long as the value vector
+    legend_cols <- rep_len(pal, n_asu)
+
+    breaks <- seq(1 + n_asu / n_cat, n_asu, length.out = n_cat - 1)
+
+    list(
+      fill = mapgl::step_expr(column   = "asunum",
+                       base     = pal[1],
+                       stops    = pal[-1],
+                       values   = breaks,
+                       na_color = "#444444"),
+      legend_vals = seq_len(n_asu),
+      legend_cols = legend_cols
+    )
+  }
+}
+
+    pal <- palette_logic(n_asu)
+    mapgl::maplibre(style = mapgl::carto_style("positron")) |>
+      mapgl::fit_bounds(map_data, animate = FALSE) |>
+      mapgl::add_fill_layer(
+        id                 = "basemap",
+        source             = map_data,
+        fill_color         = pal$fill,
+        fill_opacity       = 0.5,
+        fill_outline_color = "black"
+      )
+  })
 })
 
 #-------Total Unemployment Box --------------------------------
