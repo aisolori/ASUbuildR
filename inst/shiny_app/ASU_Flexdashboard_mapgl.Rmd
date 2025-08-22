@@ -140,6 +140,14 @@ selected_tracts <- shiny::reactiveVal(NULL)
 edit_table <- shiny::reactiveVal(NULL)
 edit_summary <- shiny::reactiveVal(NULL)
 current_selection <- shiny::reactiveVal(NULL)
+
+
+# Prevent reactivity issues with empty initial values
+map_update_debounced <- shiny::debounce(shiny::reactive({
+  list(full_data(), selected_tracts(), highlighted_tracts())
+}), 250) # 250ms delay
+
+
 # New England Optional year selection logic
 output$is_new_england <- shiny::reactive({
   if (is.null(state())) {
@@ -186,9 +194,14 @@ shiny::outputOptions(output, "is_new_england", suspendWhenHidden = FALSE)
 th_state <- shiny::reactiveVal(NULL)
 th_tract_list <- shiny::reactiveVal(NULL)
 th_bls_df <- shiny::reactiveVal(NULL)
+
 prep_map_data <- function(map_data) {
+  # Cache the result to avoid repeated processing
+  if (nrow(map_data) == 0) return(map_data)
+  
   map_data |>
     sf::st_make_valid() |>
+    sf::st_simplify(dTolerance = .001, preserveTopology = TRUE) |>  # Simplify geometry
     sf::st_zm(what = "ZM", drop = TRUE) |>
     dplyr::filter(!sf::st_is_empty(geometry)) |>
     dplyr::mutate(geom_type = sf::st_geometry_type(geometry)) |>
@@ -196,10 +209,12 @@ prep_map_data <- function(map_data) {
     dplyr::select(-geom_type)
 }
 
+# Add caching to map_geom
 map_geom <- shiny::reactive({
   shiny::req(full_data())
   prep_map_data(full_data())
-})
+}) |>
+  shiny::bindCache(full_data()) # Cache based on full_data changes
 
 highlighted_tracts <- shiny::reactiveVal(character(0))
 
@@ -232,6 +247,112 @@ excel_names <- c("record",
                  "tract_ASU_emp",
                  "tract_ASU_unemp",
                  "tract_ASU_urate")
+
+#-------- Map Rendering Helpers --------------------------------
+# Helper function to calculate color scheme
+calculate_color_scheme <- function(data) {
+  number_asus <- max(data$asunum, na.rm = TRUE)
+  number_categories <- min(c(number_asus, 8))
+  
+  if (number_categories == 1) {
+    asu_breaks <- 1
+    actual_categories <- 1
+    brewer_pal <- "#7FC97F"
+  } else {
+    asu_breaks <- seq(from = 1, to = number_asus, length.out = number_categories)
+    actual_categories <- max(3, number_categories)
+    full_brewer_pal <- RColorBrewer::brewer.pal(actual_categories, "Accent")
+    brewer_pal <- full_brewer_pal[1:number_categories]
+  }
+  
+  return(list(breaks = asu_breaks, colors = brewer_pal))
+}
+
+
+
+
+update_map_efficiently <- function(map_id = "edit_map") {
+  data <- map_geom()
+  if (is.null(data) || nrow(data) == 0) return()
+  
+  # Update colors without recreating layers
+  color_scheme <- calculate_color_scheme(data)
+  
+  mapgl::maplibre_proxy(map_id) |>
+    mapgl::set_paint_property("basemap", "fill-color",
+      mapgl::step_expr(
+        column = "asunum",
+        base = "#E0E0E0",
+        stops = color_scheme$colors,
+        values = color_scheme$breaks,
+        na_color = "#E0E0E0"
+      )
+    )
+}
+
+# Enhanced version that can also update the data source if needed
+update_map_with_data <- function(map_id = "edit_map", new_data = NULL) {
+  data <- if (is.null(new_data)) map_geom() else new_data
+  if (is.null(data) || nrow(data) == 0) return()
+  
+  color_scheme <- calculate_color_scheme(data)
+  
+  # If new data is provided, we need to update the source
+  if (!is.null(new_data)) {
+    mapgl::maplibre_proxy(map_id) |>
+      mapgl::clear_layer("basemap") |>
+      mapgl::clear_layer("selected") |>
+      mapgl::clear_layer("highlighted") |>
+      mapgl::add_fill_layer(
+        id = "basemap",
+        source = data,
+        fill_color = mapgl::step_expr(
+          column = "asunum",
+          base = "#E0E0E0",
+          stops = color_scheme$colors,
+          values = color_scheme$breaks,
+          na_color = "#E0E0E0"
+        ),
+        fill_opacity = 0.5,
+        fill_outline_color = "black",
+        tooltip = mapgl::concat(
+          "<strong>ASU Number: </strong>", mapgl::get_column("asunum"), "<br>",
+          "<strong>Tract GEOID: </strong>", mapgl::get_column("GEOID"), "<br>",
+          "<strong>Tract Population: </strong>", mapgl::number_format(mapgl::get_column("tract_pop_cur"), style = "decimal", maximum_fraction_digits = 0), "<br>",
+          "<strong>Tract Labor Force: </strong>", mapgl::number_format(mapgl::get_column("tract_ASU_clf"), style = "decimal", maximum_fraction_digits = 0), "<br>",
+          "<strong>Tract Unemployment Rate: </strong>", mapgl::number_format(mapgl::get_column("tract_ASU_urate"), style = "decimal", maximum_fraction_digits = 2), "%<br>",
+          "<strong>Tract Unemployment: </strong>", mapgl::number_format(mapgl::get_column("tract_ASU_unemp"), style = "decimal", maximum_fraction_digits = 0), "<br>"
+        )
+      ) |>
+      mapgl::add_line_layer(
+        id = "selected",
+        source = data,
+        line_color = "red",
+        line_width = 2,
+        line_opacity = 1,
+        filter = list("==", c("get", "GEOID"), "__NONE__")
+      ) |>
+      mapgl::add_fill_layer(
+        id = "highlighted",
+        source = data,
+        fill_color = "black",
+        fill_opacity = 0.8,
+        filter = list("==", c("get", "GEOID"), "__NONE__")
+      )
+  } else {
+    # Just update the paint property
+    mapgl::maplibre_proxy(map_id) |>
+      mapgl::set_paint_property("basemap", "fill-color",
+        mapgl::step_expr(
+          column = "asunum",
+          base = "#E0E0E0",
+          stops = color_scheme$colors,
+          values = color_scheme$breaks,
+          na_color = "#E0E0E0"
+        )
+      )
+  }
+}
 ```
 
 # Data Initialization
@@ -381,8 +502,8 @@ shiny::conditionalPanel(
     shiny::numericInput("cpsat_tau",       "UR threshold (τ)",          value = 0.0645, min = 0, max = 1, step = 0.0001),
     shiny::numericInput("cpsat_pop",       "Population threshold",      value = 10000,  min = 0, step = 100),
     shiny::numericInput("cpsat_max",       "Max ASUs",                  value = 30,     min = 1, step = 1),
-    shiny::numericInput("cpsat_timelimit", "Time limit (sec) per window", value = 1200, min = 1, step = 10),
-    shiny::numericInput("cpsat_workers",   "Parallel workers",          value = max(1, parallel::detectCores()-5), min = 1, step = 1),
+    shiny::numericInput("cpsat_timelimit", "Time limit (sec) per window", value = 18000, min = 0, step = 60),
+    shiny::numericInput("cpsat_workers",   "Parallel workers (Defaults to Number of Dectected Cores - 2)",          value = max(1, parallel::detectCores()-2), min = 1, step = 1),
     shiny::numericInput("cpsat_relgap",    "Relative gap (optional)",   value = NA,     min = 0, step = 0.0001)
   )
 )
@@ -810,7 +931,7 @@ print('[runner] OK', flush=True)
                   Population          = sum(tract_pop_cur,   na.rm = TRUE),
                   `Labor Force`       = sum(tract_ASU_clf,   na.rm = TRUE),
                   Unemployment        = sum(tract_ASU_unemp, na.rm = TRUE),
-                  `Unemployment Rate` = round(Unemployment/`Labor Force`*100, 5),
+                  `Unemployment Rate` = round((Unemployment/`Labor Force`)*100, 5),
                   .groups = "drop"
                 )
             )
@@ -876,12 +997,16 @@ shiny::observeEvent(input$th_pass, {
   })
   th_state(st)
   res <- tract_hunter_finalize(st)
-  full_data(res$full_data  )   ; full_data_reset(res$full_data_reset)
-  asu_data(res$asu_data    )   ; asu_tracts(res$asu_tracts)
-  asu_summary(res$asu_summary) ; 
-  output$asu <- shiny::renderTable( asu_summary(),digits = 3 )
-  mapgl::maplibre_proxy("initial_map") |> mapgl::clear_layer("basemap")})
+  full_data(res$full_data)
+  full_data_reset(res$full_data_reset)
+  asu_data(res$asu_data)
+  asu_tracts(res$asu_tracts)
+  asu_summary(res$asu_summary)
+  output$asu <- shiny::renderTable(asu_summary(), digits = 3)
   
+  # Efficient update instead of clearing layers
+  update_map_efficiently("initial_map")
+})
 
 shiny::observeEvent(input$th_combine, {
   shiny::req(th_state())
@@ -890,12 +1015,15 @@ shiny::observeEvent(input$th_combine, {
   })
   th_state(st)
   res <- tract_hunter_finalize(st)
-  full_data(res$full_data  )   ; full_data_reset(res$full_data_reset)
-  asu_data(res$asu_data    )   ; asu_tracts(res$asu_tracts)
-  asu_summary(res$asu_summary) ; 
-  output$asu <- shiny::renderTable( asu_summary(),digits = 3 )
-  mapgl::maplibre_proxy("initial_map") |> mapgl::clear_layer("basemap")
+  full_data(res$full_data)
+  full_data_reset(res$full_data_reset)
+  asu_data(res$asu_data)
+  asu_tracts(res$asu_tracts)
+  asu_summary(res$asu_summary)
+  output$asu <- shiny::renderTable(asu_summary(), digits = 3)
   
+  # Efficient update instead of clearing layers
+  update_map_efficiently("initial_map")
 })
 
 #-------Total Unemployment Box --------------------------------
@@ -977,6 +1105,22 @@ output$initial_map <- mapgl::renderMaplibre({
     )
 })
 ```
+
+```{r}
+# Add debounced reactive for map updates
+map_update_trigger <- shiny::debounce(shiny::reactive({
+  list(full_data(), input$update, input$th_pass, input$th_combine)
+}), 200)
+
+# Observer for debounced updates
+shiny::observeEvent(map_update_trigger(), {
+  if (!is.null(full_data()) && nrow(full_data()) > 0) {
+    update_map_efficiently("initial_map")
+    update_map_efficiently("edit_map")
+  }
+}, ignoreInit = TRUE)
+```
+
 
 ## Map {data-width="800"}
 ```{r}
@@ -1270,29 +1414,11 @@ shiny::observeEvent(list(input$clear_percentile, input$select_asunum), {
 }, ignoreInit = TRUE)
 
 
-# Helper function to calculate color scheme
-calculate_color_scheme <- function(data) {
-  number_asus <- max(data$asunum, na.rm = TRUE)
-  number_categories <- min(c(number_asus, 8))
-  
-  if (number_categories == 1) {
-    asu_breaks <- 1
-    actual_categories <- 1
-    brewer_pal <- "#7FC97F"
-  } else {
-    asu_breaks <- seq(from = 1, to = number_asus, length.out = number_categories)
-    actual_categories <- max(3, number_categories)
-    full_brewer_pal <- RColorBrewer::brewer.pal(actual_categories, "Accent")
-    brewer_pal <- full_brewer_pal[1:number_categories]
-  }
-  
-  return(list(breaks = asu_breaks, colors = brewer_pal))
-}
+
 
 # Update with dynamic color changes
 shiny::observeEvent(input$update, {
   shiny::req(selected_tracts(), full_data())
-  
   old_data <- full_data()
   new_asu <- as.numeric(input$new_asu)
   
@@ -1304,27 +1430,12 @@ shiny::observeEvent(input$update, {
         TRUE ~ asunum
       )
     )
-  
   full_data(updated_data)
   
-  # Calculate new color scheme
-  color_scheme <- calculate_color_scheme(updated_data)
-  
-  # Update the fill color dynamically using set_paint_property
-  new_color_expr <- mapgl::step_expr(
-    column = "asunum",
-    base = "#E0E0E0",  # Grey for asunum == 0
-    stops = color_scheme$colors,
-    values = color_scheme$breaks,
-    na_color = "#E0E0E0"
-  )
-  
-  # Update the basemap colors without redrawing
-  mapgl::maplibre_proxy("edit_map") |>
-    mapgl::set_paint_property("basemap", "fill-color", new_color_expr)
+  # Use the efficient update function
+  update_map_efficiently("edit_map")
   
   selected_tracts(NULL)
-  
   # Clear selection with set_filter
   mapgl::maplibre_proxy("edit_map") |>
     mapgl::set_filter("selected", list("==", c("get", "GEOID"), "__NONE__"))
@@ -1334,66 +1445,23 @@ shiny::observeEvent(input$update, {
 refresh_edit_map <- function() {
   shiny::req(map_geom())
   data <- map_geom()
-  scheme <- calculate_color_scheme(data)
-
-  mapgl::maplibre_proxy("edit_map") |>
-    mapgl::clear_layer("basemap") |>
-    mapgl::clear_layer("selected") |>
-    mapgl::clear_layer("highlighted") |>
-    mapgl::add_fill_layer(
-      id = "basemap",
-      source = data,
-      fill_color = mapgl::step_expr(
-        column = "asunum",
-        base   = "#E0E0E0",
-        stops  = scheme$colors,
-        values = scheme$breaks,
-        na_color = "#E0E0E0"
-      ),
-      fill_opacity       = 0.5,
-      fill_outline_color = "black",
-      tooltip = mapgl::concat(
-        "<strong>ASU Number: </strong>", mapgl::get_column("asunum"), "<br>",
-        "<strong>Tract GEOID: </strong>", mapgl::get_column("GEOID"), "<br>",
-        "<strong>Tract Unemployment Rate: </strong>",
-        mapgl::number_format(mapgl::get_column("tract_ASU_urate"), style="decimal", maximum_fraction_digits=2), "%<br>",
-        "<strong>Tract Unemployment: </strong>",
-        mapgl::number_format(mapgl::get_column("tract_ASU_unemp"), style="decimal", maximum_fraction_digits=0), "<br>"
-      )
-    ) |>
-    mapgl::add_line_layer(
-      id          = "selected",
-      source      = data,
-      line_color  = "red",
-      line_width  = 2,
-      line_opacity= 1,
-      filter      = list("==", c("get","GEOID"), "__NONE__")
-    ) |>
-    mapgl::add_fill_layer(
-      id          = "highlighted",
-      source      = data,
-      fill_color  = "black",
-      fill_opacity= 0.8,
-      filter      = list("==", c("get","GEOID"), "__NONE__")
-    ) |>
+  
+  # Use the efficient update function that handles data changes
+  update_map_with_data("edit_map", data) |>
     mapgl::fit_bounds(data, animate = TRUE)
 }
 
 
 shiny::observeEvent(input$reset, {
   shiny::req(full_data_reset())
-
-  full_data(full_data_reset())     # restore the snapshot
-
-  # clear selection/highlights + UI
+  full_data(full_data_reset())
   selected_tracts(NULL)
   highlighted_tracts(character(0))
   shiny::updateSelectInput(session, "select_asunum", selected = "None")
-
-  # actually refresh the map (was calling an undefined initial_map_data())
+  
+  # Use the efficient refresh function
   refresh_edit_map()
 })
-
 
 # OPTIMIZATION 8: Optimized data loading observer
 # Observer for loading the data
@@ -1435,55 +1503,8 @@ shiny::observeEvent(input$load_data, {
     easyClose = TRUE
   ))
   
-  # Calculate new color scheme using helper function
-  color_scheme <- calculate_color_scheme(loaded_data)
-  
-  # OPTIMIZATION: For data loading, we need to recreate layers but preserve zoom
-  # Store current map state if possible
-  current_zoom <- NULL  # Would need to get from map state if available
-  current_center <- NULL
-  
-  # Update the map layers (necessary when loading completely new data)
-  mapgl::maplibre_proxy("edit_map") |>
-    mapgl::clear_layer("basemap") |>
-    mapgl::clear_layer("highlighted") |>
-    mapgl::clear_layer("selected") |>
-    mapgl::add_fill_layer(
-      id = "basemap",
-      source = loaded_data,
-      fill_color = mapgl::step_expr(
-        column = "asunum",
-        base = "#E0E0E0",
-        stops = color_scheme$colors,
-        values = color_scheme$breaks,
-        na_color = "#E0E0E0"
-      ),
-      fill_opacity = 0.5,
-      fill_outline_color = "black",
-      tooltip = mapgl::concat(
-        "<strong>ASU Number: </strong>", mapgl::get_column("asunum"), "<br>",
-        "<strong>Tract GEOID: </strong>", mapgl::get_column("GEOID"), "<br>",
-        "<strong>Tract Population: </strong>", mapgl::number_format(mapgl::get_column("tract_pop_cur"), style = "decimal", maximum_fraction_digits = 0), "<br>",
-        "<strong>Tract Labor Force: </strong>", mapgl::number_format(mapgl::get_column("tract_ASU_clf"), style = "decimal", maximum_fraction_digits = 0), "<br>",
-        "<strong>Tract Unemployment Rate: </strong>", mapgl::number_format(mapgl::get_column("tract_ASU_urate"), style = "decimal", maximum_fraction_digits = 2), "%<br>",
-        "<strong>Tract Unemployment: </strong>", mapgl::number_format(mapgl::get_column("tract_ASU_unemp"), style = "decimal", maximum_fraction_digits = 0), "<br>"
-      )
-    ) |>
-    mapgl::add_line_layer(
-      id = "selected",
-      source = loaded_data,
-      line_color = "red",
-      line_width = 3,
-      line_opacity = 1,
-      filter = list("==", c("get", "GEOID"), "__NONE__")
-    ) |>
-    mapgl::add_fill_layer(
-      id = "highlighted",
-      source = loaded_data,
-      fill_color = "black",
-      fill_opacity = 0.8,
-      filter = list("==", c("get", "GEOID"), "__NONE__")
-    ) |>
+  # Use the efficient update function for new data
+  update_map_with_data("edit_map", loaded_data) |>
     mapgl::fit_bounds(loaded_data, animate = TRUE)
   
   # Clear any existing selections/highlights
@@ -1795,7 +1816,7 @@ shiny::observeEvent(input$run_asu_summary, {
       Population = sum(tract_pop_cur, na.rm = TRUE),
       `Labor Force` = sum(tract_ASU_clf, na.rm = TRUE),
       Unemployment = sum(tract_ASU_unemp, na.rm = TRUE),
-      `Unemployment Rate` = round(Unemployment/`Labor Force`*100, 5)
+      `Unemployment Rate` = round((Unemployment/`Labor Force`)*100, 5)
     ) |>
     dplyr::ungroup() |>
     dplyr::mutate(
