@@ -130,6 +130,7 @@ options(shiny.maxRequestSize = 50 * 1024^2)  # Set to 50MB or your desired limit
 uploaded_data <- shiny::reactiveVal(NULL)
 state <- shiny::reactiveVal(NULL)
 tract_year <- shiny::reactiveVal(NULL)
+tigris_year <- shiny::reactiveVal(NULL)
 tract_data <- shiny::reactiveVal(NULL)
 asu_data <- shiny::reactiveVal(NULL)
 asu_tracts <- shiny::reactiveVal(NULL)
@@ -356,30 +357,34 @@ update_map_with_data <- function(map_id = "edit_map", new_data = NULL) {
 ```
 
 # Data Initialization
-
 ## Controls {data-width="150"}
+This screen allows you to import the BLS-provided ASU file, generally named like _NV_asu23.xlsx_ which will be the only external data import step necessary. The script will read the file, extract the state, and determine the population year from the Excel file.
 
-This screen allows you to import the BLS-provided ASU file, generally named like *NV_asu23.xlsx* which will be the only external data import step necessary. The script will read the file, extract the state and corresponding year, and standardize the column names to avoid annual updates to the script.
+You can specify which year of Census tract boundaries to use with the selector below. This is important because Census tract boundaries may change between years, and you'll want to use the appropriate year that matches the GEOIDs in your BLS file.
 
 If the necessary data is not in columns **A through AB** within the Excel file, this process will not work correctly.
-
-Once the file is loaded, a preview of the data will appear on the right, the state and year will display below, and the analyst may proceed to the next tab (Load Initial ASU).
-
-Note: at this time, ASUbuildR assumes a state is using county-based census tracts.  If a state uses another geography such as NECTAs as the basis for its ASU tract file, this process will require some modification.
-
+Once the file is loaded, a preview of the data will appear on the right, the state and year information will display below, and the analyst may proceed to the next tab (Load Initial ASU).
+Note: at this time, ASUbuildR assumes a state is using county-based census tracts. If a state uses another geography such as NECTAs as the basis for its ASU tract file, this process will require some modification.
 ```{r}
 shiny::fileInput("file", "Choose Excel File", accept = c(".xls", ".xlsx"))
-
+# Add numeric input for tract year
+shiny::numericInput("tract_year_input",
+                     "Census Tract Year:",
+                     value = 2023,
+                     min = 2010,
+                     max = 2024,
+                     step = 1)
+shiny::helpText("Select the year of Census tract boundaries to use.
+                 For New England states, 2021 is the last year with NECTA-based tracts.")
 shiny::textOutput("selected_state")
-
-shiny::textOutput("selected_year")
+shiny::textOutput("tract_pop_year")
+shiny::textOutput("selected_tract_year")
 ```
 
 ## Output {data-width="850"}
 
 ```{r}
 shiny::tableOutput("data_preview")
-
 shiny::observeEvent(input$file, {
   shiny::req(input$file)
   df <- readxl::read_excel(input$file$datapath, range = "A2:AB25000", col_names = excel_names) |>
@@ -394,38 +399,45 @@ shiny::observeEvent(input$file, {
            tract_ASU_clf,
            tract_ASU_emp,
            tract_ASU_unemp,
-           tract_ASU_urate) |> 
+           tract_ASU_urate) |>
     dplyr::mutate(
       tract_pop_cur = as.integer(tract_pop_cur),
       tract_ASU_clf = as.integer(tract_ASU_clf),
       tract_ASU_emp = as.integer(tract_ASU_emp),
       tract_ASU_unemp = as.integer(tract_ASU_unemp)
     )
-  
   uploaded_data(df)
-  
   uploaded_data() |>
     dplyr::pull(st_fips) |>
     unique() |>
     state()
   
+  # Get population year from the Excel file header
   readxl::read_excel(input$file$datapath, range = "H1:H1", col_names = "year") |>
     dplyr::pull(year) |>
     stringr::str_remove("tract_pop") |>
     tract_year()
   
   output$data_preview <- shiny::renderTable({
-    head(uploaded_data(),50)
+    head(uploaded_data(), 50)
   })
   
   output$selected_state <- shiny::renderText({
     paste0("Selected FIPS is: ", state())
   })
   
-  output$selected_year <- shiny::renderText({
-    paste0("Tract Population Year is: ", tract_year())
+  output$tract_pop_year <- shiny::renderText({
+    paste0("Population year (detected from Excel): ", tract_year())
   })
 })
+
+# Update tigris_year reactiveVal when input changes
+shiny::observeEvent(input$tract_year_input, {
+  tigris_year(as.character(input$tract_year_input))
+  output$selected_tract_year <- shiny::renderText({
+    paste0("Census tract boundary year (user selected): ", tigris_year())
+  })
+}, ignoreInit = FALSE)
 ```
 
 # Load Initial ASU
@@ -438,20 +450,21 @@ shiny::conditionalPanel(
   condition = "output.is_new_england === true",
   shiny::tagList(
     shiny::hr(style = "margin: 0.8rem 0;"),
-    shiny::h5("New England Year Selection"),
+    shiny::h5("New England Year Override"),
     shiny::radioButtons(
       inputId = "ne_year_choice",
-      label   = "Choose tract year:",
+      label   = "Override tract year for New England:",
       choices = list(
-        "Use detected year (default)" = "detected",
-        "Use 2021 (last NECTA year)"  = "2021"
+        "Use selected year from Data Initialization" = "detected",
+        "Force 2021 (last NECTA year)" = "2021"
       ),
       selected = "detected",
       inline = FALSE
     ),
     shiny::p(
       style = "font-size: 0.9em; color: #666;",
-      "Note: 2021 is the last year NECTA-based tracts were available for New England states."
+      "Note: 2021 is the last year NECTA-based tracts were available for New England states. 
+       You may have already selected 2021 in the Data Initialization tab."
     )
   )
 )
@@ -649,10 +662,10 @@ palette_logic <- function(n_asu) {
 
 shiny::observeEvent(input$process, {
   ## 0) Basic checks ------------------------------------------------------
-  shiny::req(uploaded_data(), state(), tract_year())
+  shiny::req(uploaded_data(), state(), tigris_year())
 
   # Determine year (NE override)
-  selected_year <- tract_year()
+  selected_year <- tigris_year()
   state_val <- state()
   if (!is.null(state_val) && length(state_val) > 0) {
     new_england_fips <- c("09","23","25","33","44","50")
@@ -690,34 +703,28 @@ shiny::observeEvent(input$process, {
     # --- CP-SAT branch (drop-in replacement) -------------------------------
 if (identical(algo_choice, "cpsat")) {
   session <- shiny::getDefaultReactiveDomain()
-
   shiny::withProgress(message = "Running OR-Tools CP-SAT…", value = 0, {
     cpsat_running(TRUE)
     append_cpsat_log("[run] Button clicked (CP-SAT).")
-
     # ---- 1) Preconditions & parameters --------------------------------
     shiny::req(uploaded_data(), state(), tract_year())
     sel_year <- selected_year              # from your earlier NE override logic
     st_fips  <- state()
-
     tau      <- if (is.null(input$cpsat_tau))       0.0645 else as.numeric(input$cpsat_tau)
     pop_thr  <- if (is.null(input$cpsat_pop))       10000  else as.integer(input$cpsat_pop)
     max_asus <- if (is.null(input$cpsat_max))       30     else as.integer(input$cpsat_max)
     tlimit   <- if (is.null(input$cpsat_timelimit)) 1200   else as.integer(input$cpsat_timelimit)
     workers  <- if (is.null(input$cpsat_workers))   max(1L, parallel::detectCores()-5L) else as.integer(input$cpsat_workers)
     rel_gap  <- if (!is.null(input$cpsat_relgap) && !is.na(input$cpsat_relgap)) as.numeric(input$cpsat_relgap) else NA_real_
-
     append_cpsat_log(sprintf("[run] params: tau=%.6f pop=%d max=%d limit=%ds workers=%d rel_gap=%s",
                              tau, pop_thr, max_asus, tlimit, workers,
                              if (is.na(rel_gap)) "None" else as.character(rel_gap)))
-
     # ---- 2) Build tracts + neighbors ----------------------------------
     shiny::incProgress(0.15, detail = "Downloading tracts & building neighbors")
     append_cpsat_log(sprintf("[NB] Downloading TIGER tracts for state %s (year=%s)…", st_fips, sel_year))
-
     tr_sf <- tigris::tracts(state = st_fips, year = sel_year, progress_bar = FALSE) |>
       dplyr::mutate(continuous = sfdep::st_contiguity(geometry))
-
+    
     # Join with uploaded BLS
     cols_needed <- c("GEOID","tract_ASU_unemp","tract_ASU_emp","tract_pop_cur","tract_ASU_clf","tract_ASU_urate")
     miss <- setdiff(cols_needed, names(uploaded_data()))
@@ -728,13 +735,66 @@ if (identical(algo_choice, "cpsat")) {
       cpsat_running(FALSE)
       return(invisible(NULL))
     }
-
+    
     merged_sf <- tr_sf |>
       dplyr::left_join(uploaded_data(), by="GEOID")
-
+    
+    # Apply island fix
+    append_cpsat_log("[NB] Applying island fix to connect disconnected components")
+    
+    # Convert list column to regular lists
+    merged_sf$continuous <- lapply(merged_sf$continuous, function(x) {
+      # If it's scalar 0, replace with integer(0)
+      if (length(x) == 1 && x == 0) return(integer(0))
+      as.integer(x)
+    })
+    
+    # Use igraph to identify components
+    nb <- merged_sf$continuous
+    g <- igraph::graph_from_adj_list(nb)
+    comps <- igraph::components(g)
+    main_component_id <- which.max(comps$csize)
+    main_indices <- which(comps$membership == main_component_id)
+    island_indices <- which(comps$membership != main_component_id)
+    
+    # If there are islands, connect them to the mainland
+    if (length(island_indices) > 0) {
+      append_cpsat_log(sprintf("[NB] Found %d tracts in islands, connecting to mainland", length(island_indices)))
+      
+      coords <- data.frame(
+        INTPTLAT = as.numeric(merged_sf$INTPTLAT),
+        INTPTLON = as.numeric(merged_sf$INTPTLON)
+      )
+      
+      island_component_ids <- setdiff(unique(comps$membership), main_component_id)
+      for (island_id in island_component_ids) {
+        island_members <- which(comps$membership == island_id)
+        # For all members of this island component, get distances to all in main
+        combis <- expand.grid(island = island_members, main = main_indices)
+        combis$dist <- sqrt(
+          (coords$INTPTLAT[combis$island] - coords$INTPTLAT[combis$main])^2 +
+          (coords$INTPTLON[combis$island] - coords$INTPTLON[combis$main])^2
+        )
+        closest <- combis[which.min(combis$dist), ]
+        g <- igraph::add_edges(g, c(closest$island, closest$main))
+        
+        # Update the neighborhood lists with the new connection
+        nb[[closest$island]] <- c(nb[[closest$island]], closest$main)
+        nb[[closest$main]] <- c(nb[[closest$main]], closest$island)
+      }
+      
+      append_cpsat_log("[NB] Island fix complete - all tracts now connected")
+    } else {
+      append_cpsat_log("[NB] No islands detected - all tracts already connected")
+    }
+    
+    # Update merged_sf with the fixed neighborhood structure
+    merged_sf$continuous <- nb
+    
     merged_df <- merged_sf |> sf::st_drop_geometry()
     append_cpsat_log(sprintf("[NB] Tracts kept: %d (after join)", nrow(merged_df)))
-
+    
+    # Continue with the existing code...
     # Dataframe for Python
     df_py <- merged_df |>
       dplyr::transmute(
@@ -743,18 +803,8 @@ if (identical(algo_choice, "cpsat")) {
         tract_ASU_emp   = as.integer(tract_ASU_emp),
         tract_pop2024   = as.integer(tract_pop_cur)
       )
-
-    if (anyNA(df_py$tract_ASU_unemp) || anyNA(df_py$tract_ASU_emp) || anyNA(df_py$tract_pop2024)) {
-      shiny::showModal(shiny::modalDialog(
-        title="Input problem",
-        "NA found after integer coercion (unemp/emp/pop). Fix the input file.",
-        easyClose=TRUE
-      ))
-      cpsat_running(FALSE)
-      return(invisible(NULL))
-    }
-
-    # 0-based neighbor lists
+    
+    # Use the island-fixed neighborhood lists for the Python solver
     nb_lists <- lapply(merged_sf$continuous, function(iv) {
       if (length(iv) == 0) list() else as.list(as.integer(iv) - 1L)
     })
@@ -1055,7 +1105,7 @@ output$total_unemp2 <- shiny::renderUI({
 output$log_overlay <- shiny::renderUI({
   if (!isTRUE(cpsat_running())) return(NULL)
   shiny::absolutePanel(
-    top = 80, right = 20, width = 600, height = "70vh", draggable = TRUE,
+    top = 80, right = 20, width = 800, height = "70vh", draggable = TRUE,
     style = "background:#fff; border:1px solid #ddd; box-shadow:0 2px 8px rgba(0,0,0,.15); overflow-y:auto; padding:10px;",
     shiny::div(style="font-family:monospace; font-size:12px;",
       shiny::strong("CP-SAT log"), shiny::br(), shiny::verbatimTextOutput("cpsat_log_tail")
