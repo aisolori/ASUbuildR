@@ -885,8 +885,8 @@ shiny::observeEvent(input$th_pass, {
   n_asu <- ifelse(is.finite(n_asu), n_asu, 0L)
   pal <- palette_logic(n_asu)
   mapgl::maplibre_proxy("initial_map") |>
-    mapgl::set_data("basemap", map_data) |>
-    mapgl::set_paint_property("basemap", "fill-color", pal$fill)
+    mapgl:::set_data("basemap", map_data) |>
+    mapgl:::set_paint_property("basemap", "fill-color", pal$fill)
 })
   
 
@@ -906,8 +906,8 @@ shiny::observeEvent(input$th_combine, {
   n_asu <- ifelse(is.finite(n_asu), n_asu, 0L)
   pal <- palette_logic(n_asu)
   mapgl::maplibre_proxy("initial_map") |>
-    mapgl::set_data("basemap", map_data) |>
-    mapgl::set_paint_property("basemap", "fill-color", pal$fill)
+    mapgl:::set_data("basemap", map_data) |>
+    mapgl:::set_paint_property("basemap", "fill-color", pal$fill)
 
 })
 
@@ -1334,7 +1334,7 @@ shiny::observeEvent(input$update, {
   
   # Update the basemap colors without redrawing
   mapgl::maplibre_proxy("edit_map") |>
-    mapgl::set_paint_property("basemap", "fill-color", new_color_expr)
+    mapgl:::set_paint_property("basemap", "fill-color", new_color_expr)
   
   selected_tracts(NULL)
   
@@ -1358,10 +1358,10 @@ refresh_edit_map <- function() {
   )
 
   mapgl::maplibre_proxy("edit_map") |>
-    mapgl::set_data("basemap", data) |>
-    mapgl::set_paint_property("basemap", "fill-color", color_expr) |>
-    mapgl::set_data("selected", data) |>
-    mapgl::set_data("highlighted", data) |>
+    mapgl:::set_data("basemap", data) |>
+    mapgl:::set_paint_property("basemap", "fill-color", color_expr) |>
+    mapgl:::set_data("selected", data) |>
+    mapgl:::set_data("highlighted", data) |>
     mapgl::set_filter("selected", list("==", c("get", "GEOID"), "__NONE__")) |>
     mapgl::set_filter("highlighted", list("==", c("get", "GEOID"), "__NONE__")) |>
     mapgl::fit_bounds(data, animate = TRUE)
@@ -1435,10 +1435,10 @@ shiny::observeEvent(input$load_data, {
   )
 
   mapgl::maplibre_proxy("edit_map") |>
-    mapgl::set_data("basemap", loaded_data) |>
-    mapgl::set_paint_property("basemap", "fill-color", color_expr) |>
-    mapgl::set_data("highlighted", loaded_data) |>
-    mapgl::set_data("selected", loaded_data) |>
+    mapgl:::set_data("basemap", loaded_data) |>
+    mapgl:::set_paint_property("basemap", "fill-color", color_expr) |>
+    mapgl:::set_data("highlighted", loaded_data) |>
+    mapgl:::set_data("selected", loaded_data) |>
     mapgl::set_filter("highlighted", list("==", c("get", "GEOID"), "__NONE__")) |>
     mapgl::set_filter("selected", list("==", c("get", "GEOID"), "__NONE__")) |>
     mapgl::fit_bounds(loaded_data, animate = TRUE)
