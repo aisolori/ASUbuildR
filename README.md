@@ -16,9 +16,8 @@ prior year.
 
 ## Installation
 
-<span style="color:red; font-weight:bold;">
-DO NOT TRY INSTALLING FROM MAIN BRANCH — MAIN BRANCH IS BROKEN
-</span>
+**!!DO NOT TRY INSTALLING FROM MAIN BRANCH — MAIN BRANCH IS BROKEN!!**
+
 
 Please download the latest release at  
 [https://github.com/aisolori/ASUbuildR/releases/tag/ASUbuildR]
