@@ -20,7 +20,7 @@ prior year.
 
 
 Please download the latest release at  
-[https://github.com/aisolori/ASUbuildR/releases/tag/ASUbuildR]
+[[https://github.com/aisolori/ASUbuildR/releases/tag/ASUbuildR]](https://github.com/aisolori/ASUbuildR/releases/download/ASUbuildR/ASUbuildR.Dashboard-0.5.1-win.zip)
 
 - Unzip folder and run **"ASUbuildR Dashboard.exe"**
 
