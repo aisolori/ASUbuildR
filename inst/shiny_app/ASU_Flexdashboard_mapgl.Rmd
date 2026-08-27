@@ -291,12 +291,20 @@ map_tile_fingerprint <- function(data) {
   unname(tools::md5sum(fingerprint_file))
 }
 
+map_cache_component <- function(value, fallback = "unknown") {
+  values <- as.character(value %||% fallback)
+  values <- values[!is.na(values) & nzchar(values)]
+  if (length(values) == 0L) values <- fallback
+  values <- gsub("[^A-Za-z0-9_-]", "_", values)
+  paste(sort(unique(values)), collapse = "-")
+}
+
 ensure_map_tiles <- function(data) {
   if (isTRUE(pmtiles_disabled()) || is.null(data) || nrow(data) == 0) return(NULL)
 
   tryCatch({
-    state_id <- gsub("[^A-Za-z0-9_-]", "_", state() %||% "unknown")
-    year_id <- gsub("[^A-Za-z0-9_-]", "_", tigris_year() %||% "unknown")
+    state_id <- map_cache_component(state())
+    year_id <- map_cache_component(tigris_year())
     fingerprint <- map_tile_fingerprint(data)
     tile_name <- sprintf("tracts_v2_%s_%s_%s.pmtiles", state_id, year_id, fingerprint)
     tile_path <- file.path(pmtiles_cache_dir, tile_name)
@@ -940,7 +948,7 @@ shiny::observeEvent(input$process, {
   state_val <- state()
   if (!is.null(state_val) && length(state_val) > 0) {
     new_england_fips <- c("09","23","25","33","44","50")
-    if (state_val %in% new_england_fips &&
+    if (any(state_val %in% new_england_fips) &&
         !is.null(input$ne_year_choice) &&
         input$ne_year_choice == "2021") {
       selected_year <- "2021"
@@ -983,8 +991,16 @@ if (identical(algo_choice, "cpsat")) {
                              if (is.na(rel_gap)) "None" else as.character(rel_gap)))
     # ---- 2) Build tracts + neighbors ----------------------------------
     shiny::incProgress(0.15, detail = "Downloading tracts & building neighbors")
-    append_cpsat_log(sprintf("[NB] Downloading TIGER tracts for state %s (year=%s)…", st_fips, sel_year))
-    tr_sf <- tigris::tracts(state = st_fips, year = sel_year, progress_bar = FALSE) |>
+    
+    # 1. Collapse the vector of states into a single string for the log (e.g., "32, 06")
+    st_fips_str <- paste(st_fips, collapse = ", ")
+    append_cpsat_log(sprintf("[NB] Downloading TIGER tracts for state(s) %s (year=%s)…", st_fips_str, sel_year))
+    
+    # 2. Map over the vector of states, combine them, then calculate contiguity
+    tr_sf <- purrr::map(st_fips, \(st) {
+      tigris::tracts(state = st, year = sel_year, progress_bar = FALSE)
+    }) |>
+      dplyr::bind_rows() |>
       dplyr::mutate(continuous = sfdep::st_contiguity(geometry))
     
     # Join with uploaded BLS
@@ -1291,7 +1307,9 @@ print('[runner] OK', flush=True)
     shiny::incProgress(0.10, detail = "Downloading Census shapefiles\u2026")
 
     # use selected_year (handles New England override)
-    tract_list <- tigris::tracts(state = state(), year = selected_year) |>
+    # Map over each state to fetch tracts, bind into one map, then calculate contiguity
+    tract_list <- purrr::map(state(), \(st) tigris::tracts(state = st, year = selected_year)) |> 
+      dplyr::bind_rows() |>
       dplyr::mutate(
         row_num    = dplyr::row_number(),
         continuous = sfdep::st_contiguity(geometry)
