@@ -2,6 +2,9 @@ name: Build tract-first OR-Tools wheel
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - tract-first-probing-wheel-20260901
 
 permissions:
   contents: read
