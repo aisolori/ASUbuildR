@@ -12,7 +12,7 @@ permissions:
 jobs:
   windows-wheel:
     name: Windows Python 3.11 wheel
-    runs-on: windows-latest
+    runs-on: windows-2022
     timeout-minutes: 120
 
     steps:
