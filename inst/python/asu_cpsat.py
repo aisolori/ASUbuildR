@@ -35,6 +35,7 @@ import heapq
 import json
 import math
 import os
+import threading
 import time
 from dataclasses import dataclass
 from typing import List, Optional, Dict, Sequence, Tuple
@@ -526,12 +527,12 @@ def _asu_branch_challenges(
 
 
 _ASU_FULL_SUBSOLVER_PATTERN = (
-    "asu_probe_fast",
+    "asu_probe_standard",
     "max_lp",
     "portfolio_max_lp",
 
     "lb_tree_search",
-    "asu_probe_standard",
+    "asu_probe_fast",
 
     "probing_no_lp",
     "max_lp",
@@ -1456,6 +1457,46 @@ def solve_one_asu_cpsat(
     if remaining_time <= 0:
         return _to_orig(best_connected, "FEASIBLE") if best_connected else None
 
+    def _seed_solution_hints(target_model: cp_model.CpModel, selection: Sequence[int]) -> None:
+        """Refresh variable hints from a connected incumbent selection."""
+        sel_set = {int(i) for i in selection}
+        target_model.ClearHints()
+        for i in range(N):
+            target_model.AddHint(x[i], 1 if i in sel_set else 0)
+
+        if not use_arborescence:
+            sf = _spanning_tree_flows(sorted(sel_set), nb_local, root_local)
+            target_model.AddHint(selected_count, len(sel_set))
+            if use_signed_flow:
+                for edge_index, (edge_u, edge_v) in enumerate(edges):
+                    target_model.AddHint(
+                        f[edge_index],
+                        sf.get((edge_u, edge_v), 0) - sf.get((edge_v, edge_u), 0),
+                    )
+            else:
+                for edge_index, (edge_u, edge_v) in enumerate(edges):
+                    target_model.AddHint(f[edge_index], sf.get((edge_u, edge_v), 0))
+            return
+
+        sf_arb = _spanning_tree_flows(sorted(sel_set), nb_local, root_local)
+        tree_parent = {v: p for (p, v) in sf_arb}
+        children: Dict[int, List[int]] = {v: [] for v in range(N)}
+        for v, p in tree_parent.items():
+            if 0 <= p < N:
+                children[p].append(v)
+        depth_hint: Dict[int, int] = {root_local: 0}
+        bfs_q = [root_local]
+        while bfs_q:
+            node = bfs_q.pop(0)
+            for child in children[node]:
+                if child not in depth_hint:
+                    depth_hint[child] = depth_hint[node] + 1
+                    bfs_q.append(child)
+        for (i, j), pvar in par_vars.items():
+            target_model.AddHint(pvar, 1 if tree_parent.get(i) == j else 0)
+        for i in range(N):
+            target_model.AddHint(depth_vars[i], depth_hint.get(i, 0))
+
     # Scout: 10 s LNS-only pass on the full flow model to lift the warm-start
     # incumbent before the lbts-heavy main solve. lbts proves bounds but is slow
     # to improve the primal; the LNS subsolvers do the opposite -- suppress lbts
@@ -1486,44 +1527,7 @@ def solve_one_asu_cpsat(
                 best_connected, best_obj = _scout_sel, _scout_obj
                 model.Add(obj_expr >= _scout_obj)
                 lower_bound = _scout_obj
-                _scout_set = set(_scout_sel)
-                if not use_arborescence:
-                    _sf = _spanning_tree_flows(_scout_sel, nb_local, root_local)
-                    model.ClearHints()
-                    for _i in range(N):
-                        model.AddHint(x[_i], 1 if _i in _scout_set else 0)
-                    model.AddHint(selected_count, len(_scout_set))
-                    if use_signed_flow:
-                        for _ei, (_eu, _ev) in enumerate(edges):
-                            model.AddHint(f[_ei], _sf.get((_eu, _ev), 0) - _sf.get((_ev, _eu), 0))
-                    else:
-                        for _ei, (_eu, _ev) in enumerate(edges):
-                            model.AddHint(f[_ei], _sf.get((_eu, _ev), 0))
-                else:
-                    # Rebuild arborescence hints from the scout's BFS spanning tree.
-                    # The scout added obj_expr >= _scout_obj to the model; the old
-                    # hint (pre-scout objective) would violate that hard constraint.
-                    _sf_arb = _spanning_tree_flows(_scout_sel, nb_local, root_local)
-                    _tp = {v: p for (p, v) in _sf_arb}
-                    _ch: Dict[int, List[int]] = {v: [] for v in range(N)}
-                    for _v, _p in _tp.items():
-                        if 0 <= _p < N:
-                            _ch[_p].append(_v)
-                    _dh: Dict[int, int] = {root_local: 0}
-                    _bfsq = [root_local]
-                    while _bfsq:
-                        _nd = _bfsq.pop(0)
-                        for _child in _ch[_nd]:
-                            if _child not in _dh:
-                                _dh[_child] = _dh[_nd] + 1
-                                _bfsq.append(_child)
-                    model.ClearHints()
-                    for _i in range(N):
-                        model.AddHint(x[_i], 1 if _i in _scout_set else 0)
-                    for (_ai, _aj), _pvar in par_vars.items():
-                        model.AddHint(_pvar, 1 if _tp.get(_ai) == _aj else 0)
-                    for _i in range(N):
-                        model.AddHint(depth_vars[_i], _dh.get(_i, 0))
+                _seed_solution_hints(model, _scout_sel)
                 if log:
                     print(f"  scout: improved incumbent to {_scout_obj} "
                           f"(+{_scout_obj - (hint_obj or 0)} vs hint)", flush=True)
@@ -1639,28 +1643,9 @@ def solve_one_asu_cpsat(
                     flush=True,
                 )
 
-        solver = cp_model.CpSolver()
-        solver.parameters.num_search_workers = max(1, int(workers))
-        solver.parameters.max_time_in_seconds = remaining_time
-        solver.parameters.log_search_progress = bool(log)
-        solver.parameters.cp_model_presolve = True
-        solver.parameters.linearization_level = 2
-        solver.parameters.cp_model_probing_level = 2
-        solver.parameters.cut_level = 2
-
-        # LNS settings
-        solver.parameters.lns_initial_difficulty = 0.65
-        solver.parameters.lns_initial_deterministic_limit = 0.6
-        solver.parameters.solution_pool_size = max(1, int(solution_pool_size))
-        solver.parameters.diversify_lns_params = True
-
-
-        solver.parameters.add_objective_cut = True
-        solver.parameters.variables_shaving_level = 3
-        _configure_asu_lp_search_params(solver.parameters)
-        tract_first_probing_enabled = _configure_asu_probe_variants(
-            solver.parameters,
-            tract_first=tract_first_enabled,
+        tract_first_probing_enabled = (
+            tract_first_enabled
+            and _supports_tract_first_probing(cp_model.CpSolver().parameters)
         )
         if tract_first_enabled and log:
             if tract_first_probing_enabled:
@@ -1675,11 +1660,6 @@ def solve_one_asu_cpsat(
                     "retaining integer-first probe workers",
                     flush=True,
                 )
-        _configure_asu_pseudo_costs(solver.parameters)
-        _configure_asu_shared_tree(
-            solver.parameters,
-            tract_first=tract_first_enabled,
-        )
 
         def configure_asu_subsolvers(params, workers):
             workers = max(1, int(workers))
@@ -1753,14 +1733,52 @@ def solve_one_asu_cpsat(
 
             params.filter_subsolvers.extend(allowed)
 
+        def _configure_main_solver_params(
+            params,
+            max_seconds: float,
+            *,
+            search_log: bool,
+            collect_tightened_domains: bool = False,
+        ) -> None:
+            params.num_search_workers = max(1, int(workers))
+            params.max_time_in_seconds = max(0.01, float(max_seconds))
+            params.log_search_progress = bool(search_log)
+            params.cp_model_presolve = True
+            params.linearization_level = 2
+            params.cp_model_probing_level = 2
+            params.cut_level = 2
+            if hasattr(params, "fill_tightened_domains_in_response"):
+                params.fill_tightened_domains_in_response = bool(
+                    collect_tightened_domains
+                )
+            if hasattr(params, "keep_all_feasible_solutions_in_presolve"):
+                params.keep_all_feasible_solutions_in_presolve = bool(
+                    collect_tightened_domains
+                )
 
-        if configure_subsolvers:
-            configure_asu_subsolvers(
-                solver.parameters,
-                workers
+            # LNS settings
+            params.lns_initial_difficulty = 0.65
+            params.lns_initial_deterministic_limit = 0.6
+            params.solution_pool_size = max(1, int(solution_pool_size))
+            params.diversify_lns_params = True
+
+            params.add_objective_cut = True
+            params.variables_shaving_level = 3
+            _configure_asu_lp_search_params(params)
+            _configure_asu_probe_variants(
+                params,
+                tract_first=tract_first_enabled,
             )
-        if rel_gap is not None:
-            solver.parameters.relative_gap_limit = float(rel_gap)
+            _configure_asu_pseudo_costs(params)
+            _configure_asu_shared_tree(
+                params,
+                tract_first=tract_first_enabled,
+            )
+            if configure_subsolvers:
+                configure_asu_subsolvers(params, workers)
+            if rel_gap is not None:
+                params.relative_gap_limit = float(rel_gap)
+
         if log:
             print(
                 "ASU probing experiment:\n"
@@ -1770,11 +1788,343 @@ def solve_one_asu_cpsat(
                 "  shared_tree_split_strategy=OBJECTIVE_LB",
                 flush=True,
             )
-        status = solver.Solve(model)
-        status_name = solver.StatusName(status)
-        if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-            selected = [i for i in range(N) if solver.BooleanValue(x[i])]
-            objective = int(u_g[selected].sum())
+
+        stall_window_seconds = 1200.0  # Time window to detect solver stalling in seconds.
+        proof_feasibility_cap_seconds = 180.0
+        proof_mid_gap_trigger = 5
+        max_stall_restart_no_progress = 2  # consecutive no-progress cycles before giving up
+        stall_restart_no_progress_cycles = 0
+        best_bound_seen = math.inf
+        bound_cap_applied: Optional[int] = None
+        if best_obj >= 0:
+            model.Add(obj_expr >= best_obj)
+            lower_bound = max(lower_bound, best_obj)
+
+        def _carry_objective_bound(bound_value: float) -> None:
+            """Persist the best proven objective upper bound across real restarts."""
+            nonlocal best_bound_seen, bound_cap_applied
+            if not math.isfinite(bound_value):
+                return
+            if bound_value >= best_bound_seen - 1e-9:
+                return
+
+            best_bound_seen = bound_value
+            cap = max(best_obj, int(math.floor(best_bound_seen)))
+            if bound_cap_applied is None or cap < bound_cap_applied:
+                model.Add(obj_expr <= cap)
+                bound_cap_applied = cap
+
+        proof_fix_min_target: Optional[int] = None
+        proof_x_fixes: Dict[int, int] = {}
+
+        def _extract_tightened_x_fixes(response_proto) -> Dict[int, int]:
+            """Extract fixed Boolean tract domains from a solver response."""
+            tightened_variables = getattr(response_proto, "tightened_variables", None)
+            if not tightened_variables:
+                return {}
+
+            fixes: Dict[int, int] = {}
+            for i, var in enumerate(x):
+                var_index = var.Index()
+                if var_index < 0 or var_index >= len(tightened_variables):
+                    continue
+                domain = list(tightened_variables[var_index].domain)
+                if domain == [0, 0]:
+                    fixes[i] = 0
+                elif domain == [1, 1]:
+                    fixes[i] = 1
+            return fixes
+
+        def _update_cached_proof_fixes(
+            proof_target: int,
+            fixes: Dict[int, int],
+        ) -> int:
+            """Cache tract fixes only for proof targets at least this restrictive."""
+            nonlocal proof_fix_min_target, proof_x_fixes
+            if not fixes:
+                return 0
+
+            if proof_fix_min_target is None:
+                proof_fix_min_target = proof_target
+                proof_x_fixes = dict(fixes)
+                return len(proof_x_fixes)
+
+            if proof_target < proof_fix_min_target:
+                proof_fix_min_target = proof_target
+                proof_x_fixes = dict(fixes)
+                return len(proof_x_fixes)
+
+            if proof_target > proof_fix_min_target:
+                proof_fix_min_target = proof_target
+
+            added = 0
+            for idx, value in fixes.items():
+                prior = proof_x_fixes.get(idx)
+                if prior is None:
+                    proof_x_fixes[idx] = value
+                    added += 1
+                elif prior != value:
+                    # Defensive: drop contradictory fix if domains disagree.
+                    proof_x_fixes.pop(idx, None)
+            return added
+
+        while True:
+            remaining_time = float(time_limit) - (time.monotonic() - start_time)
+            if remaining_time <= 0.01:
+                break
+
+            cycle_start_obj = best_obj
+            cycle_start_bound = best_bound_seen
+
+            solver = cp_model.CpSolver()
+            _configure_main_solver_params(
+                solver.parameters,
+                remaining_time,
+                search_log=log,
+            )
+
+            progress_lock = threading.Lock()
+            solve_done = threading.Event()
+            stalled = threading.Event()
+            progress = {
+                "last_time": time.monotonic(),
+                "best_obj": best_obj,
+                "best_selection": best_connected,
+                "best_bound": best_bound_seen,
+            }
+
+            class _MainSolveCallback(cp_model.CpSolverSolutionCallback):
+                def on_solution_callback(self) -> None:
+                    candidate_obj = int(round(self.ObjectiveValue()))
+                    with progress_lock:
+                        if candidate_obj <= progress["best_obj"]:
+                            return
+
+                    candidate = [i for i in range(N) if self.BooleanValue(x[i])]
+                    with progress_lock:
+                        if candidate_obj > progress["best_obj"]:
+                            progress["best_obj"] = candidate_obj
+                            progress["best_selection"] = candidate
+                            progress["last_time"] = time.monotonic()
+
+            def _on_best_bound(bound: float) -> None:
+                with progress_lock:
+                    if bound < progress["best_bound"] - 1e-9:
+                        progress["best_bound"] = float(bound)
+                        progress["last_time"] = time.monotonic()
+
+            def _stall_watchdog() -> None:
+                while not solve_done.is_set():
+                    with progress_lock:
+                        idle_seconds = time.monotonic() - progress["last_time"]
+                    wait_seconds = max(0.01, stall_window_seconds - idle_seconds)
+                    if solve_done.wait(wait_seconds):
+                        return
+                    with progress_lock:
+                        idle_seconds = time.monotonic() - progress["last_time"]
+                    if idle_seconds >= stall_window_seconds:
+                        stalled.set()
+                        solver.stop_search()
+                        return
+
+            callback = _MainSolveCallback()
+            solver.best_bound_callback = _on_best_bound
+            watchdog = threading.Thread(target=_stall_watchdog, daemon=True)
+            watchdog.start()
+            try:
+                main_status = solver.Solve(model, callback)
+            finally:
+                solve_done.set()
+                watchdog.join()
+
+            status = main_status
+            status_name = solver.StatusName(main_status)
+            with progress_lock:
+                callback_obj = int(progress["best_obj"])
+                callback_selection = progress["best_selection"]
+                callback_bound = float(progress["best_bound"])
+
+            if callback_selection is not None and callback_obj > best_obj:
+                best_connected = list(callback_selection)
+                best_obj = callback_obj
+                model.Add(obj_expr >= best_obj)
+                lower_bound = max(lower_bound, best_obj)
+                _seed_solution_hints(model, best_connected)
+            _carry_objective_bound(callback_bound)
+            _carry_objective_bound(solver.BestObjectiveBound())
+
+            if main_status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                selected = [i for i in range(N) if solver.BooleanValue(x[i])]
+                objective = int(u_g[selected].sum())
+                if objective > best_obj:
+                    best_connected = selected
+                    best_obj = objective
+
+            if main_status == cp_model.OPTIMAL:
+                break
+            if not stalled.is_set():
+                break
+            if best_connected is None or best_obj < 0:
+                break
+
+            proof_remaining = float(time_limit) - (time.monotonic() - start_time)
+            if proof_remaining <= 0.01:
+                break
+            proof_seconds = min(proof_remaining, proof_feasibility_cap_seconds)
+
+            best_upper: Optional[int] = None
+            gap_to_bound: Optional[int] = None
+            if math.isfinite(best_bound_seen):
+                best_upper = int(math.floor(best_bound_seen + 1e-6))
+                gap_to_bound = max(0, best_upper - best_obj)
+
+            if best_upper is not None and best_upper <= best_obj:
+                status = cp_model.OPTIMAL
+                status_name = "OPTIMAL"
+                selected = list(best_connected)
+                objective = best_obj
+                break
+
+            if gap_to_bound is not None and gap_to_bound > proof_mid_gap_trigger:
+                proof_target = best_obj + max(
+                    1,
+                    int(math.ceil(gap_to_bound / 2.0)),
+                )
+            else:
+                proof_target = best_obj + 1
+
+            if (
+                proof_fix_min_target is not None
+                and proof_target < proof_fix_min_target
+            ):
+                proof_fix_min_target = None
+                proof_x_fixes.clear()
+
+            proof_model = model.clone()
+            proof_model.ClearObjective()
+            proof_model.ClearHints()
+            proof_model.Add(obj_expr >= proof_target)
+            cached_fix_count = 0
+            if (
+                proof_fix_min_target is not None
+                and proof_target >= proof_fix_min_target
+            ):
+                for idx, value in sorted(proof_x_fixes.items()):
+                    proof_model.Add(x[idx] == value)
+                    cached_fix_count += 1
+            probe_upper_ceiling: Optional[int] = None
+            if best_upper is not None:
+                probe_upper_ceiling = best_upper
+                proof_model.Add(obj_expr <= probe_upper_ceiling)
+
+            if log:
+                upper_text = str(best_upper) if best_upper is not None else "unknown"
+                gap_text = str(gap_to_bound) if gap_to_bound is not None else "unknown"
+                ceiling_text = (
+                    str(probe_upper_ceiling)
+                    if probe_upper_ceiling is not None
+                    else "none"
+                )
+                print(
+                    f"  stall watchdog: stopped main solve after "
+                    f"{stall_window_seconds:.0f}s without incumbent/bound movement; "
+                    f"testing feasibility at objective >= {proof_target} "
+                    f"(incumbent {best_obj}, upper {upper_text}, gap {gap_text}) "
+                    f"with probe ceiling {ceiling_text} and "
+                    f"{cached_fix_count} cached x-fix(es) "
+                    f"for up to {proof_seconds:.1f}s",
+                    flush=True,
+                )
+
+            proof_solver = cp_model.CpSolver()
+            _configure_main_solver_params(
+                proof_solver.parameters,
+                proof_seconds,
+                search_log=log,
+                collect_tightened_domains=True,
+            )
+            proof_status = proof_solver.Solve(proof_model)
+            if proof_status in (cp_model.OPTIMAL, cp_model.FEASIBLE, cp_model.UNKNOWN):
+                new_fixes = _extract_tightened_x_fixes(proof_solver.ResponseProto())
+                added_fixes = _update_cached_proof_fixes(proof_target, new_fixes)
+                if log and new_fixes:
+                    print(
+                        f"  stall watchdog: cached {len(new_fixes)} tightened "
+                        f"x-domain fix(es) at target >= {proof_target} "
+                        f"({added_fixes} new)",
+                        flush=True,
+                    )
+
+            if proof_status == cp_model.INFEASIBLE:
+                new_upper = proof_target - 1
+                model.Add(obj_expr <= new_upper)
+                best_bound_seen = min(best_bound_seen, float(new_upper))
+                bound_cap_applied = (
+                    new_upper
+                    if bound_cap_applied is None
+                    else min(bound_cap_applied, new_upper)
+                )
+                proof_fix_min_target = None
+                proof_x_fixes.clear()
+                if log:
+                    print(
+                        f"  stall watchdog: objective >= {proof_target} is "
+                        f"infeasible; proven upper bound tightened to {new_upper}",
+                        flush=True,
+                    )
+                if new_upper <= best_obj:
+                    status = cp_model.OPTIMAL
+                    status_name = "OPTIMAL"
+                    selected = list(best_connected)
+                    objective = best_obj
+                    break
+
+            elif proof_status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                proof_selected = [
+                    i for i in range(N)
+                    if proof_solver.BooleanValue(x[i])
+                ]
+                proof_obj = int(u_g[proof_selected].sum())
+                if proof_obj > best_obj:
+                    best_connected = proof_selected
+                    best_obj = proof_obj
+                    model.Add(obj_expr >= best_obj)
+                    lower_bound = max(lower_bound, best_obj)
+                    _seed_solution_hints(model, proof_selected)
+                    if log:
+                        print(
+                            f"  stall watchdog: feasibility probe found "
+                            f"improved incumbent {best_obj}",
+                            flush=True,
+                        )
+
+            # A no-progress cycle is one where neither the incumbent nor the
+            # proven bound moved; cap consecutive occurrences so a stuck
+            # window (e.g. an unresolved or infeasible next ASU) can't repeat
+            # the same stall/probe cycle forever.
+            made_progress = (
+                best_obj > cycle_start_obj
+                or best_bound_seen < cycle_start_bound - 1e-9
+            )
+            if made_progress:
+                stall_restart_no_progress_cycles = 0
+            else:
+                stall_restart_no_progress_cycles += 1
+                if log:
+                    print(
+                        f"  stall watchdog: no incumbent/bound progress this "
+                        f"cycle ({stall_restart_no_progress_cycles}/"
+                        f"{max_stall_restart_no_progress})",
+                        flush=True,
+                    )
+                if stall_restart_no_progress_cycles >= max_stall_restart_no_progress:
+                    if log:
+                        print(
+                            "  stall watchdog: giving up after repeated "
+                            "no-progress restarts; keeping current incumbent",
+                            flush=True,
+                        )
+                    break
 
     if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         # A secondary objective must never trade away even one unemployed
