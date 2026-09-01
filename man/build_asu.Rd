@@ -13,6 +13,13 @@ build_asu(
   time_limit = 1200,
   workers = max(1L, parallel::detectCores(logical = TRUE) - 1L),
   rel_gap = NA_real_,
+  configure_subsolvers = FALSE,
+  use_tract_first_search = FALSE,
+  use_flow_count_envelope = TRUE,
+  use_small_root_separators = TRUE,
+  root_separator_max_size = 3L,
+  root_separator_clause_limit = 200L,
+  solution_pool_size = 32L,
   verbose = interactive()
 )
 }
@@ -32,6 +39,25 @@ build_asu(
 \item{workers}{CP-SAT threads}
 
 \item{rel_gap}{optional relative MIP gap (e.g. 0.01)}
+
+\item{configure_subsolvers}{logical; if \code{FALSE}, use OR-Tools' default
+subsolver portfolio instead of the ASU-specific portfolio}
+
+\item{use_tract_first_search}{logical; enable the experimental
+incumbent-boundary worker, trying safe exclusions before frontier additions,
+within the ASU-specific portfolio}
+
+\item{use_flow_count_envelope}{logical; dynamically bound signed-flow values
+by the number of selected nodes}
+
+\item{use_small_root_separators}{logical; add valid size-2/3 rooted
+vertex-separator clauses}
+
+\item{root_separator_max_size}{maximum rooted vertex-separator size to add}
+
+\item{root_separator_clause_limit}{maximum number of rooted separator clauses}
+
+\item{solution_pool_size}{number of feasible solutions retained for LNS}
 
 \item{verbose}{logical; print CP-SAT logs}
 }

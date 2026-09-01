@@ -1,0 +1,203 @@
+diff --git a/ortools/sat/integer_search.cc b/ortools/sat/integer_search.cc
+index 737a086..4c45b7d 100644
+--- a/ortools/sat/integer_search.cc
++++ b/ortools/sat/integer_search.cc
+@@ -1740,6 +1740,80 @@ ContinuousProber::ContinuousProber(const CpModelProto& model_proto,
+           << time_limit_->GetDeterministicLimit() << " on " << model_->Name();
+ }
+ 
++SatSolver::Status ContinuousProber::ProbeIntegerVariables() {
++  // Probe variable bounds.
++  // TODO(user): Probe optional variables.
++  for (; current_int_var_ < int_vars_.size(); ++current_int_var_) {
++    const IntegerVariable int_var = int_vars_[current_int_var_];
++    if (integer_trail_->IsFixed(int_var)) continue;
++
++    const Literal shave_lb_literal =
++        encoder_->GetOrCreateAssociatedLiteral(IntegerLiteral::LowerOrEqual(
++            int_var, integer_trail_->LowerBound(int_var)));
++    const BooleanVariable shave_lb_var = shave_lb_literal.Variable();
++    const auto [_lb, lb_inserted] = probed_bool_vars_.insert(shave_lb_var);
++    if (lb_inserted) {
++      if (!prober_->ProbeOneVariable(shave_lb_var)) {
++        return SatSolver::INFEASIBLE;
++      }
++      num_literals_probed_++;
++    }
++
++    const Literal shave_ub_literal =
++        encoder_->GetOrCreateAssociatedLiteral(IntegerLiteral::GreaterOrEqual(
++            int_var, integer_trail_->UpperBound(int_var)));
++    const BooleanVariable shave_ub_var = shave_ub_literal.Variable();
++    const auto [_ub, ub_inserted] = probed_bool_vars_.insert(shave_ub_var);
++    if (ub_inserted) {
++      if (!prober_->ProbeOneVariable(shave_ub_var)) {
++        return SatSolver::INFEASIBLE;
++      }
++      num_literals_probed_++;
++    }
++
++    if (use_shaving_) {
++      const SatSolver::Status lb_status = ShaveLiteral(shave_lb_literal);
++      if (ReportStatus(lb_status)) return lb_status;
++
++      const SatSolver::Status ub_status = ShaveLiteral(shave_ub_literal);
++      if (ReportStatus(ub_status)) return ub_status;
++    }
++
++    RETURN_IF_NOT_FEASIBLE(PeriodicSyncAndCheck());
++  }
++  return SatSolver::FEASIBLE;
++}
++
++SatSolver::Status ContinuousProber::ProbeBooleanVariables() {
++  const auto& assignment = sat_solver_->Assignment();
++  for (; current_bool_var_ < bool_vars_.size(); ++current_bool_var_) {
++    const BooleanVariable& bool_var = bool_vars_[current_bool_var_];
++
++    if (assignment.VariableIsAssigned(bool_var)) continue;
++
++    const auto [_, inserted] = probed_bool_vars_.insert(bool_var);
++    if (!inserted) continue;
++
++    if (!prober_->ProbeOneVariable(bool_var)) {
++      return SatSolver::INFEASIBLE;
++    }
++    num_literals_probed_++;
++
++    const Literal literal(bool_var, true);
++    if (use_shaving_ && !assignment.LiteralIsAssigned(literal)) {
++      const SatSolver::Status true_status = ShaveLiteral(literal);
++      if (ReportStatus(true_status)) return true_status;
++      if (true_status == SatSolver::ASSUMPTIONS_UNSAT) continue;
++
++      const SatSolver::Status false_status = ShaveLiteral(literal.Negated());
++      if (ReportStatus(false_status)) return false_status;
++    }
++
++    RETURN_IF_NOT_FEASIBLE(PeriodicSyncAndCheck());
++  }
++  return SatSolver::FEASIBLE;
++}
++
+ // Continuous probing procedure.
+ // TODO(user):
+ //   - sort variables before the iteration (statically or dynamically)
+@@ -1764,73 +1838,18 @@ SatSolver::Status ContinuousProber::Probe() {
+     const int64_t initial_num_bounds_shaved = num_bounds_shaved_;
+     const auto& assignment = sat_solver_->Assignment();
+ 
+-    // Probe variable bounds.
+-    // TODO(user): Probe optional variables.
+-    for (; current_int_var_ < int_vars_.size(); ++current_int_var_) {
+-      const IntegerVariable int_var = int_vars_[current_int_var_];
+-      if (integer_trail_->IsFixed(int_var)) continue;
+-
+-      const Literal shave_lb_literal =
+-          encoder_->GetOrCreateAssociatedLiteral(IntegerLiteral::LowerOrEqual(
+-              int_var, integer_trail_->LowerBound(int_var)));
+-      const BooleanVariable shave_lb_var = shave_lb_literal.Variable();
+-      const auto [_lb, lb_inserted] = probed_bool_vars_.insert(shave_lb_var);
+-      if (lb_inserted) {
+-        if (!prober_->ProbeOneVariable(shave_lb_var)) {
+-          return SatSolver::INFEASIBLE;
+-        }
+-        num_literals_probed_++;
+-      }
+-
+-      const Literal shave_ub_literal =
+-          encoder_->GetOrCreateAssociatedLiteral(IntegerLiteral::GreaterOrEqual(
+-              int_var, integer_trail_->UpperBound(int_var)));
+-      const BooleanVariable shave_ub_var = shave_ub_literal.Variable();
+-      const auto [_ub, ub_inserted] = probed_bool_vars_.insert(shave_ub_var);
+-      if (ub_inserted) {
+-        if (!prober_->ProbeOneVariable(shave_ub_var)) {
+-          return SatSolver::INFEASIBLE;
+-        }
+-        num_literals_probed_++;
+-      }
+-
+-      if (use_shaving_) {
+-        const SatSolver::Status lb_status = ShaveLiteral(shave_lb_literal);
+-        if (ReportStatus(lb_status)) return lb_status;
+-
+-        const SatSolver::Status ub_status = ShaveLiteral(shave_ub_literal);
+-        if (ReportStatus(ub_status)) return ub_status;
+-      }
+-
+-      RETURN_IF_NOT_FEASIBLE(PeriodicSyncAndCheck());
+-    }
+-
+-    // Probe Boolean variables from the model.
+-    for (; current_bool_var_ < bool_vars_.size(); ++current_bool_var_) {
+-      const BooleanVariable& bool_var = bool_vars_[current_bool_var_];
+-
+-      if (assignment.VariableIsAssigned(bool_var)) continue;
+-
+-      const auto [_, inserted] = probed_bool_vars_.insert(bool_var);
+-      if (!inserted) continue;
+-
+-      if (!prober_->ProbeOneVariable(bool_var)) {
+-        return SatSolver::INFEASIBLE;
+-      }
+-      num_literals_probed_++;
+-
+-      const Literal literal(bool_var, true);
+-      if (use_shaving_ && !assignment.LiteralIsAssigned(literal)) {
+-        const SatSolver::Status true_status = ShaveLiteral(literal);
+-        if (ReportStatus(true_status)) return true_status;
+-        if (true_status == SatSolver::ASSUMPTIONS_UNSAT) continue;
+-
+-        const SatSolver::Status false_status = ShaveLiteral(literal.Negated());
+-        if (ReportStatus(false_status)) return false_status;
+-      }
+-
+-      RETURN_IF_NOT_FEASIBLE(PeriodicSyncAndCheck());
++    SatSolver::Status status;
++    if (parameters_.continuous_probing_order() ==
++        SatParameters::CONTINUOUS_PROBING_BOOLEANS_FIRST) {
++      status = ProbeBooleanVariables();
++      if (status != SatSolver::FEASIBLE) return status;
++      status = ProbeIntegerVariables();
++    } else {
++      status = ProbeIntegerVariables();
++      if (status != SatSolver::FEASIBLE) return status;
++      status = ProbeBooleanVariables();
+     }
++    if (status != SatSolver::FEASIBLE) return status;
+ 
+     if (parameters_.use_extended_probing()) {
+       const auto at_least_one_literal_is_true =
+diff --git a/ortools/sat/integer_search.h b/ortools/sat/integer_search.h
+index cfd6309..ab13d95 100644
+--- a/ortools/sat/integer_search.h
++++ b/ortools/sat/integer_search.h
+@@ -347,6 +347,8 @@ class ContinuousProber {
+   static const int kLogPeriod = 5000;
+   static const int kSyncPeriod = 50;
+ 
++  SatSolver::Status ProbeIntegerVariables();
++  SatSolver::Status ProbeBooleanVariables();
+   SatSolver::Status ShaveLiteral(Literal literal);
+   bool ReportStatus(SatSolver::Status status);
+   void LogStatistics();
+diff --git a/ortools/sat/sat_parameters.proto b/ortools/sat/sat_parameters.proto
+index 56b0741..4451e8a 100644
+--- a/ortools/sat/sat_parameters.proto
++++ b/ortools/sat/sat_parameters.proto
+@@ -1217,6 +1217,15 @@ message SatParameters {
+   // How many combinations of pairs or triplets of variables we want to scan.
+   optional int32 probing_num_combinations_limit = 272 [default = 20000];
+ 
++  enum ContinuousProbingOrder {
++    CONTINUOUS_PROBING_INTEGERS_FIRST = 0;
++    CONTINUOUS_PROBING_BOOLEANS_FIRST = 1;
++  }
++  // Selects whether continuous probing processes model Boolean variables or
++  // integer-variable bounds first. This only affects use_probing_search.
++  optional ContinuousProbingOrder continuous_probing_order = 356
++      [default = CONTINUOUS_PROBING_INTEGERS_FIRST];
++
+   // Add a shaving phase (where the solver tries to prove that the lower or
+   // upper bound of a variable are infeasible) to the probing search. (<= 0
+   // disables it).

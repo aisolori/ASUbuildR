@@ -1152,6 +1152,15 @@ kwargs = dict(
     df=df, nb=nb,
     tau=%s, pop_thresh=%d, max_asus=%d,
     time_limit=%d, workers=%d, verbose=True,
+    configure_subsolvers=True,
+    use_root_articulation_implications=True,
+    use_tract_first_search=True,
+    use_flow_count_envelope=False,
+    use_small_root_separators=False,
+    root_separator_max_size=8,
+
+    root_separator_clause_limit=400,
+    solution_pool_size=32,
     full_graph_window=True
 )
 REL = %s

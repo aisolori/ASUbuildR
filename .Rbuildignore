@@ -11,6 +11,7 @@
 ^ASUbuildR\.Rcheck$
 ^ASUbuildR_[0-9.]+\.tar\.gz$
 ^test folder($|/)
+^tools($|/)
 ^temp_.*\.R$
 ~\$
 

@@ -118,12 +118,10 @@ setup_asu_python <- function(force = FALSE) {
   envs <- reticulate::conda_list()$name
   if (force && env_name %in% envs) {
     message("Removing existing conda environment...")
-    tryCatch(
-      reticulate::conda_remove(envname = env_name, packages = "--all"),
-      error = function(e) {
-        stop("Failed to remove the existing '", env_name, "' environment: ",
-             conditionMessage(e), call. = FALSE)
-      }
+    run_conda_step(
+      c("remove", "--yes", "--name", env_name, "--all",
+        "--override-channels", "-c", "conda-forge"),
+      paste0("remove the existing '", env_name, "' conda environment")
     )
     envs <- setdiff(envs, env_name)
   }
@@ -150,26 +148,30 @@ setup_asu_python <- function(force = FALSE) {
     message("Conda environment already exists. Use force=TRUE to recreate.")
   }
 
-  pkgs <- c("numpy", "pandas", "networkx", "ortools", "openpyxl")
-
-  # Try to attach the env so we can skip already-installed packages.
-  # If Python is already initialised to a *different* interpreter in this
-  # session (reticulate one-time-init rule), fall back to installing all
-  # Locate the Python and pip executables by full path to avoid ambiguity
-  # when multiple conda installations are present (Anaconda + r-miniconda).
-  # This also bypasses reticulate's one-time-init constraint entirely.
+  # Locate Python by full path to avoid ambiguity when multiple conda
+  # installations are present. This also bypasses reticulate's one-time-init
+  # constraint entirely.
   envs_df     <- reticulate::conda_list()
   env_row     <- envs_df[envs_df$name == env_name, ]
   if (nrow(env_row) == 0)
     stop("Conda environment '", env_name, "' not found after creation.", call. = FALSE)
   python_path <- env_row$python[1]
-  pip_path    <- if (.Platform$OS.type == "windows")
-    file.path(dirname(python_path), "Scripts", "pip.exe")
-  else
-    file.path(dirname(python_path), "pip")
 
-  pkgs <- c("numpy", "pandas", "networkx", "ortools", "openpyxl")
-  pkg_list_py <- paste0("[", paste0('"', pkgs, '"', collapse = ", "), "]")
+  required_imports <- c(
+    numpy = "numpy",
+    pandas = "pandas",
+    networkx = "networkx",
+    ortools = "ortools.sat.python.cp_model",
+    openpyxl = "openpyxl"
+  )
+  required_imports_py <- paste0(
+    "{",
+    paste0(
+      '"', names(required_imports), '": "', required_imports, '"',
+      collapse = ", "
+    ),
+    "}"
+  )
 
   # Write Python snippets to temp files to avoid Windows cmd.exe quoting issues.
   check_file  <- tempfile(fileext = ".py")
@@ -177,9 +179,14 @@ setup_asu_python <- function(force = FALSE) {
   on.exit(unlink(c(check_file, verify_file), force = TRUE), add = TRUE)
 
   writeLines(c(
-    "import importlib.util",
-    paste0("pkgs = ", pkg_list_py),
-    'missing = [p for p in pkgs if importlib.util.find_spec(p) is None]',
+    "import importlib",
+    paste0("required = ", required_imports_py),
+    "missing = []",
+    "for package, module in required.items():",
+    "    try:",
+    "        importlib.import_module(module)",
+    "    except Exception:",
+    "        missing.append(package)",
     'print("\\n".join(missing))'
   ), check_file)
 
@@ -189,25 +196,37 @@ setup_asu_python <- function(force = FALSE) {
   if (length(missing_pkgs) == 0) {
     message("All required Python packages are already installed.")
   } else {
-    message("Installing Python packages via pip: ",
+    message("Installing or repairing Python packages via pip: ",
             paste(missing_pkgs, collapse = ", "), "...")
-    status <- system2(pip_path, args = c("install", "--quiet", "--isolated", missing_pkgs))
+    status <- system2(
+      python_path,
+      args = c(
+        "-m", "pip", "install", "--quiet", "--isolated", "--upgrade",
+        "--force-reinstall", "--no-cache-dir", missing_pkgs
+      )
+    )
     if (!identical(status, 0L))
       stop("pip install failed (exit status: ", status, "). ",
            "See the output above for details.", call. = FALSE)
   }
 
   writeLines(c(
-    "import importlib.util",
-    paste0("pkgs = ", pkg_list_py),
-    'bad = [p for p in pkgs if importlib.util.find_spec(p) is None]',
-    'print(",".join(bad) if bad else "OK")'
+    "import importlib",
+    paste0("required = ", required_imports_py),
+    "errors = []",
+    "for package, module in required.items():",
+    "    try:",
+    "        importlib.import_module(module)",
+    "    except Exception as exc:",
+    "        errors.append(f'{package}: {type(exc).__name__}: {exc}')",
+    'print("\\n".join(errors) if errors else "OK")'
   ), verify_file)
 
   verify <- trimws(system2(python_path, args = verify_file, stdout = TRUE, stderr = FALSE))
   if (!identical(verify, "OK"))
     stop(
-      "Required Python packages are still not importable: ", verify,
+      "Required Python modules are still not importable:\n",
+      paste(verify, collapse = "\n"),
       ". Try setup_asu_python(force = TRUE) to recreate the environment.",
       call. = FALSE
     )
@@ -230,14 +249,22 @@ check_asu_python <- function() {
     return(FALSE)
   }
 
-  required <- c("numpy", "pandas", "networkx", "ortools", "openpyxl")
-  available <- vapply(required, reticulate::py_module_available, logical(1))
+  required <- c(
+    numpy = "numpy",
+    pandas = "pandas",
+    networkx = "networkx",
+    ortools = "ortools.sat.python.cp_model",
+    openpyxl = "openpyxl"
+  )
+  available <- vapply(
+    unname(required), reticulate::py_module_available, logical(1)
+  )
 
   if (all(available)) {
     message("Python environment is properly configured")
     return(TRUE)
   } else {
-    missing <- required[!available]
+    missing <- names(required)[!available]
     message("Missing packages: ", paste(missing, collapse = ", "))
     message("Run setup_asu_python() to install missing packages.")
     return(FALSE)

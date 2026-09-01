@@ -1,0 +1,119 @@
+name: Build tract-first OR-Tools wheel
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-wheel:
+    name: Windows Python 3.11 wheel
+    runs-on: windows-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out ASUbuildR
+        uses: actions/checkout@v4
+
+      - name: Check out OR-Tools v9.15
+        uses: actions/checkout@v4
+        with:
+          repository: google/or-tools
+          ref: v9.15
+          path: ortools-src
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python build dependencies
+        shell: pwsh
+        run: >-
+          python -m pip install --upgrade
+          pip mypy-protobuf absl-py setuptools wheel numpy pandas
+
+      - name: Apply continuous probing order patch
+        shell: pwsh
+        run: >-
+          git -C ortools-src apply
+          "$env:GITHUB_WORKSPACE/tools/ortools/continuous-probing-order-v9.15.patch"
+
+      - name: Configure OR-Tools
+        shell: pwsh
+        run: >-
+          cmake -S ortools-src -B ortools-build
+          -G "Visual Studio 17 2022" -A x64
+          -DCMAKE_CONFIGURATION_TYPES=Release
+          -DBUILD_CXX_SAMPLES=OFF
+          -DBUILD_CXX_EXAMPLES=OFF
+          -DBUILD_PYTHON=ON
+
+      - name: Build Python wheel
+        shell: pwsh
+        run: >-
+          cmake --build ortools-build
+          --config Release
+          --target python_package
+          -j2 -v
+
+      - name: Install patched wheel
+        shell: pwsh
+        run: |
+          $wheel = Get-ChildItem ortools-build/python/dist/*.whl |
+            Select-Object -First 1
+          if (-not $wheel) {
+            throw "OR-Tools wheel was not produced"
+          }
+          python -m pip install --force-reinstall $wheel.FullName
+
+      - name: Smoke test patched probing portfolio
+        shell: pwsh
+        run: |
+          @'
+          import sys
+          from pathlib import Path
+
+          from ortools.sat.python import cp_model
+
+          sys.path.insert(0, str(Path("inst/python").resolve()))
+          import asu_cpsat
+
+          solver = cp_model.CpSolver()
+          params = solver.parameters
+          assert asu_cpsat._supports_tract_first_probing(params)
+          assert asu_cpsat._configure_asu_probe_variants(
+              params,
+              tract_first=True,
+          )
+          params_text = str(params)
+          assert 'name: "asu_probe_fast_tract_first"' in params_text
+          assert 'name: "asu_probe_standard_tract_first"' in params_text
+          assert "continuous_probing_order: CONTINUOUS_PROBING_BOOLEANS_FIRST" in params_text
+
+          model = cp_model.CpModel()
+          tract = model.NewBoolVar("x_tract")
+          flow = model.NewIntVar(0, 10, "f_flow")
+          model.Add(flow == 5 * tract)
+          model.Maximize(tract)
+
+          solve = cp_model.CpSolver()
+          solve.parameters.use_probing_search = True
+          solve.parameters.continuous_probing_order = (
+              type(solve.parameters).CONTINUOUS_PROBING_BOOLEANS_FIRST
+          )
+          solve.parameters.max_time_in_seconds = 5
+          assert solve.Solve(model) == cp_model.OPTIMAL
+          assert solve.Value(tract) == 1
+          print("tract-first continuous probing smoke test: PASS")
+          '@ | Set-Content tract_first_probe_smoke.py
+          python tract_first_probe_smoke.py
+
+      - name: Upload patched wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: ortools-9.15-tract-first-windows-py311
+          path: ortools-build/python/dist/*.whl
+          if-no-files-found: error
+          retention-days: 14

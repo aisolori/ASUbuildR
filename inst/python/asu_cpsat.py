@@ -276,6 +276,428 @@ def _root_articulation_implications(
     return implications
 
 
+def _bounded_root_vertex_separator(
+    nb_local: List[List[int]],
+    root_local: int,
+    target: int,
+    max_size: int,
+) -> Optional[Tuple[int, ...]]:
+    """Return a minimum root-target vertex separator when its size is 2..max_size."""
+    N = len(nb_local)
+    if target == root_local or max_size < 2:
+        return None
+
+    cutoff = int(max_size) + 1
+    residual: List[Dict[int, int]] = [dict() for _ in range(2 * N)]
+
+    def _add_arc(start: int, end: int, capacity: int) -> None:
+        residual[start][end] = residual[start].get(end, 0) + capacity
+        residual[end].setdefault(start, 0)
+
+    for node in range(N):
+        capacity = cutoff if node in (root_local, target) else 1
+        _add_arc(2 * node, 2 * node + 1, capacity)
+
+    undirected_edges = {
+        (min(node, neighbor), max(node, neighbor))
+        for node, neighbors in enumerate(nb_local)
+        for neighbor in neighbors
+        if node != neighbor
+    }
+    for left, right in undirected_edges:
+        _add_arc(2 * left + 1, 2 * right, cutoff)
+        _add_arc(2 * right + 1, 2 * left, cutoff)
+
+    source = 2 * root_local + 1
+    sink = 2 * target
+    flow = 0
+    while flow < cutoff:
+        parent = [-1] * (2 * N)
+        parent[source] = source
+        queue = [source]
+        head = 0
+        while head < len(queue) and parent[sink] < 0:
+            node = queue[head]
+            head += 1
+            for neighbor, capacity in residual[node].items():
+                if capacity > 0 and parent[neighbor] < 0:
+                    parent[neighbor] = node
+                    queue.append(neighbor)
+                    if neighbor == sink:
+                        break
+        if parent[sink] < 0:
+            break
+
+        amount = cutoff - flow
+        node = sink
+        while node != source:
+            previous = parent[node]
+            amount = min(amount, residual[previous][node])
+            node = previous
+        node = sink
+        while node != source:
+            previous = parent[node]
+            residual[previous][node] -= amount
+            residual[node][previous] = residual[node].get(previous, 0) + amount
+            node = previous
+        flow += amount
+
+    if flow < 2 or flow > max_size:
+        return None
+
+    reachable = {source}
+    queue = [source]
+    head = 0
+    while head < len(queue):
+        node = queue[head]
+        head += 1
+        for neighbor, capacity in residual[node].items():
+            if capacity > 0 and neighbor not in reachable:
+                reachable.add(neighbor)
+                queue.append(neighbor)
+
+    separator = tuple(
+        node for node in range(N)
+        if node not in (root_local, target)
+        and 2 * node in reachable
+        and 2 * node + 1 not in reachable
+    )
+    return separator if 2 <= len(separator) <= max_size else None
+
+
+def _small_root_separator_implications(
+    nb_local: List[List[int]],
+    root_local: int,
+    node_value: np.ndarray,
+    max_size: int = 3,
+    clause_limit: int = 200,
+    target_limit: int = 128,
+) -> List[Tuple[int, Tuple[int, ...]]]:
+    """Find capped size-2/3 separators and the nodes they disconnect from root."""
+    N = len(nb_local)
+    max_size = max(2, int(max_size))
+    clause_limit = max(0, int(clause_limit))
+    if N <= 2 or clause_limit == 0:
+        return []
+
+    target_order = sorted(
+        (node for node in range(N) if node != root_local),
+        key=lambda node: (-int(node_value[node]), node),
+    )[:max(1, int(target_limit))]
+    seen_separators: set = set()
+    implications: List[Tuple[int, Tuple[int, ...]]] = []
+
+    for target in target_order:
+        separator = _bounded_root_vertex_separator(
+            nb_local, root_local, target, max_size
+        )
+        if separator is None or separator in seen_separators:
+            continue
+        seen_separators.add(separator)
+
+        blocked = set(separator)
+        reachable = {root_local}
+        queue = [root_local]
+        head = 0
+        while head < len(queue):
+            node = queue[head]
+            head += 1
+            for neighbor in nb_local[node]:
+                if neighbor not in blocked and neighbor not in reachable:
+                    reachable.add(neighbor)
+                    queue.append(neighbor)
+
+        affected = sorted(
+            (
+                node for node in range(N)
+                if node not in reachable and node not in blocked
+            ),
+            key=lambda node: (-int(node_value[node]), node),
+        )
+        for node in affected:
+            implications.append((node, separator))
+            if len(implications) >= clause_limit:
+                return implications
+
+    return implications
+
+
+def _rank01(values: np.ndarray) -> np.ndarray:
+    """Return average ranks scaled to [0, 1], with equal values tied."""
+    values = np.asarray(values, dtype=float)
+    n = len(values)
+    if n <= 1:
+        return np.ones(n, dtype=float)
+
+    order = np.argsort(values, kind="stable")
+    ranks = np.empty(n, dtype=float)
+    sorted_values = values[order]
+    start = 0
+    while start < n:
+        end = start + 1
+        while end < n and sorted_values[end] == sorted_values[start]:
+            end += 1
+        ranks[order[start:end]] = 0.5 * (start + end - 1)
+        start = end
+    return ranks / (n - 1)
+
+
+def _asu_branch_order(
+    nb_local: List[List[int]],
+    u_g: np.ndarray,
+    E_g: np.ndarray,
+    root_local: int,
+    num: int,
+    den: int,
+    hint: Optional[List[int]] = None,
+    root_implications: Optional[Sequence[Tuple[int, int]]] = None,
+) -> Tuple[List[int], np.ndarray]:
+    """Rank tract variables for one domain-specific partial-search worker."""
+    N = len(nb_local)
+    rate_slack = (
+        int(den) * u_g.astype(np.int64)
+        - int(num) * E_g.astype(np.int64)
+    )
+    degree = np.array([len(neighbors) for neighbors in nb_local], dtype=float)
+    downstream = np.zeros(N, dtype=float)
+
+    implications = root_implications
+    if implications is None:
+        implications = _root_articulation_implications(nb_local, root_local)
+    for _, cut_vertex in implications:
+        downstream[cut_vertex] += 1
+
+    score = (
+        0.45 * _rank01(u_g)
+        + 0.25 * _rank01(rate_slack)
+        + 0.10 * _rank01(degree)
+        + 0.20 * _rank01(downstream)
+    )
+    if hint is not None:
+        hint_set = set(hint)
+        score += 0.10 * np.array(
+            [i in hint_set for i in range(N)],
+            dtype=float,
+        )
+
+    order = np.argsort(-score, kind="stable")
+    return order.astype(int).tolist(), score
+
+
+def _asu_branch_challenges(
+    nb_local: List[List[int]],
+    branch_order: Sequence[int],
+    hint: Optional[Sequence[int]],
+    protected: Sequence[int],
+    max_prefix: int = 64,
+) -> Tuple[List[int], List[int]]:
+    """Rank one-hop additions and removable nodes on the incumbent boundary."""
+    prefix_budget = max(1, int(max_prefix))
+    add_budget = (prefix_budget + 1) // 2
+    drop_budget = prefix_budget // 2
+    hint_set = set(int(i) for i in (hint or []))
+    protected_set = set(int(i) for i in protected)
+
+    selected_mask = np.zeros(len(nb_local), dtype=bool)
+    if hint_set:
+        selected_mask[list(hint_set)] = True
+    protected_set.update(_articulation_points(nb_local, selected_mask))
+
+    frontier = {
+        neighbor
+        for node in hint_set
+        for neighbor in nb_local[node]
+        if neighbor not in hint_set
+    }
+    boundary = {
+        node for node in hint_set
+        if any(neighbor not in hint_set for neighbor in nb_local[node])
+    }
+
+    additions = [
+        int(i) for i in branch_order
+        if i in frontier
+    ][:add_budget]
+    removals = [
+        int(i) for i in reversed(branch_order)
+        if i in boundary and i not in protected_set
+    ][:drop_budget]
+    return additions, removals
+
+
+_ASU_FULL_SUBSOLVER_PATTERN = (
+    "asu_probe_fast",
+    "max_lp",
+    "portfolio_max_lp",
+
+    "lb_tree_search",
+    "asu_probe_standard",
+
+    "probing_no_lp",
+    "max_lp",
+    "core_max_lp",
+    "portfolio_max_lp",
+    "asu_probe_fast",
+
+    "asu_probe_standard",
+    "lb_tree_search",
+    "max_lp",
+    "objective_shaving_max_lp",
+    "objective_shaving_no_lp"
+)
+def _asu_full_subsolvers(
+    workers: int,
+    use_tract_first_search: bool = False,
+    use_tract_first_probing: bool = False,
+) -> List[str]:
+    """Return the bounded full-problem portfolio for one ASU solve."""
+    workers = max(1, int(workers))
+    if workers < 8:
+        return []
+
+    full_budget = max(3, min(16, round(workers / 3)))
+    full_subsolvers = list(_ASU_FULL_SUBSOLVER_PATTERN[:full_budget])
+    if use_tract_first_search:
+        # Preserve reduced-cost and pseudo-cost search. At large budgets, use
+        # one of the duplicate max-LP slots for the boundary worker instead.
+        max_lp_indices = [
+            index for index, name in enumerate(full_subsolvers)
+            if name == "max_lp"
+        ]
+        replace_index = (
+            max_lp_indices[-1]
+            if len(max_lp_indices) > 1
+            else full_subsolvers.index("portfolio_max_lp")
+            if "portfolio_max_lp" in full_subsolvers
+            else len(full_subsolvers) - 1
+        )
+        full_subsolvers[replace_index] = "asu_tract_first"
+    if use_tract_first_probing:
+        for source, replacement in (
+            ("asu_probe_fast", "asu_probe_fast_tract_first"),
+            ("asu_probe_standard", "asu_probe_standard_tract_first"),
+        ):
+            source_indices = [
+                index for index, name in enumerate(full_subsolvers)
+                if name == source
+            ]
+            if len(source_indices) > 1:
+                full_subsolvers[source_indices[-1]] = replacement
+    return full_subsolvers
+
+
+def _append_asu_subsolver_params(params, name: str, **overrides) -> None:
+    """Append owned subsolver parameters compatible with OR-Tools 9.14 and 9.15."""
+    subsolver_params = type(params)()
+    subsolver_params.name = name
+    for field, value in overrides.items():
+        setattr(subsolver_params, field, value)
+    params.subsolver_params.append(subsolver_params)
+
+
+def _supports_tract_first_probing(params) -> bool:
+    """Return whether this OR-Tools build supports Boolean-first probing."""
+    descriptor = getattr(params, "DESCRIPTOR", None)
+    return (
+        descriptor is not None
+        and "continuous_probing_order" in descriptor.fields_by_name
+        and hasattr(type(params), "CONTINUOUS_PROBING_BOOLEANS_FIRST")
+    )
+
+
+def _configure_asu_lp_search_params(params) -> None:
+    """Apply LP branching to compatible full and local solves."""
+    _append_asu_subsolver_params(
+        params,
+        "lns_base",
+        linearization_level=2,
+        search_branching=cp_model.LP_SEARCH
+    )
+
+
+def _configure_asu_probe_variants(
+    params,
+    tract_first: bool = False,
+) -> bool:
+    """Register ContinuousProber workers and return tract-first availability."""
+
+    common = {
+        # ContinuousProber worker, not normal tree search.
+        "search_branching": cp_model.AUTOMATIC_SEARCH,
+        "use_probing_search": True,
+        "use_extended_probing": True,
+        "at_most_one_max_expansion_size": 2,
+
+        "shaving_deterministic_time_in_probing_search": 0.001,
+        "probing_num_combinations_limit": 0,
+
+        "linearization_level": 2,
+        "add_lp_constraints_lazily": False,
+        "max_cut_rounds_at_level_zero": 4,
+    }
+
+    tract_first_enabled = tract_first and _supports_tract_first_probing(params)
+    variants = [
+        ("asu_probe_fast",       50_000, 0.001, False),
+        ("asu_probe_standard", 100_000, 0.005, False),
+    ]
+    if tract_first_enabled:
+        variants.extend([
+            ("asu_probe_fast_tract_first", 50_000, 0.001, True),
+            ("asu_probe_standard_tract_first", 100_000, 0.005, True),
+        ])
+
+    for name, root_iterations, shaving_time, boolean_first in variants:
+        overrides = dict(common)
+        overrides["root_lp_iterations"] = root_iterations
+        overrides["shaving_search_deterministic_time"] = shaving_time
+        if boolean_first:
+            overrides["continuous_probing_order"] = (
+                type(params).CONTINUOUS_PROBING_BOOLEANS_FIRST
+            )
+
+        _append_asu_subsolver_params(
+            params,
+            name,
+            **overrides,
+        )
+
+    return tract_first_enabled
+
+
+def _configure_asu_pseudo_costs(params) -> None:
+    """Register a genuine pseudo-cost branch-and-bound worker."""
+
+    _append_asu_subsolver_params(
+        params,
+        "asu_pseudo_costs",
+
+        search_branching=cp_model.PSEUDO_COST_SEARCH,
+
+        # Important: allow normal tree search.
+        use_probing_search=False,
+
+        linearization_level=2,
+
+        # OR-Tools also enables this on its built-in pseudo_costs worker.
+        exploit_best_solution=True,
+    )
+
+
+def _configure_asu_shared_tree(params, tract_first: bool = False) -> None:
+    """Configure coordinated proof workers around the global objective bound."""
+    params.shared_tree_num_workers = 4
+    params.shared_tree_split_strategy = (
+        type(params).SPLIT_STRATEGY_OBJECTIVE_LB
+    )
+    if tract_first:
+        _append_asu_subsolver_params(
+            params,
+            "shared_tree",
+            search_branching=cp_model.PARTIAL_FIXED_SEARCH,
+        )
+
+
 def reverse_prune_hint(
     nb_local: List[List[int]],
     u_g: np.ndarray,  # tract unemployment counts
@@ -628,6 +1050,12 @@ def solve_one_asu_cpsat(
     use_signed_flow: bool = True,
     use_arborescence: bool = False,
     configure_subsolvers: bool = True,
+    use_tract_first_search: bool = False,
+    use_flow_count_envelope: bool = True,
+    use_small_root_separators: bool = True,
+    root_separator_max_size: int = 3,
+    root_separator_clause_limit: int = 200,
+    solution_pool_size: int = 32,
 ) -> Optional[CpsatResult]:
     """
         Connectivity via iterative vertex-separator cuts. Each disconnected incumbent
@@ -648,6 +1076,11 @@ def solve_one_asu_cpsat(
     nb_local, u_g, E_g, P_g = nb_c, u_c, E_c, P_c
     N = len(nb_local)
     root_local = int(node_map_c[root_local_orig])
+    tract_first_enabled = (
+        configure_subsolvers
+        and use_tract_first_search
+        and max(1, int(workers)) >= 8
+    )
     if hint is not None:
         hint = sorted({int(node_map_c[v]) for v in hint})
 
@@ -678,9 +1111,33 @@ def solve_one_asu_cpsat(
         else:
             model.Add(x[v] == 0)
 
+    root_implications = (
+        _root_articulation_implications(nb_local, root_local)
+        if use_root_articulation_implications or tract_first_enabled else []
+    )
     if use_root_articulation_implications:
-        for node, cut_vertex in _root_articulation_implications(nb_local, root_local):
+        for node, cut_vertex in root_implications:
             model.Add(x[node] <= x[cut_vertex])
+
+    separator_implications = (
+        _small_root_separator_implications(
+            nb_local,
+            root_local,
+            u_g,
+            max_size=root_separator_max_size,
+            clause_limit=root_separator_clause_limit,
+        )
+        if use_small_root_separators else []
+    )
+    for node, separator in separator_implications:
+        model.AddBoolOr([x[node].Not()] + [x[cut_vertex] for cut_vertex in separator])
+    if log and use_small_root_separators:
+        separator_count = len({separator for _, separator in separator_implications})
+        print(
+            f"  small root separators: {len(separator_implications)} clause(s) "
+            f"from {separator_count} separator(s)",
+            flush=True,
+        )
 
     # Population threshold
     pop_expr = sum(int(P_g[i]) * x[i] for i in range(N))
@@ -921,9 +1378,10 @@ def solve_one_asu_cpsat(
         _ms.parameters.log_search_progress = False
         _ms_status = _ms.Solve(_mM)
         if _ms_status == cp_model.OPTIMAL:
-            M = max(1, int(round(_ms.ObjectiveValue())) - 1)
+            max_selected = max(1, int(round(_ms.ObjectiveValue())))
         else:
-            M = max(1, N - 1)
+            max_selected = N
+        M = max(1, max_selected - 1)
         # NOTE: _bridge_edge_bounds() gives a provably sound tighter per-edge cap
         # (validated against 400 brute-force instances + explicit counterexamples)
         # but was A/B tested on real Colorado data and was a clear regression
@@ -931,7 +1389,12 @@ def solve_one_asu_cpsat(
         # available but NOT wired in by default.
         edge_bounds = [M] * len(edges)
 
-        selected_count = sum(x)
+        selected_count = model.NewIntVar(
+            len(forced_set), max_selected, "selected_count"
+        )
+        model.Add(selected_count == sum(x))
+        if flow_source is not None:
+            model.AddHint(selected_count, len(flow_source))
 
         if use_signed_flow:
             f = [
@@ -940,16 +1403,19 @@ def solve_one_asu_cpsat(
             ]
             net_out_for = [[] for _ in range(N)]
             for edge_index, (i, j) in enumerate(edges):
-              model.Add(f[edge_index] == 0).OnlyEnforceIf(x[i].Not())
-              model.Add(f[edge_index] == 0).OnlyEnforceIf(x[j].Not())
-          
-              net_out_for[i].append(f[edge_index])
-              net_out_for[j].append(-f[edge_index])
-          
-              model.AddHint(
-                  f[edge_index],
-                  flow_hints.get((i, j), 0) - flow_hints.get((j, i), 0),
-              )
+                model.Add(f[edge_index] == 0).OnlyEnforceIf(x[i].Not())
+                model.Add(f[edge_index] == 0).OnlyEnforceIf(x[j].Not())
+                if use_flow_count_envelope:
+                    model.Add(f[edge_index] <= selected_count - 1)
+                    model.Add(f[edge_index] >= 1 - selected_count)
+
+                net_out_for[i].append(f[edge_index])
+                net_out_for[j].append(-f[edge_index])
+
+                model.AddHint(
+                    f[edge_index],
+                    flow_hints.get((i, j), 0) - flow_hints.get((j, i), 0),
+                )
             for i in range(N):
                 net_outflow = sum(net_out_for[i]) if net_out_for[i] else 0
                 model.Add(net_outflow == (selected_count - 1 if i == root_local else -x[i]))
@@ -974,6 +1440,12 @@ def solve_one_asu_cpsat(
         if log:
             print(f"  flow formulation: {'signed' if use_signed_flow else 'directed'} "
                   f"({len(edges)} edge variables)", flush=True)
+            if use_signed_flow and use_flow_count_envelope:
+                print(
+                    f"  flow count envelope: selected <= {max_selected}, "
+                    "|flow| <= selected - 1",
+                    flush=True,
+                )
 
     remaining_time = float(time_limit) - (time.monotonic() - start_time)
     if log and cut_round > 0:
@@ -1020,6 +1492,7 @@ def solve_one_asu_cpsat(
                     model.ClearHints()
                     for _i in range(N):
                         model.AddHint(x[_i], 1 if _i in _scout_set else 0)
+                    model.AddHint(selected_count, len(_scout_set))
                     if use_signed_flow:
                         for _ei, (_eu, _ev) in enumerate(edges):
                             model.AddHint(f[_ei], _sf.get((_eu, _ev), 0) - _sf.get((_ev, _eu), 0))
@@ -1114,6 +1587,58 @@ def solve_one_asu_cpsat(
         if remaining_time <= 0.01:
             return _to_orig(best_connected, "FEASIBLE") if best_connected else None
 
+        if tract_first_enabled:
+            branch_order, _ = _asu_branch_order(
+                nb_local=nb_local,
+                u_g=u_g,
+                E_g=E_g,
+                root_local=root_local,
+                num=num,
+                den=den,
+                hint=best_connected if best_connected is not None else hint,
+                root_implications=root_implications,
+            )
+            branch_hint = best_connected if best_connected is not None else hint
+            protected_branch_nodes = forced_set | {
+                cut_vertex for _, cut_vertex in root_implications
+            }
+            branch_additions, branch_removals = _asu_branch_challenges(
+                nb_local=nb_local,
+                branch_order=branch_order,
+                hint=branch_hint,
+                protected=protected_branch_nodes,
+            )
+            if branch_removals:
+                model.AddDecisionStrategy(
+                    [x[i] for i in branch_removals],
+                    cp_model.CHOOSE_FIRST,
+                    cp_model.SELECT_MIN_VALUE,
+                )
+            if branch_additions:
+                model.AddDecisionStrategy(
+                    [x[i] for i in branch_additions],
+                    cp_model.CHOOSE_FIRST,
+                    cp_model.SELECT_MAX_VALUE,
+                )
+            challenged_tracts = set(branch_removals) | set(branch_additions)
+            remaining_tracts = [
+                int(i) for i in branch_order
+                if i not in challenged_tracts
+            ]
+            if remaining_tracts:
+                model.AddDecisionStrategy(
+                    [x[i] for i in remaining_tracts],
+                    cp_model.CHOOSE_FIRST,
+                    cp_model.SELECT_MAX_VALUE,
+                )
+            if log:
+                print(
+                    f"  tract-first worker: drop {len(branch_removals)} boundary, "
+                    f"add {len(branch_additions)} frontier, then branch on "
+                    f"{len(remaining_tracts)} remaining tract variables before flow",
+                    flush=True,
+                )
+
         solver = cp_model.CpSolver()
         solver.parameters.num_search_workers = max(1, int(workers))
         solver.parameters.max_time_in_seconds = remaining_time
@@ -1125,22 +1650,36 @@ def solve_one_asu_cpsat(
 
         # LNS settings
         solver.parameters.lns_initial_difficulty = 0.65
-        solver.parameters.solution_pool_size = 10
+        solver.parameters.lns_initial_deterministic_limit = 0.6
+        solver.parameters.solution_pool_size = max(1, int(solution_pool_size))
         solver.parameters.diversify_lns_params = True
 
 
         solver.parameters.add_objective_cut = True
         solver.parameters.variables_shaving_level = 3
-
-        if hasattr(solver.parameters, "merge_text_format"):
-            lns_params_text = (
-                'subsolver_params { name: "lns_base" linearization_level: 1 }'
-            )
-            solver.parameters.merge_text_format(lns_params_text)
-        else:
-            lns_params = solver.parameters.subsolver_params.add()
-            lns_params.name = "lns_base"
-            lns_params.linearization_level = 1
+        _configure_asu_lp_search_params(solver.parameters)
+        tract_first_probing_enabled = _configure_asu_probe_variants(
+            solver.parameters,
+            tract_first=tract_first_enabled,
+        )
+        if tract_first_enabled and log:
+            if tract_first_probing_enabled:
+                print(
+                    "  tract-first probing: one fast and one standard worker "
+                    "probe tract Booleans before flow bounds",
+                    flush=True,
+                )
+            else:
+                print(
+                    "  tract-first probing: unavailable in this OR-Tools build; "
+                    "retaining integer-first probe workers",
+                    flush=True,
+                )
+        _configure_asu_pseudo_costs(solver.parameters)
+        _configure_asu_shared_tree(
+            solver.parameters,
+            tract_first=tract_first_enabled,
+        )
 
         def configure_asu_subsolvers(params, workers):
             workers = max(1, int(workers))
@@ -1150,23 +1689,24 @@ def solve_one_asu_cpsat(
 
             # Prevent old/default custom subsolvers from being inserted
             # ahead of our explicitly ordered ASU portfolio.
-            params.ClearField("extra_subsolvers")
-            params.ClearField("subsolvers")
-            params.ClearField("filter_subsolvers")
+            params.extra_subsolvers.clear()
+            params.subsolvers.clear()
+            params.filter_subsolvers.clear()
 
-            # ASU benefits strongly from interleaved RINS/LNS/LS.
-            # Do not devote too many workers to full-problem solvers.
-            full_budget = max(
-                3,
-                min(16, round(workers / 3))
-            )
+            if tract_first_enabled:
+                _append_asu_subsolver_params(
+                    params,
+                    "asu_tract_first",
+                    search_branching=cp_model.PARTIAL_FIXED_SEARCH,
+                    linearization_level=2,
+                )
 
             # Ordered so that every prefix is useful.
             #
             # ASU roles observed in logs:
             #
-            #   probing_max_lp
-            #       Primary objective-bound / proof worker.
+            #   asu_probe_fast / asu_probe_standard / asu_probe_deep
+            #       Controlled root-LP-effort variants of the primary proof worker.
             #
             #   lb_tree_search
             #       Useful for larger early bound jumps.
@@ -1174,9 +1714,8 @@ def solve_one_asu_cpsat(
             #   variables_shaving
             #       Strong early domain/bound reduction on large states.
             #
-            #   pseudo_costs
-            #       Useful supporting search, but less productive than
-            #       probing_max_lp for ASU proof work.
+            #   max_lp
+            #       Full LP search and sharing worker.
             #
             #   quick_restart_no_lp
             #       SAT diversification / clause and bound sharing.
@@ -1185,31 +1724,11 @@ def solve_one_asu_cpsat(
             #   probing
             #       Lower priority; retain one copy only at large budgets.
             #
-            allocation_pattern = [
-                "probing_max_lp",
-                "lb_tree_search",
-                "pseudo_costs",
-
-                "variables_shaving",
-                "probing_max_lp",
-
-
-                "lb_tree_search",
-                "objective_lb_search_max_lp",
-
-                "reduced_costs",
-                "pseudo_costs",
-
-                "probing_max_lp",
-                "quick_restart_max_lp",
-
-                "probing_max_lp",
-                "lb_tree_search",
-
-                "max_lp",
-            ]
-
-            full_subsolvers = allocation_pattern[:full_budget]
+            full_subsolvers = _asu_full_subsolvers(
+                workers,
+                use_tract_first_search=tract_first_enabled,
+                use_tract_first_probing=tract_first_probing_enabled,
+            )
 
             params.subsolvers.extend(full_subsolvers)
             params.num_full_subsolvers = len(full_subsolvers)
@@ -1220,11 +1739,13 @@ def solve_one_asu_cpsat(
                     "lb_relax_lns",
 
                     "graph_arc_lns",
+                    "graph_var_lns",
+                    "graph_cst_lns",
 
                     # Diversification / basin escape
                     "rnd_var_lns",
 
-                    "variables_shaving_max_lp",
+                    "shared_tree",
 
                     "ls*",
                 ]
@@ -1240,6 +1761,15 @@ def solve_one_asu_cpsat(
             )
         if rel_gap is not None:
             solver.parameters.relative_gap_limit = float(rel_gap)
+        if log:
+            print(
+                "ASU probing experiment:\n"
+                "  asu_probe_fast     root_lp_iterations=50000\n"
+                "  asu_probe_standard root_lp_iterations=100000\n"
+                "  shared_tree_num_workers=4\n"
+                "  shared_tree_split_strategy=OBJECTIVE_LB",
+                flush=True,
+            )
         status = solver.Solve(model)
         status_name = solver.StatusName(status)
         if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
@@ -2696,9 +3226,16 @@ def build_many_asus_cpsat(
     export_dir: Optional[str] = None,
     deterministic_ties: bool = True,
     objective_shaving: bool = False,
+    use_root_articulation_implications: bool = False,
     use_signed_flow: bool = True,
     use_arborescence: bool = False,
     configure_subsolvers: bool = True,
+    use_tract_first_search: bool = False,
+    use_flow_count_envelope: bool = True,
+    use_small_root_separators: bool = True,
+    root_separator_max_size: int = 3,
+    root_separator_clause_limit: int = 200,
+    solution_pool_size: int = 32,
     full_graph_window: bool = False,
 ) -> Dict[str, np.ndarray]:
     """
@@ -2873,9 +3410,16 @@ def build_many_asus_cpsat(
                 deterministic_ties=deterministic_ties,
                 tie_break_rank=w["tie_break_rank"],
                 objective_shaving=objective_shaving,
+                use_root_articulation_implications=use_root_articulation_implications,
                 use_signed_flow=use_signed_flow,
                 use_arborescence=use_arborescence,
                 configure_subsolvers=configure_subsolvers,
+                use_tract_first_search=use_tract_first_search,
+                use_flow_count_envelope=use_flow_count_envelope,
+                use_small_root_separators=use_small_root_separators,
+                root_separator_max_size=root_separator_max_size,
+                root_separator_clause_limit=root_separator_clause_limit,
+                solution_pool_size=solution_pool_size,
                 # cluster_groups intentionally NOT passed here: tying high-UR
                 # cluster members via equality is provably correct (validated
                 # against brute force) but empirically hurts this time-limited
@@ -3026,7 +3570,7 @@ def main():
     ap.add_argument("--min-pop-margin", type=float, default=1.0)
     ap.add_argument("--time-limit", type=int, default=1200, help="CP-SAT time limit per window (seconds)")
     ap.add_argument("--workers", type=int, default=8, help="CP-SAT parallel workers")
-    ap.add_argument("--rel-gap", type=float, default=None, help="Optional relative gap (e.g., 0.01 for 1%)")
+    ap.add_argument("--rel-gap", type=float, default=None, help="Optional relative gap (e.g., 0.01 for 1%%)")
     ap.add_argument("--parallel-asus", type=int, default=1, help="Number of ASU windows to solve concurrently")
     ap.add_argument("--no-merge-adjacent", action="store_true", help="Disable merging of touching ASUs built in the same batch")
     ap.add_argument(
@@ -3034,6 +3578,32 @@ def main():
         action="store_true",
         help="Skip secondary optimal-solution tie-break solves",
     )
+    ap.add_argument(
+        "--use-root-articulation-implications",
+        action="store_true",
+        help="Add root-based articulation implications to strengthen connectivity",
+    )
+    ap.add_argument(
+        "--use-tract-first-search",
+        action="store_true",
+        help=(
+            "Enable the experimental incumbent-boundary worker, trying safe "
+            "exclusions before frontier additions"
+        ),
+    )
+    ap.add_argument(
+        "--no-flow-count-envelope",
+        action="store_true",
+        help="Disable dynamic signed-flow bounds based on selected-node count",
+    )
+    ap.add_argument(
+        "--no-small-root-separators",
+        action="store_true",
+        help="Disable size-2/3 rooted vertex-separator clauses",
+    )
+    ap.add_argument("--root-separator-max-size", type=int, default=3)
+    ap.add_argument("--root-separator-clause-limit", type=int, default=200)
+    ap.add_argument("--solution-pool-size", type=int, default=32)
     ap.add_argument("--output", default=None, help="Output CSV path (default: <stem>_with_asu.csv)")
     ap.add_argument("--verbose", action="store_true", help="Verbose CP-SAT logs")
     args = ap.parse_args()
@@ -3103,6 +3673,13 @@ def main():
         verbose=args.verbose, parallel_asus=args.parallel_asus,
         merge_adjacent=not args.no_merge_adjacent,
         deterministic_ties=not args.no_deterministic_ties,
+        use_root_articulation_implications=args.use_root_articulation_implications,
+        use_tract_first_search=args.use_tract_first_search,
+        use_flow_count_envelope=not args.no_flow_count_envelope,
+        use_small_root_separators=not args.no_small_root_separators,
+        root_separator_max_size=args.root_separator_max_size,
+        root_separator_clause_limit=args.root_separator_clause_limit,
+        solution_pool_size=args.solution_pool_size,
     )
 
     df_out = df.copy()
