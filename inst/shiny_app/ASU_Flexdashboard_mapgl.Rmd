@@ -1154,12 +1154,12 @@ kwargs = dict(
     time_limit=%d, workers=%d, verbose=True,
     configure_subsolvers=True,
     use_root_articulation_implications=True,
-    use_tract_first_search=True,
+    use_tract_first_search=False,
     use_flow_count_envelope=False,
-    use_small_root_separators=False,
-    root_separator_max_size=8,
+    use_small_root_separators=True,
+    root_separator_max_size=5,
 
-    root_separator_clause_limit=400,
+    root_separator_clause_limit=500,
     solution_pool_size=32,
     full_graph_window=True
 )

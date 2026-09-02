@@ -369,23 +369,41 @@ def _small_root_separator_implications(
     nb_local: List[List[int]],
     root_local: int,
     node_value: np.ndarray,
+    q_surplus: Optional[np.ndarray] = None,
     max_size: int = 3,
     clause_limit: int = 200,
     target_limit: int = 128,
-) -> List[Tuple[int, Tuple[int, ...]]]:
-    """Find capped size-2/3 separators and the nodes they disconnect from root."""
+) -> Tuple[List[Tuple[int, Tuple[int, ...]]], List[Tuple[Tuple[int, ...], Tuple[int, ...], int]]]:
+    """
+    Find capped size-2/3 separators and the nodes they disconnect from root.
+    Returns (implications, component_bounds):
+      - implications: per-node clauses x_i <= OR(x_s for s in separator)
+      - component_bounds: (separator, affected_nodes, K_C) aggregate cardinality
+        bounds, where K_C is the max number of nodes in `affected` that could
+        possibly be selected given the UR-surplus (q_surplus) available to the
+        rest of the graph. Combined with an activation var z_C <= sum(x_s), the
+        caller can add sum(x_i for i in affected) <= K_C * z_C -- ignoring
+        connectivity/population/root restrictions like the global cardinality
+        bound already used for M, so it stays a valid upper bound even though
+        it's cheap (just a sort) and computed per-component.
+    """
     N = len(nb_local)
     max_size = max(2, int(max_size))
     clause_limit = max(0, int(clause_limit))
+    implications: List[Tuple[int, Tuple[int, ...]]] = []
+    component_bounds: List[Tuple[Tuple[int, ...], Tuple[int, ...], int]] = []
     if N <= 2 or clause_limit == 0:
-        return []
+        return implications, component_bounds
+
+    total_positive_q = (
+        int(np.clip(q_surplus, 0, None).sum()) if q_surplus is not None else None
+    )
 
     target_order = sorted(
         (node for node in range(N) if node != root_local),
         key=lambda node: (-int(node_value[node]), node),
     )[:max(1, int(target_limit))]
     seen_separators: set = set()
-    implications: List[Tuple[int, Tuple[int, ...]]] = []
 
     for target in target_order:
         separator = _bounded_root_vertex_separator(
@@ -414,12 +432,30 @@ def _small_root_separator_implications(
             ),
             key=lambda node: (-int(node_value[node]), node),
         )
+        clause_limit_hit = False
         for node in affected:
             implications.append((node, separator))
             if len(implications) >= clause_limit:
-                return implications
+                clause_limit_hit = True
+                break
 
-    return implications
+        if affected and q_surplus is not None and total_positive_q is not None:
+            positive_within = int(np.clip(q_surplus[affected], 0, None).sum())
+            budget = total_positive_q - positive_within
+            sorted_q = sorted((int(v) for v in q_surplus[affected]), reverse=True)
+            k, running = 0, 0
+            for value in sorted_q:
+                if running + value < -budget:
+                    break
+                running += value
+                k += 1
+            if k < len(affected):
+                component_bounds.append((separator, tuple(affected), k))
+
+        if clause_limit_hit:
+            break
+
+    return implications, component_bounds
 
 
 def _rank01(values: np.ndarray) -> np.ndarray:
@@ -527,7 +563,7 @@ def _asu_branch_challenges(
 
 _ASU_FULL_SUBSOLVER_PATTERN = (
     "asu_probe_fast",
-    "max_lp",
+    "lb_tree_search",
     "portfolio_max_lp",
 
     "lb_tree_search",
@@ -611,7 +647,7 @@ def _configure_asu_lp_search_params(params) -> None:
         params,
         "lns_base",
         linearization_level=2,
-        search_branching=cp_model.LP_SEARCH
+        search_branching=cp_model.LP_SEARCH,
     )
 
 
@@ -629,6 +665,18 @@ def _configure_asu_probe_variants(
         "at_most_one_max_expansion_size": 2,
 
         "shaving_deterministic_time_in_probing_search": 0.001,
+        # NOTE: CP-SAT default is 20000; was 0 here, which fully disabled
+        # random-triplet-of-bool-vars probing (see integer_search.cc,
+        # ContinuousProber::Probe: loop_limit=limit when num_bool_vars
+        # exceeds sqrt/cbrt(2*limit), always true for our 1000+ bool var
+        # models). Random-pair probing is unaffected either way (hardcoded
+        # 10000-iteration fallback). A/B tested on real data (seed=1173,
+        # matched 600s budget): asu_probe_fast/standard's own "improving
+        # bounds shared" dropped a lot (47->11, 23->14) -- triplet probing
+        # does eat into their productive time, as expected -- but
+        # lb_tree_search's share grew far more (53->431) and objective/
+        # gap_integral came out flat-to-slightly-better (75425 vs 75422,
+        # gap_integral 9339.88 vs 9485.54). Kept at the CP-SAT default.
         "probing_num_combinations_limit": 0,
 
         "linearization_level": 2,
@@ -636,15 +684,17 @@ def _configure_asu_probe_variants(
         "max_cut_rounds_at_level_zero": 4,
     }
 
-    tract_first_enabled = tract_first and _supports_tract_first_probing(params)
+    
     variants = [
-        ("asu_probe_fast",       50_000, 0.001, False),
-        ("asu_probe_standard", 100_000, 0.005, False),
+        ("asu_probe_fast",       25_000, 0.001, False),
+        ("asu_probe_standard", 50_000, 0.001, False),
     ]
+
+    tract_first_enabled = tract_first and _supports_tract_first_probing(params)
     if tract_first_enabled:
         variants.extend([
-            ("asu_probe_fast_tract_first", 50_000, 0.001, True),
-            ("asu_probe_standard_tract_first", 100_000, 0.005, True),
+            ("asu_probe_fast_tract_first", 50_000, 0.0005, True),
+            ("asu_probe_standard_tract_first", 100_000, 0.0005, True),
         ])
 
     for name, root_iterations, shaving_time, boolean_first in variants:
@@ -686,7 +736,7 @@ def _configure_asu_pseudo_costs(params) -> None:
 
 def _configure_asu_shared_tree(params, tract_first: bool = False) -> None:
     """Configure coordinated proof workers around the global objective bound."""
-    params.shared_tree_num_workers = 4
+    params.shared_tree_num_workers = 0
     params.shared_tree_split_strategy = (
         type(params).SPLIT_STRATEGY_OBJECTIVE_LB
     )
@@ -1055,6 +1105,7 @@ def solve_one_asu_cpsat(
     use_small_root_separators: bool = True,
     root_separator_max_size: int = 3,
     root_separator_clause_limit: int = 200,
+    use_separator_cardinality_bounds: bool = True,
     solution_pool_size: int = 32,
 ) -> Optional[CpsatResult]:
     """
@@ -1119,23 +1170,36 @@ def solve_one_asu_cpsat(
         for node, cut_vertex in root_implications:
             model.Add(x[node] <= x[cut_vertex])
 
-    separator_implications = (
+    # q_i = den*u_i - num*E_i is the exact-integer form of UR-surplus
+    # u_i - tau*(u_i+E_i); sum(q_i * x_i) >= 0 is exactly the UR constraint below.
+    num, den = as_fraction_tau(tau)
+    q_surplus = den * u_g.astype(np.int64) - num * E_g.astype(np.int64)
+
+    separator_implications, separator_component_bounds = (
         _small_root_separator_implications(
             nb_local,
             root_local,
             u_g,
+            q_surplus if use_separator_cardinality_bounds else None,
             max_size=root_separator_max_size,
             clause_limit=root_separator_clause_limit,
         )
-        if use_small_root_separators else []
+        if use_small_root_separators else ([], [])
     )
     for node, separator in separator_implications:
         model.AddBoolOr([x[node].Not()] + [x[cut_vertex] for cut_vertex in separator])
+    for separator, affected, k_bound in separator_component_bounds:
+        # z_c relaxes to min(1, sum(x_s)) in the LP, so the cardinality bound
+        # tightens continuously as the separator's fractional selection grows.
+        z_c = model.NewBoolVar(f"zsep_{'_'.join(map(str, separator))}")
+        model.Add(z_c <= sum(x[s] for s in separator))
+        model.Add(sum(x[i] for i in affected) <= k_bound * z_c)
     if log and use_small_root_separators:
         separator_count = len({separator for _, separator in separator_implications})
         print(
             f"  small root separators: {len(separator_implications)} clause(s) "
-            f"from {separator_count} separator(s)",
+            f"from {separator_count} separator(s), "
+            f"{len(separator_component_bounds)} cardinality cut(s)",
             flush=True,
         )
 
@@ -1144,7 +1208,6 @@ def solve_one_asu_cpsat(
     model.Add(pop_expr >= int(pop_thresh))
 
     # UR >= tau as exact integer linear inequality
-    num, den = as_fraction_tau(tau)
     lhs = sum(int(den) * int(u_g[i]) * x[i] for i in range(N)) \
         - sum(int(num) * int(E_g[i]) * x[i] for i in range(N))
     model.Add(lhs >= 0)
@@ -1382,6 +1445,11 @@ def solve_one_asu_cpsat(
         else:
             max_selected = N
         M = max(1, max_selected - 1)
+        # NOTE: tried adding a connectivity-free relaxed-objective bound here (same
+        # _mM model, maximize sum(u*x) instead of count, add as obj_expr <= ub cut)
+        # -- valid (dropping connectivity only enlarges the feasible region) but
+        # A/B tested on real data and it never beat the bound the main solver's own
+        # search already converges to, so it only cost ~10s for no benefit. Reverted.
         # NOTE: _bridge_edge_bounds() gives a provably sound tighter per-edge cap
         # (validated against 400 brute-force instances + explicit counterexamples)
         # but was A/B tested on real Colorado data and was a clear regression
@@ -1647,10 +1715,15 @@ def solve_one_asu_cpsat(
         solver.parameters.linearization_level = 2
         solver.parameters.cp_model_probing_level = 2
         solver.parameters.cut_level = 2
+        # Gurobi's log on this instance closed most of its gap with repeated
+        # root-node cut rounds before ever branching; asu_probe_* already used
+        # 4 rounds, this extends the same root-cut budget to the rest of the
+        # portfolio (max_lp, lb_tree_search, etc). Needs A/B validation.
+        solver.parameters.max_cut_rounds_at_level_zero = 4
 
         # LNS settings
-        solver.parameters.lns_initial_difficulty = 0.65
-        solver.parameters.lns_initial_deterministic_limit = 0.6
+        solver.parameters.lns_initial_difficulty = 0.3
+        solver.parameters.lns_initial_deterministic_limit = 0.2
         solver.parameters.solution_pool_size = max(1, int(solution_pool_size))
         solver.parameters.diversify_lns_params = True
 
@@ -1675,11 +1748,11 @@ def solve_one_asu_cpsat(
                     "retaining integer-first probe workers",
                     flush=True,
                 )
-        _configure_asu_pseudo_costs(solver.parameters)
-        _configure_asu_shared_tree(
-            solver.parameters,
-            tract_first=tract_first_enabled,
-        )
+        # _configure_asu_pseudo_costs(solver.parameters)
+        # _configure_asu_shared_tree(
+        #     solver.parameters,
+        #     tract_first=tract_first_enabled,
+        # )
 
         def configure_asu_subsolvers(params, workers):
             workers = max(1, int(workers))
@@ -1700,6 +1773,34 @@ def solve_one_asu_cpsat(
                     search_branching=cp_model.PARTIAL_FIXED_SEARCH,
                     linearization_level=2,
                 )
+
+            # Warm-starts each node's LP from the nearest ancestor's saved
+            # basis instead of resolving from scratch, and (as a side effect)
+            # activates lb_tree_search's pseudo-cost branching heuristic.
+            # Marked "Experimental" upstream -- needs A/B validation.
+            _append_asu_subsolver_params(
+                params,
+                "lb_tree_search",
+                save_lp_basis_in_lb_tree_search=False,
+                max_cut_rounds_at_level_zero=4,
+                add_objective_cut=True,
+                root_lp_iterations = 50_000
+            )
+
+            # Dedicated worker that only tries to shave the upper bound
+            # (our objective is maximized, so "upper bound" == dual/proof
+            # bound) instead of searching for better incumbents. Registered
+            # as its own named entry so the override merges onto a fresh
+            # SatParameters and never leaks into the other portfolio members.
+            # _append_asu_subsolver_params(
+            #     params,
+            #     "asu_upper_bound",
+            #     use_objective_shaving_search=True,
+            #     cp_model_probing_level=0,
+            #     symmetry_level=0,
+            #     linearization_level=2,
+            #     add_lp_constraints_lazily=False,
+            # )
 
             # Ordered so that every prefix is useful.
             #
@@ -1733,6 +1834,14 @@ def solve_one_asu_cpsat(
             params.subsolvers.extend(full_subsolvers)
             params.num_full_subsolvers = len(full_subsolvers)
 
+            # NOTE: tried dedicating shared_tree_num_workers=max(2, workers//4)
+            # workers to shared tree search (+ "shared_tree" in filter_subsolvers)
+            # to target proof speed. A/B tested on real data (seed=1173, matched
+            # 600s budget): objective -100 vs baseline (75322 vs 75422) and worse
+            # gap_integral (11295 vs 9486) -- the dedicated workers barely shared
+            # any bounds (3 vs 47/23/53 for asu_probe_fast/standard/lb_tree_search)
+            # while permanently occupying 3 of 14 threads. Reverted.
+
             allowed = list(dict.fromkeys(
                 full_subsolvers + [
                     "rins*",
@@ -1745,7 +1854,6 @@ def solve_one_asu_cpsat(
                     # Diversification / basin escape
                     "rnd_var_lns",
 
-                    "shared_tree",
 
                     "ls*",
                 ]
@@ -1765,9 +1873,7 @@ def solve_one_asu_cpsat(
             print(
                 "ASU probing experiment:\n"
                 "  asu_probe_fast     root_lp_iterations=50000\n"
-                "  asu_probe_standard root_lp_iterations=100000\n"
-                "  shared_tree_num_workers=4\n"
-                "  shared_tree_split_strategy=OBJECTIVE_LB",
+                "  asu_probe_standard root_lp_iterations=100000",
                 flush=True,
             )
         status = solver.Solve(model)
@@ -3235,6 +3341,7 @@ def build_many_asus_cpsat(
     use_small_root_separators: bool = True,
     root_separator_max_size: int = 3,
     root_separator_clause_limit: int = 200,
+    use_separator_cardinality_bounds: bool = True,
     solution_pool_size: int = 32,
     full_graph_window: bool = False,
 ) -> Dict[str, np.ndarray]:
@@ -3419,6 +3526,7 @@ def build_many_asus_cpsat(
                 use_small_root_separators=use_small_root_separators,
                 root_separator_max_size=root_separator_max_size,
                 root_separator_clause_limit=root_separator_clause_limit,
+                use_separator_cardinality_bounds=use_separator_cardinality_bounds,
                 solution_pool_size=solution_pool_size,
                 # cluster_groups intentionally NOT passed here: tying high-UR
                 # cluster members via equality is provably correct (validated
@@ -3603,6 +3711,11 @@ def main():
     )
     ap.add_argument("--root-separator-max-size", type=int, default=3)
     ap.add_argument("--root-separator-clause-limit", type=int, default=200)
+    ap.add_argument(
+        "--no-separator-cardinality-bounds",
+        action="store_true",
+        help="Disable UR-surplus cardinality cuts (sum(x_i in C) <= K_C * z_C) for separator components",
+    )
     ap.add_argument("--solution-pool-size", type=int, default=32)
     ap.add_argument("--output", default=None, help="Output CSV path (default: <stem>_with_asu.csv)")
     ap.add_argument("--verbose", action="store_true", help="Verbose CP-SAT logs")
@@ -3679,6 +3792,7 @@ def main():
         use_small_root_separators=not args.no_small_root_separators,
         root_separator_max_size=args.root_separator_max_size,
         root_separator_clause_limit=args.root_separator_clause_limit,
+        use_separator_cardinality_bounds=not args.no_separator_cardinality_bounds,
         solution_pool_size=args.solution_pool_size,
     )
 
