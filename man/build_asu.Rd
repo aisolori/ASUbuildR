@@ -19,7 +19,11 @@ build_asu(
   use_small_root_separators = TRUE,
   root_separator_max_size = 3L,
   root_separator_clause_limit = 200L,
+  root_separator_target_limit = 128L,
   solution_pool_size = 32L,
+  use_bridge_edge_bounds = FALSE,
+  max_nodes_per_asu = NA_integer_,
+  combine_capped_asus = TRUE,
   verbose = interactive()
 )
 }
@@ -44,8 +48,8 @@ build_asu(
 subsolver portfolio instead of the ASU-specific portfolio}
 
 \item{use_tract_first_search}{logical; enable the experimental
-incumbent-boundary worker, trying safe exclusions before frontier additions,
-within the ASU-specific portfolio}
+incumbent-boundary worker, trying safe exclusions before frontier
+additions, within the ASU-specific portfolio}
 
 \item{use_flow_count_envelope}{logical; dynamically bound signed-flow values
 by the number of selected nodes}
@@ -57,7 +61,26 @@ vertex-separator clauses}
 
 \item{root_separator_clause_limit}{maximum number of rooted separator clauses}
 
+\item{root_separator_target_limit}{number of highest-value candidate targets
+searched for a rooted vertex separator}
+
 \item{solution_pool_size}{number of feasible solutions retained for LNS}
+
+\item{use_bridge_edge_bounds}{logical; tighten flow variable domains on
+graph bridges using a root-rooted directional bound (the reverse
+direction across a bridge is forced to 0). Sound but unproven on real
+data -- opt-in, default FALSE}
+
+\item{max_nodes_per_asu}{optional integer cap on the number of tracts per
+ASU (\code{NA_integer_} disables the cap, the default). When set, ASUs are
+built up to this size, then touching capped ASUs are combined and
+re-solved (uncapped) via CP-SAT in a final improvement pass -- see
+\code{combine_capped_asus}}
+
+\item{combine_capped_asus}{logical; when \code{max_nodes_per_asu} is set,
+combine touching capped ASUs and improve them via an uncapped CP-SAT
+re-solve after the main build loop finishes. Ignored if
+\code{max_nodes_per_asu} is \code{NA}}
 
 \item{verbose}{logical; print CP-SAT logs}
 }

@@ -19,7 +19,22 @@
 #'   vertex-separator clauses
 #' @param root_separator_max_size maximum rooted vertex-separator size to add
 #' @param root_separator_clause_limit maximum number of rooted separator clauses
+#' @param root_separator_target_limit number of highest-value candidate targets
+#'   searched for a rooted vertex separator
 #' @param solution_pool_size number of feasible solutions retained for LNS
+#' @param use_bridge_edge_bounds logical; tighten flow variable domains on
+#'   graph bridges using a root-rooted directional bound (the reverse
+#'   direction across a bridge is forced to 0). Sound but unproven on real
+#'   data -- opt-in, default FALSE
+#' @param max_nodes_per_asu optional integer cap on the number of tracts per
+#'   ASU (`NA_integer_` disables the cap, the default). When set, ASUs are
+#'   built up to this size, then touching capped ASUs are combined and
+#'   re-solved (uncapped) via CP-SAT in a final improvement pass -- see
+#'   `combine_capped_asus`
+#' @param combine_capped_asus logical; when `max_nodes_per_asu` is set,
+#'   combine touching capped ASUs and improve them via an uncapped CP-SAT
+#'   re-solve after the main build loop finishes. Ignored if
+#'   `max_nodes_per_asu` is `NA`
 #' @param verbose logical; print CP-SAT logs
 #' @return df with added `asu_id` column (integer; -1 means unassigned)
 #' @export
@@ -38,7 +53,11 @@ build_asu <- function(
     use_small_root_separators = TRUE,
     root_separator_max_size = 3L,
     root_separator_clause_limit = 200L,
+    root_separator_target_limit = 128L,
     solution_pool_size = 32L,
+    use_bridge_edge_bounds = FALSE,
+    max_nodes_per_asu = NA_integer_,
+    combine_capped_asus = TRUE,
     verbose = interactive()
 ) {
   asu_use_python(required = TRUE)
@@ -76,7 +95,11 @@ build_asu <- function(
     use_small_root_separators = isTRUE(use_small_root_separators),
     root_separator_max_size = as.integer(root_separator_max_size),
     root_separator_clause_limit = as.integer(root_separator_clause_limit),
-    solution_pool_size = as.integer(solution_pool_size)
+    root_separator_target_limit = as.integer(root_separator_target_limit),
+    solution_pool_size = as.integer(solution_pool_size),
+    use_bridge_edge_bounds = isTRUE(use_bridge_edge_bounds),
+    max_nodes_per_asu = if (is.na(max_nodes_per_asu)) NULL else as.integer(max_nodes_per_asu),
+    combine_capped_asus = isTRUE(combine_capped_asus)
   )
 
   df$asu_id <- as.integer(reticulate::py_to_r(out[["asu_id"]]))

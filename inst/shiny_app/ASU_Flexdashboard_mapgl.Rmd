@@ -203,6 +203,9 @@ cpsat_nb_json    <- shiny::reactiveVal(NULL)
 cpsat_out_json   <- shiny::reactiveVal(NULL)
 cpsat_log_file   <- shiny::reactiveVal(NULL)
 cpsat_log_saved  <- shiny::reactiveVal(NULL)
+cpsat_stop_file  <- shiny::reactiveVal(NULL)
+cpsat_stop_requested <- shiny::reactiveVal(FALSE)
+cpsat_skip_file  <- shiny::reactiveVal(NULL)
 cpsat_running <- shiny::reactiveVal(FALSE)
 
 append_cpsat_log <- function(...) {
@@ -667,10 +670,10 @@ shiny::observeEvent(input$file, {
            tract_ASU_unemp,
            tract_ASU_urate) |>
     dplyr::mutate(
-      tract_pop_cur = as.integer(tract_pop_cur),
-      tract_ASU_clf = as.integer(tract_ASU_clf),
-      tract_ASU_emp = as.integer(tract_ASU_emp),
-      tract_ASU_unemp = as.integer(tract_ASU_unemp)
+      tract_pop_cur = as.integer(round(tract_pop_cur)),
+      tract_ASU_clf = as.integer(round(tract_ASU_clf)),
+      tract_ASU_emp = as.integer(round(tract_ASU_emp)),
+      tract_ASU_unemp = as.integer(round(tract_ASU_unemp))
     )
   uploaded_data(df)
   uploaded_data() |>
@@ -791,6 +794,7 @@ shiny::conditionalPanel(
     shiny::numericInput("cpsat_timelimit", "Time limit (sec) per window", value = 18000, min = 0, step = 60),
     shiny::numericInput("cpsat_workers",   "Parallel workers (detected cores - 2)", value = max(1, parallel::detectCores(logical = FALSE)-2), min = 1, step = 1),
     shiny::numericInput("cpsat_relgap",        "Relative gap (optional)",    value = NULL, min = 0, step = 0.0001),
+    shiny::numericInput("cpsat_max_nodes",     "Max tracts per ASU (optional)", value = NULL, min = 1, step = 1),
     shiny::uiOutput("cpsat_log_link")
   )
 )
@@ -824,6 +828,14 @@ output$algo_blurb <- shiny::renderUI({
              <code>Max ASUs</code>, <code>Time limit</code>, optional
              <code>Relative gap</code>, and <code>Parallel workers</code>.</li>
        </ul>
+       <p>
+         <strong>Max tracts per ASU (optional):</strong> leave this blank for
+         unrestricted ASU sizes (default). If set, each ASU is capped at that
+         many tracts while the solver builds as many separate, non-overlapping
+         capped ASUs as it can. Once no more capped ASUs can be built, touching
+         capped ASUs are automatically combined and re-solved (uncapped) by
+         CP-SAT to improve the merged result.
+       </p>
        <p>
          While solving, a live <em>CP-SAT log</em> panel appears (top-right)
          showing progress. When the solver finishes, the map and summary table
@@ -986,9 +998,11 @@ if (identical(algo_choice, "cpsat")) {
     tlimit   <- if (is.null(input$cpsat_timelimit)) 1200   else as.integer(input$cpsat_timelimit)
     workers  <- if (is.null(input$cpsat_workers))   max(1L, parallel::detectCores()-5L) else as.integer(input$cpsat_workers)
     rel_gap  <- if (!is.null(input$cpsat_relgap) && !is.na(input$cpsat_relgap)) as.numeric(input$cpsat_relgap) else NA_real_
-    append_cpsat_log(sprintf("[run] params: tau=%.6f pop=%d max=%d limit=%ds workers=%d rel_gap=%s",
+    max_nodes_per_asu <- if (!is.null(input$cpsat_max_nodes) && !is.na(input$cpsat_max_nodes)) as.integer(input$cpsat_max_nodes) else NA_integer_
+    append_cpsat_log(sprintf("[run] params: tau=%.6f pop=%d max=%d limit=%ds workers=%d rel_gap=%s max_nodes_per_asu=%s",
                              tau, pop_thr, max_asus, tlimit, workers,
-                             if (is.na(rel_gap)) "None" else as.character(rel_gap)))
+                             if (is.na(rel_gap)) "None" else as.character(rel_gap),
+                             if (is.na(max_nodes_per_asu)) "None" else as.character(max_nodes_per_asu)))
     # ---- 2) Build tracts + neighbors ----------------------------------
     shiny::incProgress(0.15, detail = "Downloading tracts & building neighbors")
     
@@ -1086,9 +1100,9 @@ if (identical(algo_choice, "cpsat")) {
     df_py <- merged_df |>
       dplyr::transmute(
         geoid           = GEOID,
-        tract_ASU_unemp = as.integer(tract_ASU_unemp),
-        tract_ASU_emp   = as.integer(tract_ASU_emp),
-        tract_pop2024   = as.integer(tract_pop_cur)
+        tract_ASU_unemp = as.integer(round(tract_ASU_unemp)),
+        tract_ASU_emp   = as.integer(round(tract_ASU_emp)),
+        tract_pop2024   = as.integer(round(tract_pop_cur))
       )
     
     # Use the island-fixed neighborhood lists for the Python solver
@@ -1105,6 +1119,8 @@ if (identical(algo_choice, "cpsat")) {
     nb_json  <- file.path(run_dir, "nb.json")
     out_json <- file.path(run_dir, "out.json")
     runner   <- file.path(run_dir, "runner.py")
+    stop_file <- file.path(run_dir, "stop.flag")
+    skip_file <- file.path(run_dir, "skip.flag")
 
     utils::write.csv(df_py, df_csv, row.names = FALSE)
     jsonlite::write_json(nb_lists, nb_json, auto_unbox = TRUE)
@@ -1116,6 +1132,11 @@ if (identical(algo_choice, "cpsat")) {
     cpsat_out_json(out_json)
     cpsat_log_file(log_file)
     cpsat_log_saved(NULL)
+    unlink(stop_file)
+    unlink(skip_file)
+    cpsat_stop_file(stop_file)
+    cpsat_stop_requested(FALSE)
+    cpsat_skip_file(skip_file)
 
     append_cpsat_log(paste0("[run] Folder: ", run_dir))
     append_cpsat_log(paste0("[run] df.csv: ", df_csv))
@@ -1157,15 +1178,23 @@ kwargs = dict(
     use_tract_first_search=False,
     use_flow_count_envelope=False,
     use_small_root_separators=True,
-    root_separator_max_size=5,
+    root_separator_max_size=7,
 
-    root_separator_clause_limit=500,
+    root_separator_clause_limit=2000,
+    root_separator_target_limit=500,
     solution_pool_size=32,
-    full_graph_window=True
+    full_graph_window=True,
+    use_bridge_edge_bounds=True,
+    stop_flag_path=r'%s',
+    skip_flag_path=r'%s'
 )
 REL = %s
 if REL is not None and not (isinstance(REL, float) and math.isnan(REL)):
     kwargs['rel_gap'] = REL
+MAXN = %s
+if MAXN is not None and not (isinstance(MAXN, float) and math.isnan(MAXN)):
+    kwargs['max_nodes_per_asu'] = int(MAXN)
+    kwargs['combine_capped_asus'] = True
 print('[runner] window scope: all remaining tracts', flush=True)
 print('[runner] launching CP-SAT…', flush=True)
 res = build_many_asus_cpsat(**kwargs)
@@ -1179,7 +1208,9 @@ print('[runner] OK', flush=True)
 ",
       py_mod_path, df_csv, nb_json,
       format(tau, scientific = FALSE), pop_thr, max_asus, tlimit, workers,
+      stop_file, skip_file,
       if (is.na(rel_gap)) "None" else as.character(rel_gap),
+      if (is.na(max_nodes_per_asu)) "None" else as.character(max_nodes_per_asu),
       out_json
     )
     writeLines(runner_code, runner)
@@ -1300,6 +1331,13 @@ print('[runner] OK', flush=True)
         lf <- cpsat_log_file()
         if (!is.null(lf) && file.exists(lf)) cpsat_log_saved(lf)
         cpsat_log_file(NULL)
+        sf <- cpsat_stop_file()
+        if (!is.null(sf)) unlink(sf)
+        cpsat_stop_file(NULL)
+        cpsat_stop_requested(FALSE)
+        kf <- cpsat_skip_file()
+        if (!is.null(kf)) unlink(kf)
+        cpsat_skip_file(NULL)
         cpsat_running(FALSE)
       }
     })
@@ -1452,8 +1490,36 @@ output$log_overlay <- shiny::renderUI({
       shiny::strong("CP-SAT log"), shiny::br(), 
       shiny::verbatimTextOutput("cpsat_log_tail", placeholder = FALSE)
     ),
+    shiny::actionButton(
+      "stop_solve", if (isTRUE(cpsat_stop_requested())) "Stopping…" else "Stop Solve",
+      class = "btn-sm btn-warning", style = "margin-right:4px;"
+    ),
+    shiny::actionButton(
+      "skip_asu", "Skip to Next ASU",
+      class = "btn-sm btn-info", style = "margin-right:4px;"
+    ),
     shiny::actionButton("close_log", "Close", class = "btn-sm")
   )
+})
+
+# Signal the running Python solve to stop via its CP-SAT stop_search() callback
+# and return its current incumbent, instead of killing the process outright.
+shiny::observeEvent(input$stop_solve, {
+  shiny::req(!isTRUE(cpsat_stop_requested()))
+  sf <- cpsat_stop_file()
+  shiny::req(!is.null(sf), isTRUE(cpsat_running()))
+  if (!file.exists(sf)) file.create(sf)
+  cpsat_stop_requested(TRUE)
+  append_cpsat_log("[run] Stop requested by user; waiting for solver to return its current incumbent…")
+})
+
+# Halt only the ASU currently being solved (via stop_search()) and let the
+# builder move on to the next ASU window, instead of stopping the whole run.
+shiny::observeEvent(input$skip_asu, {
+  kf <- cpsat_skip_file()
+  shiny::req(!is.null(kf), isTRUE(cpsat_running()))
+  if (!file.exists(kf)) file.create(kf)
+  append_cpsat_log("[run] Skip requested by user; committing current ASU's incumbent and moving to the next one…")
 })
 
 # Add this observer to handle closing the log manually
