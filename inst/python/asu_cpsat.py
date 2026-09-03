@@ -687,6 +687,7 @@ def _asu_branch_challenges(
 
 
 _ASU_FULL_SUBSOLVER_PATTERN = (
+    "default_lp",
     "asu_probe_fast",
     "asu_probe_very_deep",
     "lb_tree_search",
@@ -703,7 +704,6 @@ _ASU_FULL_SUBSOLVER_PATTERN = (
     "asu_probe_very_deep",
     "variables_shaving",
     "variables_shaving_max_lp",
-    "default_lp"
 
 )
 def _asu_full_subsolvers(
