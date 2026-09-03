@@ -20,3 +20,4 @@ test folder/asu_exports/
 *.csv
 ASUbuildR.Rproj
 .codex_exact_lns_patch_probe
+*.rds
