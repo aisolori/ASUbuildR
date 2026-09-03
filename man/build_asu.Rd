@@ -24,6 +24,7 @@ build_asu(
   use_bridge_edge_bounds = FALSE,
   max_nodes_per_asu = NA_integer_,
   combine_capped_asus = TRUE,
+  combine_time_limit = NA_integer_,
   verbose = interactive()
 )
 }
@@ -81,6 +82,10 @@ re-solved (uncapped) via CP-SAT in a final improvement pass -- see
 combine touching capped ASUs and improve them via an uncapped CP-SAT
 re-solve after the main build loop finishes. Ignored if
 \code{max_nodes_per_asu} is \code{NA}}
+
+\item{combine_time_limit}{optional seconds; CP-SAT time limit used
+specifically for the uncapped combine/re-solve pass (\code{NA_integer_} uses
+\code{time_limit}, the default)}
 
 \item{verbose}{logical; print CP-SAT logs}
 }

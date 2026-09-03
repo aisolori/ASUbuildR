@@ -35,6 +35,9 @@
 #'   combine touching capped ASUs and improve them via an uncapped CP-SAT
 #'   re-solve after the main build loop finishes. Ignored if
 #'   `max_nodes_per_asu` is `NA`
+#' @param combine_time_limit optional seconds; CP-SAT time limit used
+#'   specifically for the uncapped combine/re-solve pass (`NA_integer_` uses
+#'   `time_limit`, the default)
 #' @param verbose logical; print CP-SAT logs
 #' @return df with added `asu_id` column (integer; -1 means unassigned)
 #' @export
@@ -58,6 +61,7 @@ build_asu <- function(
     use_bridge_edge_bounds = FALSE,
     max_nodes_per_asu = NA_integer_,
     combine_capped_asus = TRUE,
+    combine_time_limit = NA_integer_,
     verbose = interactive()
 ) {
   asu_use_python(required = TRUE)
@@ -99,7 +103,8 @@ build_asu <- function(
     solution_pool_size = as.integer(solution_pool_size),
     use_bridge_edge_bounds = isTRUE(use_bridge_edge_bounds),
     max_nodes_per_asu = if (is.na(max_nodes_per_asu)) NULL else as.integer(max_nodes_per_asu),
-    combine_capped_asus = isTRUE(combine_capped_asus)
+    combine_capped_asus = isTRUE(combine_capped_asus),
+    combine_time_limit = if (is.na(combine_time_limit)) NULL else as.integer(combine_time_limit)
   )
 
   df$asu_id <- as.integer(reticulate::py_to_r(out[["asu_id"]]))

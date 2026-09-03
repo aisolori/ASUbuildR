@@ -794,7 +794,12 @@ shiny::conditionalPanel(
     shiny::numericInput("cpsat_timelimit", "Time limit (sec) per window", value = 18000, min = 0, step = 60),
     shiny::numericInput("cpsat_workers",   "Parallel workers (detected cores - 2)", value = max(1, parallel::detectCores(logical = FALSE)-2), min = 1, step = 1),
     shiny::numericInput("cpsat_relgap",        "Relative gap (optional)",    value = NULL, min = 0, step = 0.0001),
-    shiny::numericInput("cpsat_max_nodes",     "Max tracts per ASU (optional)", value = NULL, min = 1, step = 1),
+    shiny::checkboxInput("cpsat_enable_max_nodes", "Limit tracts per ASU (cap + combine)", value = FALSE),
+    shiny::conditionalPanel(
+      condition = "input.cpsat_enable_max_nodes === true",
+      shiny::numericInput("cpsat_max_nodes",           "Max tracts per ASU",                     value = 500, min = 1, step = 1),
+      shiny::numericInput("cpsat_combine_timelimit",   "Combine/re-solve time limit (sec, optional)", value = NULL, min = 0, step = 60)
+    ),
     shiny::uiOutput("cpsat_log_link")
   )
 )
@@ -829,12 +834,17 @@ output$algo_blurb <- shiny::renderUI({
              <code>Relative gap</code>, and <code>Parallel workers</code>.</li>
        </ul>
        <p>
-         <strong>Max tracts per ASU (optional):</strong> leave this blank for
-         unrestricted ASU sizes (default). If set, each ASU is capped at that
-         many tracts while the solver builds as many separate, non-overlapping
-         capped ASUs as it can. Once no more capped ASUs can be built, touching
-         capped ASUs are automatically combined and re-solved (uncapped) by
-         CP-SAT to improve the merged result.
+         <strong>Limit tracts per ASU (cap + combine):</strong> leave this
+         toggle off for unrestricted ASU sizes (default). Enabling it reveals
+         two extra controls: <code>Max tracts per ASU</code>, which caps each
+         ASU built during the main pass at that many tracts (so the solver
+         builds as many separate, non-overlapping capped ASUs as it can), and
+         <code>Combine/re-solve time limit</code>, an optional separate CP-SAT
+         time budget for the final pass. Once no more capped ASUs can be
+         built, touching capped ASUs are automatically combined and re-solved
+         (uncapped) by CP-SAT -- repeating until no more touching ASUs remain
+         -- to improve the merged result. Leaving the combine time limit blank
+         reuses the main <code>Time limit</code> for that pass.
        </p>
        <p>
          While solving, a live <em>CP-SAT log</em> panel appears (top-right)
@@ -998,11 +1008,14 @@ if (identical(algo_choice, "cpsat")) {
     tlimit   <- if (is.null(input$cpsat_timelimit)) 1200   else as.integer(input$cpsat_timelimit)
     workers  <- if (is.null(input$cpsat_workers))   max(1L, parallel::detectCores()-5L) else as.integer(input$cpsat_workers)
     rel_gap  <- if (!is.null(input$cpsat_relgap) && !is.na(input$cpsat_relgap)) as.numeric(input$cpsat_relgap) else NA_real_
-    max_nodes_per_asu <- if (!is.null(input$cpsat_max_nodes) && !is.na(input$cpsat_max_nodes)) as.integer(input$cpsat_max_nodes) else NA_integer_
-    append_cpsat_log(sprintf("[run] params: tau=%.6f pop=%d max=%d limit=%ds workers=%d rel_gap=%s max_nodes_per_asu=%s",
+    max_nodes_enabled <- isTRUE(input$cpsat_enable_max_nodes)
+    max_nodes_per_asu <- if (max_nodes_enabled && !is.null(input$cpsat_max_nodes) && !is.na(input$cpsat_max_nodes)) as.integer(input$cpsat_max_nodes) else NA_integer_
+    combine_timelimit <- if (max_nodes_enabled && !is.null(input$cpsat_combine_timelimit) && !is.na(input$cpsat_combine_timelimit)) as.integer(input$cpsat_combine_timelimit) else NA_integer_
+    append_cpsat_log(sprintf("[run] params: tau=%.6f pop=%d max=%d limit=%ds workers=%d rel_gap=%s max_nodes_per_asu=%s combine_time_limit=%s",
                              tau, pop_thr, max_asus, tlimit, workers,
                              if (is.na(rel_gap)) "None" else as.character(rel_gap),
-                             if (is.na(max_nodes_per_asu)) "None" else as.character(max_nodes_per_asu)))
+                             if (is.na(max_nodes_per_asu)) "None" else as.character(max_nodes_per_asu),
+                             if (is.na(combine_timelimit)) "None" else as.character(combine_timelimit)))
     # ---- 2) Build tracts + neighbors ----------------------------------
     shiny::incProgress(0.15, detail = "Downloading tracts & building neighbors")
     
@@ -1178,13 +1191,15 @@ kwargs = dict(
     use_tract_first_search=False,
     use_flow_count_envelope=False,
     use_small_root_separators=True,
-    root_separator_max_size=7,
+    root_separator_max_size=6,
 
-    root_separator_clause_limit=2000,
-    root_separator_target_limit=500,
+    root_separator_clause_limit=5000,
+    root_separator_target_limit=1000,
     solution_pool_size=32,
     full_graph_window=True,
     use_bridge_edge_bounds=True,
+    use_global_capacity_cardinality_bound=True,
+    use_bridge_subtree_pruning=True,
     stop_flag_path=r'%s',
     skip_flag_path=r'%s'
 )
@@ -1195,6 +1210,9 @@ MAXN = %s
 if MAXN is not None and not (isinstance(MAXN, float) and math.isnan(MAXN)):
     kwargs['max_nodes_per_asu'] = int(MAXN)
     kwargs['combine_capped_asus'] = True
+COMBINE_TL = %s
+if COMBINE_TL is not None and not (isinstance(COMBINE_TL, float) and math.isnan(COMBINE_TL)):
+    kwargs['combine_time_limit'] = int(COMBINE_TL)
 print('[runner] window scope: all remaining tracts', flush=True)
 print('[runner] launching CP-SAT…', flush=True)
 res = build_many_asus_cpsat(**kwargs)
@@ -1211,6 +1229,7 @@ print('[runner] OK', flush=True)
       stop_file, skip_file,
       if (is.na(rel_gap)) "None" else as.character(rel_gap),
       if (is.na(max_nodes_per_asu)) "None" else as.character(max_nodes_per_asu),
+      if (is.na(combine_timelimit)) "None" else as.character(combine_timelimit),
       out_json
     )
     writeLines(runner_code, runner)
