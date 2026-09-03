@@ -792,7 +792,8 @@ shiny::conditionalPanel(
     shiny::numericInput("cpsat_pop",       "Population threshold",      value = 10000,  min = 0, step = 100),
     shiny::numericInput("cpsat_max",       "Max ASUs",                  value = 30,     min = 1, step = 1),
     shiny::numericInput("cpsat_timelimit", "Time limit (sec) per window", value = 18000, min = 0, step = 60),
-    shiny::numericInput("cpsat_workers",   "Parallel workers (detected cores - 2)", value = max(1, parallel::detectCores(logical = FALSE)-2), min = 1, step = 1),
+    shiny::numericInput("cpsat_workers",   "Total CP-SAT workers (detected cores - 2)", value = max(1, parallel::detectCores(logical = FALSE)-2), min = 1, step = 1),
+    shiny::numericInput("cpsat_parallel_asus", "Concurrent ASU solves", value = 1, min = 1, step = 1),
     shiny::numericInput("cpsat_relgap",        "Relative gap (optional)",    value = NULL, min = 0, step = 0.0001),
     shiny::checkboxInput("cpsat_enable_max_nodes", "Limit tracts per ASU (cap + combine)", value = FALSE),
     shiny::conditionalPanel(
@@ -831,7 +832,8 @@ output$algo_blurb <- shiny::renderUI({
          <li>Run the CP-SAT solver with your parameters:
              <code>UR threshold (τ)</code>, <code>Population threshold</code>,
              <code>Max ASUs</code>, <code>Time limit</code>, optional
-             <code>Relative gap</code>, and <code>Parallel workers</code>.</li>
+             <code>Relative gap</code>, <code>Total CP-SAT workers</code>, and
+             <code>Concurrent ASU solves</code>.</li>
        </ul>
        <p>
          <strong>Limit tracts per ASU (cap + combine):</strong> leave this
@@ -1007,12 +1009,13 @@ if (identical(algo_choice, "cpsat")) {
     max_asus <- if (is.null(input$cpsat_max))       30     else as.integer(input$cpsat_max)
     tlimit   <- if (is.null(input$cpsat_timelimit)) 1200   else as.integer(input$cpsat_timelimit)
     workers  <- if (is.null(input$cpsat_workers))   max(1L, parallel::detectCores()-5L) else as.integer(input$cpsat_workers)
+    parallel_asus <- if (is.null(input$cpsat_parallel_asus)) 1L else max(1L, as.integer(input$cpsat_parallel_asus))
     rel_gap  <- if (!is.null(input$cpsat_relgap) && !is.na(input$cpsat_relgap)) as.numeric(input$cpsat_relgap) else NA_real_
     max_nodes_enabled <- isTRUE(input$cpsat_enable_max_nodes)
     max_nodes_per_asu <- if (max_nodes_enabled && !is.null(input$cpsat_max_nodes) && !is.na(input$cpsat_max_nodes)) as.integer(input$cpsat_max_nodes) else NA_integer_
     combine_timelimit <- if (max_nodes_enabled && !is.null(input$cpsat_combine_timelimit) && !is.na(input$cpsat_combine_timelimit)) as.integer(input$cpsat_combine_timelimit) else NA_integer_
-    append_cpsat_log(sprintf("[run] params: tau=%.6f pop=%d max=%d limit=%ds workers=%d rel_gap=%s max_nodes_per_asu=%s combine_time_limit=%s",
-                             tau, pop_thr, max_asus, tlimit, workers,
+    append_cpsat_log(sprintf("[run] params: tau=%.6f pop=%d max=%d limit=%ds workers=%d concurrent_asus=%d rel_gap=%s max_nodes_per_asu=%s combine_time_limit=%s",
+                 tau, pop_thr, max_asus, tlimit, workers, parallel_asus,
                              if (is.na(rel_gap)) "None" else as.character(rel_gap),
                              if (is.na(max_nodes_per_asu)) "None" else as.character(max_nodes_per_asu),
                              if (is.na(combine_timelimit)) "None" else as.character(combine_timelimit)))
@@ -1185,8 +1188,10 @@ print('[runner] inputs: rows=' + str(len(df)) + ' nb_lists=' + str(len(nb)))
 kwargs = dict(
     df=df, nb=nb,
     tau=%s, pop_thresh=%d, max_asus=%d,
-    time_limit=%d, workers=%d, verbose=True,
+    time_limit=%d, workers=%d, parallel_asus=%d, verbose=True,
     configure_subsolvers=True,
+    use_signed_flow=True,
+    use_arborescence=False,
     use_root_articulation_implications=True,
     use_tract_first_search=False,
     use_flow_count_envelope=False,
@@ -1198,8 +1203,14 @@ kwargs = dict(
     solution_pool_size=32,
     full_graph_window=True,
     use_bridge_edge_bounds=True,
+    use_articulation_edge_bounds=True,
+    use_distance_flow_bounds=True,
     use_global_capacity_cardinality_bound=True,
     use_bridge_subtree_pruning=True,
+    use_connectivity_free_repair=True,
+    connectivity_free_time_limit=30.0,
+    harvest_connectivity_free_asus=True,
+    standalone_expansion_time_limit=600.0,
     stop_flag_path=r'%s',
     skip_flag_path=r'%s'
 )
@@ -1225,7 +1236,7 @@ with open(r'%s','w') as g:
 print('[runner] OK', flush=True)
 ",
       py_mod_path, df_csv, nb_json,
-      format(tau, scientific = FALSE), pop_thr, max_asus, tlimit, workers,
+      format(tau, scientific = FALSE), pop_thr, max_asus, tlimit, workers, parallel_asus,
       stop_file, skip_file,
       if (is.na(rel_gap)) "None" else as.character(rel_gap),
       if (is.na(max_nodes_per_asu)) "None" else as.character(max_nodes_per_asu),

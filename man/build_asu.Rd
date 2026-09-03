@@ -22,10 +22,18 @@ build_asu(
   root_separator_target_limit = 128L,
   solution_pool_size = 32L,
   use_bridge_edge_bounds = FALSE,
+  use_articulation_edge_bounds = FALSE,
+  use_distance_flow_bounds = FALSE,
+  use_connectivity_free_repair = FALSE,
+  connectivity_free_time_limit = 10,
+  harvest_connectivity_free_asus = FALSE,
+  standalone_expansion_time_limit = 30,
+  final_asu_polish_time_limit = NA_real_,
   max_nodes_per_asu = NA_integer_,
   combine_capped_asus = TRUE,
   combine_time_limit = NA_integer_,
-  verbose = interactive()
+  verbose = interactive(),
+  parallel_asus = 1L
 )
 }
 \arguments{
@@ -72,6 +80,40 @@ graph bridges using a root-rooted directional bound (the reverse
 direction across a bridge is forced to 0). Sound but unproven on real
 data -- opt-in, default FALSE}
 
+\item{use_articulation_edge_bounds}{logical; tighten flow domains on edges
+from root-separating articulation vertices into far-side components. The
+reverse direction is forced to 0 and capacity is bounded by component size.
+Sound but unproven on real data -- opt-in, default FALSE}
+
+\item{use_distance_flow_bounds}{logical; cap each flow direction by
+\code{max_selected - 1 - dist(root, tail)} using BFS distance from the root.
+Sound on cycles (any connected selection admits a rooted spanning-tree
+flow within these caps) but unproven on real data -- opt-in, default FALSE}
+
+\item{use_connectivity_free_repair}{logical; solve the unemployment objective
+subject to population and UR requirements without connectivity, repair the
+selected components, and use the result only when it is a better valid hint}
+
+\item{connectivity_free_time_limit}{seconds allowed for the connectivity-free
+relaxation in each ASU window}
+
+\item{harvest_connectivity_free_asus}{logical; commit each connected relaxed
+component that independently meets the population and UR requirements as a
+separate ASU, instead of connecting all valid components to one root}
+
+\item{standalone_expansion_time_limit}{seconds allowed for each exact CP-SAT
+expansion of a standalone relaxed component within its assigned disjoint
+territory. The current ASU is a hint and objective floor, so tracts may be
+replaced. Touching expanded ASUs are merged and expansion is rerun until
+stable; zero commits standalone components without initial expansion}
+
+\item{final_asu_polish_time_limit}{optional seconds for each final sequential
+CP-SAT solve over one committed ASU plus every currently unassigned tract.
+Current tracts are a hint and objective floor rather than forced membership;
+dropped tracts become available to later ASUs. New touching ASUs are merged
+transitively and the polish repeats until no new merge occurs. \code{NA_real_}
+uses \code{standalone_expansion_time_limit}, and zero disables the final polish}
+
 \item{max_nodes_per_asu}{optional integer cap on the number of tracts per
 ASU (\code{NA_integer_} disables the cap, the default). When set, ASUs are
 built up to this size, then touching capped ASUs are combined and
@@ -88,6 +130,10 @@ specifically for the uncapped combine/re-solve pass (\code{NA_integer_} uses
 \code{time_limit}, the default)}
 
 \item{verbose}{logical; print CP-SAT logs}
+
+\item{parallel_asus}{maximum number of ASU windows or standalone expansions
+solved concurrently. Use \code{1} (the default) to solve ASUs sequentially;
+the configured \code{workers} are then available to each solve}
 }
 \value{
 df with added \code{asu_id} column (integer; -1 means unassigned)

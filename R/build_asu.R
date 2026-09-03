@@ -7,6 +7,9 @@
 #' @param max_asus max number of ASUs to carve
 #' @param time_limit seconds per window
 #' @param workers CP-SAT threads
+#' @param parallel_asus maximum number of ASU windows or standalone expansions
+#'   solved concurrently. Use `1` (the default) to solve ASUs sequentially;
+#'   the configured `workers` are then available to each solve
 #' @param rel_gap optional relative MIP gap (e.g. 0.01)
 #' @param configure_subsolvers logical; if `FALSE`, use OR-Tools' default
 #'   subsolver portfolio instead of the ASU-specific portfolio
@@ -26,6 +29,33 @@
 #'   graph bridges using a root-rooted directional bound (the reverse
 #'   direction across a bridge is forced to 0). Sound but unproven on real
 #'   data -- opt-in, default FALSE
+#' @param use_articulation_edge_bounds logical; tighten flow domains on edges
+#'   from root-separating articulation vertices into far-side components. The
+#'   reverse direction is forced to 0 and capacity is bounded by component size.
+#'   Sound but unproven on real data -- opt-in, default FALSE
+#' @param use_distance_flow_bounds logical; cap each flow direction by
+#'   `max_selected - 1 - dist(root, tail)` using BFS distance from the root.
+#'   Sound on cycles (any connected selection admits a rooted spanning-tree
+#'   flow within these caps) but unproven on real data -- opt-in, default FALSE
+#' @param use_connectivity_free_repair logical; solve the unemployment objective
+#'   subject to population and UR requirements without connectivity, repair the
+#'   selected components, and use the result only when it is a better valid hint
+#' @param connectivity_free_time_limit seconds allowed for the connectivity-free
+#'   relaxation in each ASU window
+#' @param harvest_connectivity_free_asus logical; commit each connected relaxed
+#'   component that independently meets the population and UR requirements as a
+#'   separate ASU, instead of connecting all valid components to one root
+#' @param standalone_expansion_time_limit seconds allowed for each exact CP-SAT
+#'   expansion of a standalone relaxed component within its assigned disjoint
+#'   territory. The current ASU is a hint and objective floor, so tracts may be
+#'   replaced. Touching expanded ASUs are merged and expansion is rerun until
+#'   stable; zero commits standalone components without initial expansion
+#' @param final_asu_polish_time_limit optional seconds for each final sequential
+#'   CP-SAT solve over one committed ASU plus every currently unassigned tract.
+#'   Current tracts are a hint and objective floor rather than forced membership;
+#'   dropped tracts become available to later ASUs. New touching ASUs are merged
+#'   transitively and the polish repeats until no new merge occurs. `NA_real_`
+#'   uses `standalone_expansion_time_limit`, and zero disables the final polish
 #' @param max_nodes_per_asu optional integer cap on the number of tracts per
 #'   ASU (`NA_integer_` disables the cap, the default). When set, ASUs are
 #'   built up to this size, then touching capped ASUs are combined and
@@ -59,10 +89,18 @@ build_asu <- function(
     root_separator_target_limit = 128L,
     solution_pool_size = 32L,
     use_bridge_edge_bounds = FALSE,
+    use_articulation_edge_bounds = FALSE,
+    use_distance_flow_bounds = FALSE,
+    use_connectivity_free_repair = FALSE,
+    connectivity_free_time_limit = 10,
+    harvest_connectivity_free_asus = FALSE,
+    standalone_expansion_time_limit = 30,
+    final_asu_polish_time_limit = NA_real_,
     max_nodes_per_asu = NA_integer_,
     combine_capped_asus = TRUE,
     combine_time_limit = NA_integer_,
-    verbose = interactive()
+    verbose = interactive(),
+    parallel_asus = 1L
 ) {
   asu_use_python(required = TRUE)
   if (!reticulate::py_module_available("ortools"))
@@ -91,6 +129,7 @@ build_asu <- function(
     max_asus = as.integer(max_asus),
     time_limit = as.integer(time_limit),
     workers = as.integer(workers),
+    parallel_asus = max(1L, as.integer(parallel_asus)),
     rel_gap = if (is.na(rel_gap)) NULL else as.numeric(rel_gap),
     verbose = isTRUE(verbose),
     configure_subsolvers = isTRUE(configure_subsolvers),
