@@ -714,6 +714,123 @@ def _asu_flow_branch_order(
     return sorted(range(len(edges)), key=edge_priority, reverse=True)
 
 
+def _asu_tract_capacity_orders(
+    u_g: np.ndarray,
+    E_g: np.ndarray,
+    num: int,
+    den: int,
+) -> Tuple[List[int], List[int]]:
+    """Order non-draining tracts high-first and draining tracts low-first."""
+    capacity = (
+        int(den) * u_g.astype(np.int64)
+        - int(num) * E_g.astype(np.int64)
+    )
+    select_order = sorted(
+        (int(i) for i in np.flatnonzero(capacity >= 0)),
+        key=lambda i: (-int(capacity[i]), -int(u_g[i]), i),
+    )
+    reject_order = sorted(
+        (int(i) for i in np.flatnonzero(capacity < 0)),
+        key=lambda i: (int(capacity[i]), int(u_g[i]), i),
+    )
+    return select_order, reject_order
+
+
+_ASU_HYBRID_PREFIX_SIZE = 64
+
+
+def _root_graph_distances(
+    nb_local: List[List[int]],
+    root_local: int,
+) -> List[int]:
+    """Return BFS distances from root, using N for unreachable nodes."""
+    N = len(nb_local)
+    distances = [N] * N
+    distances[root_local] = 0
+    queue = [root_local]
+    head = 0
+    while head < len(queue):
+        node = queue[head]
+        head += 1
+        for neighbor in nb_local[node]:
+            if distances[neighbor] == N:
+                distances[neighbor] = distances[node] + 1
+                queue.append(neighbor)
+    return distances
+
+
+def _asu_flow_capacity_hybrid_groups(
+    edges: Sequence[Tuple[int, int]],
+    u_g: np.ndarray,
+    E_g: np.ndarray,
+    num: int,
+    den: int,
+    root_distances: Sequence[int],
+    max_prefix: int = _ASU_HYBRID_PREFIX_SIZE,
+) -> Tuple[List[int], List[int], List[int], List[Tuple[str, int]]]:
+    """
+    Build disjoint flow, capacity, and far-distance strategy groups.
+
+    The first two heuristics use bounded prefixes so the final strategy still
+    has undecided variables to minimize. For tract Booleans, absolute value is
+    the variable itself; flow entries refer to explicit absolute-flow variables.
+    """
+    if len(root_distances) != len(u_g):
+        raise ValueError("root distances must match the tract count")
+
+    prefix_budget = max(1, int(max_prefix))
+    flow_order = _asu_flow_branch_order(edges, u_g, E_g)
+    flow_prefix = flow_order[:prefix_budget]
+
+    capacity_select_order, capacity_reject_order = _asu_tract_capacity_orders(
+        u_g, E_g, num, den
+    )
+    select_limit = min(len(capacity_select_order), (prefix_budget + 1) // 2)
+    reject_limit = min(len(capacity_reject_order), prefix_budget // 2)
+    unused_budget = prefix_budget - select_limit - reject_limit
+    select_limit += min(
+        unused_budget,
+        len(capacity_select_order) - select_limit,
+    )
+    unused_budget = prefix_budget - select_limit - reject_limit
+    reject_limit += min(
+        unused_budget,
+        len(capacity_reject_order) - reject_limit,
+    )
+    capacity_select_prefix = capacity_select_order[:select_limit]
+    capacity_reject_prefix = capacity_reject_order[:reject_limit]
+
+    handled_flows = set(flow_prefix)
+    handled_tracts = set(capacity_select_prefix) | set(capacity_reject_prefix)
+    far_variables = [
+        ("tract", node, int(root_distances[node]))
+        for node in range(len(u_g))
+        if node not in handled_tracts
+    ]
+    far_variables.extend(
+        ("flow", edge_index, max(
+            int(root_distances[edges[edge_index][0]]),
+            int(root_distances[edges[edge_index][1]]),
+        ))
+        for edge_index in range(len(edges))
+        if edge_index not in handled_flows
+    )
+    far_variables.sort(
+        key=lambda item: (
+            -item[2],
+            0 if item[0] == "tract" else 1,
+            item[1],
+        )
+    )
+    far_order = [(kind, index) for kind, index, _ in far_variables]
+    return (
+        flow_prefix,
+        capacity_select_prefix,
+        capacity_reject_prefix,
+        far_order,
+    )
+
+
 _ASU_FULL_SUBSOLVER_PATTERN = (
     "portfolio_max_lp",
     "asu_probe_fast",
@@ -738,6 +855,8 @@ def _asu_full_subsolvers(
     workers: int,
     use_tract_first_search: bool = False,
     use_flow_first_search: bool = False,
+    use_tract_capacity_search: bool = False,
+    use_flow_capacity_hybrid_search: bool = False,
     use_tract_first_probing: bool = False,
 ) -> List[str]:
     """Return the bounded full-problem portfolio for one ASU solve."""
@@ -747,9 +866,22 @@ def _asu_full_subsolvers(
 
     full_budget = max(6, min(16, round(workers *.3)))
     full_subsolvers: List[str] = list(_ASU_FULL_SUBSOLVER_PATTERN[:full_budget])
-    if use_tract_first_search and use_flow_first_search:
-        raise ValueError("tract-first and flow-first search are mutually exclusive")
-    if use_tract_first_search or use_flow_first_search:
+    if sum(map(bool, (
+        use_tract_first_search,
+        use_flow_first_search,
+        use_tract_capacity_search,
+        use_flow_capacity_hybrid_search,
+    ))) > 1:
+        raise ValueError(
+            "tract-first, tract-capacity, flow-first, and flow-capacity hybrid "
+            "search are mutually exclusive"
+        )
+    if any((
+        use_tract_first_search,
+        use_flow_first_search,
+        use_tract_capacity_search,
+        use_flow_capacity_hybrid_search,
+    )):
         # Preserve reduced-cost and pseudo-cost search. At large budgets, use
         # one of the duplicate max-LP slots for the custom worker instead.
         max_lp_indices = [
@@ -763,9 +895,14 @@ def _asu_full_subsolvers(
             if "portfolio_max_lp" in full_subsolvers
             else len(full_subsolvers) - 1
         )
-        full_subsolvers[replace_index] = (
-            "asu_tract_first" if use_tract_first_search else "asu_flow_first"
-        )
+        if use_tract_first_search:
+            full_subsolvers[replace_index] = "asu_tract_first"
+        elif use_flow_capacity_hybrid_search:
+            full_subsolvers[replace_index] = "asu_flow_capacity_hybrid"
+        elif use_tract_capacity_search:
+            full_subsolvers[replace_index] = "asu_tract_capacity"
+        else:
+            full_subsolvers[replace_index] = "asu_flow_first"
     if use_tract_first_probing:
         for source, replacement in (
             ("asu_probe_fast", "asu_probe_fast_tract_first"),
@@ -1435,6 +1572,8 @@ def solve_one_asu_cpsat(
         Sequence[Tuple[Sequence[int], Sequence[int]]]
     ] = None,
     use_flow_first_search: bool = False,
+    use_tract_capacity_search: bool = False,
+    use_flow_capacity_hybrid_search: bool = False,
 ) -> Optional[CpsatResult]:
     """
         Connectivity via iterative vertex-separator cuts. Each disconnected incumbent
@@ -1467,10 +1606,21 @@ def solve_one_asu_cpsat(
     N = len(nb_local)
     if N == 0:
         return None
-    if use_tract_first_search and use_flow_first_search:
-        raise ValueError("tract-first and flow-first search are mutually exclusive")
-    if use_flow_first_search and use_arborescence:
-        raise ValueError("flow-first search requires an integer flow formulation")
+    if sum(map(bool, (
+        use_tract_first_search,
+        use_flow_first_search,
+        use_tract_capacity_search,
+        use_flow_capacity_hybrid_search,
+    ))) > 1:
+        raise ValueError(
+            "tract-first, tract-capacity, flow-first, and flow-capacity hybrid "
+            "search are mutually exclusive"
+        )
+    if (use_flow_first_search or use_flow_capacity_hybrid_search) and use_arborescence:
+        raise ValueError(
+            "flow-first and flow-capacity hybrid search require an integer "
+            "flow formulation"
+        )
 
     if hint is not None:
         hint = sorted({int(node) for node in hint})
@@ -1510,6 +1660,17 @@ def solve_one_asu_cpsat(
         and use_flow_first_search
         and max(1, int(workers)) >= 6
     )
+    tract_capacity_enabled = (
+        configure_subsolvers
+        and use_tract_capacity_search
+        and max(1, int(workers)) >= 6
+    )
+    flow_capacity_hybrid_enabled = (
+        configure_subsolvers
+        and use_flow_capacity_hybrid_search
+        and max(1, int(workers)) >= 6
+    )
+    flow_decision_enabled = flow_first_enabled or flow_capacity_hybrid_enabled
     if hint is not None:
         hint = sorted({int(node_map_c[v]) for v in hint})
 
@@ -2057,7 +2218,7 @@ def solve_one_asu_cpsat(
                         distance_tightened += 1
                 flow_var = model.NewIntVar(lo, hi, f"f_{i}_{j}")
                 f.append(flow_var)
-                if flow_first_enabled:
+                if flow_decision_enabled:
                     magnitude = model.NewIntVar(
                         0, max(abs(lo), abs(hi)), f"abs_f_{i}_{j}"
                     )
@@ -2078,7 +2239,7 @@ def solve_one_asu_cpsat(
                     flow_hints.get((i, j), 0) - flow_hints.get((j, i), 0)
                 )
                 model.AddHint(f[edge_index], hinted_flow)
-                if flow_first_enabled:
+                if flow_decision_enabled:
                     model.AddHint(abs_flow[edge_index], abs(hinted_flow))
             for i in range(N):
                 net_outflow = sum(net_out_for[i]) if net_out_for[i] else 0
@@ -2099,7 +2260,7 @@ def solve_one_asu_cpsat(
                     distance_tightened += 1
                 directed_bounds.append(bound_value)
             f = [model.NewIntVar(0, directed_bounds[idx], f"f_{i}_{j}") for idx, (i, j) in enumerate(edges)]
-            if flow_first_enabled:
+            if flow_decision_enabled:
                 abs_flow = f
             in_edges_for = [[] for _ in range(N)]
             out_edges_for = [[] for _ in range(N)]
@@ -2171,7 +2332,7 @@ def solve_one_asu_cpsat(
                         sf.get((edge_u, edge_v), 0) - sf.get((edge_v, edge_u), 0)
                     )
                     target_model.AddHint(f[edge_index], flow_value)
-                    if flow_first_enabled:
+                    if flow_decision_enabled:
                         target_model.AddHint(abs_flow[edge_index], abs(flow_value))
             else:
                 for edge_index, (edge_u, edge_v) in enumerate(edges):
@@ -2296,6 +2457,61 @@ def solve_one_asu_cpsat(
         if remaining_time <= 0.01:
             return _to_orig(best_connected, "FEASIBLE") if best_connected else None
 
+        if flow_capacity_hybrid_enabled:
+            root_distances = _root_graph_distances(nb_local, root_local)
+            (
+                hybrid_flow_prefix,
+                hybrid_capacity_select_prefix,
+                hybrid_capacity_reject_prefix,
+                hybrid_far_order,
+            ) = _asu_flow_capacity_hybrid_groups(
+                edges,
+                u_g,
+                E_g,
+                num,
+                den,
+                root_distances,
+                max_prefix=_ASU_HYBRID_PREFIX_SIZE,
+            )
+            if hybrid_flow_prefix:
+                model.AddDecisionStrategy(
+                    [abs_flow[edge_index] for edge_index in hybrid_flow_prefix],
+                    cp_model.CHOOSE_MAX_DOMAIN_SIZE,
+                    cp_model.SELECT_MIN_VALUE,
+                )
+            if hybrid_capacity_select_prefix:
+                model.AddDecisionStrategy(
+                    [x[node] for node in hybrid_capacity_select_prefix],
+                    cp_model.CHOOSE_FIRST,
+                    cp_model.SELECT_MAX_VALUE,
+                )
+            if hybrid_capacity_reject_prefix:
+                model.AddDecisionStrategy(
+                    [x[node] for node in hybrid_capacity_reject_prefix],
+                    cp_model.CHOOSE_FIRST,
+                    cp_model.SELECT_MIN_VALUE,
+                )
+            hybrid_far_variables = [
+                x[index] if kind == "tract" else abs_flow[index]
+                for kind, index in hybrid_far_order
+            ]
+            if hybrid_far_variables:
+                model.AddDecisionStrategy(
+                    hybrid_far_variables,
+                    cp_model.CHOOSE_FIRST,
+                    cp_model.SELECT_MIN_VALUE,
+                )
+            if log:
+                print(
+                    "  flow-capacity hybrid worker: "
+                    f"flow prefix={len(hybrid_flow_prefix)}, capacity select="
+                    f"{len(hybrid_capacity_select_prefix)}, capacity reject="
+                    f"{len(hybrid_capacity_reject_prefix)}, far-distance tail="
+                    f"{len(hybrid_far_variables)}; tail selects minimum absolute "
+                    "values farthest from root first",
+                    flush=True,
+                )
+
         if flow_first_enabled:
             flow_branch_order = _asu_flow_branch_order(edges, u_g, E_g)
             if flow_branch_order:
@@ -2309,6 +2525,32 @@ def solve_one_asu_cpsat(
                     f"  flow-first worker: branch on {len(flow_branch_order)} "
                     "absolute-flow variables by largest domain; ties use incident "
                     "tract UR then unemployment; select minimum magnitude",
+                    flush=True,
+                )
+
+        if tract_capacity_enabled:
+            capacity_select_order, capacity_reject_order = (
+                _asu_tract_capacity_orders(u_g, E_g, num, den)
+            )
+            if capacity_select_order:
+                model.AddDecisionStrategy(
+                    [x[i] for i in capacity_select_order],
+                    cp_model.CHOOSE_FIRST,
+                    cp_model.SELECT_MAX_VALUE,
+                )
+            if capacity_reject_order:
+                model.AddDecisionStrategy(
+                    [x[i] for i in capacity_reject_order],
+                    cp_model.CHOOSE_FIRST,
+                    cp_model.SELECT_MIN_VALUE,
+                )
+            if log:
+                print(
+                    "  tract-capacity worker: select "
+                    f"{len(capacity_select_order)} nonnegative-capacity tract "
+                    "variables high-to-low, then reject "
+                    f"{len(capacity_reject_order)} negative-capacity tract "
+                    "variables low-to-high",
                     flush=True,
                 )
 
@@ -2405,6 +2647,29 @@ def solve_one_asu_cpsat(
                     max_cut_rounds_at_level_zero=4,
                 )
 
+            if flow_capacity_hybrid_enabled:
+                _append_asu_subsolver_params(
+                    params,
+                    "asu_flow_capacity_hybrid",
+                    search_branching=cp_model.PARTIAL_FIXED_SEARCH,
+                    linearization_level=2,
+                    # Changed from 25_000 to 100_000 to allow more LP iterations for the hybrid search.
+                    root_lp_iterations=100_000,
+                    add_lp_constraints_lazily=False,
+                    max_cut_rounds_at_level_zero=4,
+                )
+
+            if tract_capacity_enabled:
+                _append_asu_subsolver_params(
+                    params,
+                    "asu_tract_capacity",
+                    search_branching=cp_model.PARTIAL_FIXED_SEARCH,
+                    linearization_level=2,
+                    root_lp_iterations=25_000,
+                    add_lp_constraints_lazily=False,
+                    max_cut_rounds_at_level_zero=4,
+                )
+
             if tract_first_enabled:
                 _append_asu_subsolver_params(
                     params,
@@ -2420,7 +2685,7 @@ def solve_one_asu_cpsat(
             _append_asu_subsolver_params(
                 params,
                 "lb_tree_search",
-                save_lp_basis_in_lb_tree_search=False,
+                save_lp_basis_in_lb_tree_search=True,
                 max_cut_rounds_at_level_zero=4,
                 add_objective_cut=True,
                 root_lp_iterations = 100_000
@@ -2468,6 +2733,8 @@ def solve_one_asu_cpsat(
                 workers,
                 use_tract_first_search=tract_first_enabled,
                 use_flow_first_search=flow_first_enabled,
+                use_tract_capacity_search=tract_capacity_enabled,
+                use_flow_capacity_hybrid_search=flow_capacity_hybrid_enabled,
                 use_tract_first_probing=tract_first_probing_enabled,
             )
 
@@ -5180,6 +5447,8 @@ def build_many_asus_cpsat(
     standalone_expansion_time_limit: float = 30.0,
     final_asu_polish_time_limit: Optional[float] = None,
     use_flow_first_search: bool = False,
+    use_tract_capacity_search: bool = False,
+    use_flow_capacity_hybrid_search: bool = False,
 ) -> Dict[str, np.ndarray]:
     """
     Build ASUs in batches of up to `parallel_asus` disjoint candidate windows, solved
@@ -5245,10 +5514,21 @@ def build_many_asus_cpsat(
     incumbent is committed as its ASU and the loop continues on to build the
     next ASU window normally.
     """
-    if use_tract_first_search and use_flow_first_search:
-        raise ValueError("tract-first and flow-first search are mutually exclusive")
-    if use_flow_first_search and use_arborescence:
-        raise ValueError("flow-first search requires an integer flow formulation")
+    if sum(map(bool, (
+        use_tract_first_search,
+        use_flow_first_search,
+        use_tract_capacity_search,
+        use_flow_capacity_hybrid_search,
+    ))) > 1:
+        raise ValueError(
+            "tract-first, tract-capacity, flow-first, and flow-capacity hybrid "
+            "search are mutually exclusive"
+        )
+    if (use_flow_first_search or use_flow_capacity_hybrid_search) and use_arborescence:
+        raise ValueError(
+            "flow-first and flow-capacity hybrid search require an integer "
+            "flow formulation"
+        )
 
     def _round_to_int64(col: pd.Series, name: str) -> np.ndarray:
         # BLS/ACS counts should already be whole numbers; round explicitly
@@ -5588,6 +5868,8 @@ def build_many_asus_cpsat(
                         configure_subsolvers=configure_subsolvers,
                         use_tract_first_search=use_tract_first_search,
                         use_flow_first_search=use_flow_first_search,
+                        use_tract_capacity_search=use_tract_capacity_search,
+                        use_flow_capacity_hybrid_search=use_flow_capacity_hybrid_search,
                         use_flow_count_envelope=use_flow_count_envelope,
                         use_small_root_separators=use_small_root_separators,
                         root_separator_max_size=root_separator_max_size,
@@ -5751,6 +6033,8 @@ def build_many_asus_cpsat(
                 configure_subsolvers=configure_subsolvers,
                 use_tract_first_search=use_tract_first_search,
                 use_flow_first_search=use_flow_first_search,
+                use_tract_capacity_search=use_tract_capacity_search,
+                use_flow_capacity_hybrid_search=use_flow_capacity_hybrid_search,
                 use_flow_count_envelope=use_flow_count_envelope,
                 use_small_root_separators=use_small_root_separators,
                 root_separator_max_size=root_separator_max_size,
@@ -5891,6 +6175,8 @@ def build_many_asus_cpsat(
                 configure_subsolvers=configure_subsolvers,
                 use_tract_first_search=use_tract_first_search,
                 use_flow_first_search=use_flow_first_search,
+                use_tract_capacity_search=use_tract_capacity_search,
+                use_flow_capacity_hybrid_search=use_flow_capacity_hybrid_search,
                 use_flow_count_envelope=use_flow_count_envelope,
                 use_small_root_separators=use_small_root_separators,
                 root_separator_max_size=root_separator_max_size,
@@ -6180,6 +6466,8 @@ def build_many_asus_cpsat(
                     configure_subsolvers=configure_subsolvers,
                     use_tract_first_search=use_tract_first_search,
                     use_flow_first_search=use_flow_first_search,
+                    use_tract_capacity_search=use_tract_capacity_search,
+                    use_flow_capacity_hybrid_search=use_flow_capacity_hybrid_search,
                     use_flow_count_envelope=use_flow_count_envelope,
                     use_small_root_separators=use_small_root_separators,
                     root_separator_max_size=root_separator_max_size,
@@ -6351,6 +6639,8 @@ def build_many_asus_cpsat(
             configure_subsolvers=configure_subsolvers,
             use_tract_first_search=use_tract_first_search,
             use_flow_first_search=use_flow_first_search,
+            use_tract_capacity_search=use_tract_capacity_search,
+            use_flow_capacity_hybrid_search=use_flow_capacity_hybrid_search,
             use_flow_count_envelope=use_flow_count_envelope,
             use_small_root_separators=use_small_root_separators,
             root_separator_max_size=root_separator_max_size,
@@ -6575,6 +6865,24 @@ def main():
         ),
     )
     ap.add_argument(
+        "--use-tract-capacity-search",
+        action="store_true",
+        help=(
+            "Enable an experimental partial fixed-search worker that selects "
+            "tracts in descending nonnegative rate-capacity order, then rejects "
+            "tracts in ascending negative rate-capacity order"
+        ),
+    )
+    ap.add_argument(
+        "--use-flow-capacity-hybrid-search",
+        action="store_true",
+        help=(
+            "Enable an experimental hybrid worker: minimize a flow-first "
+            "prefix, apply tract-capacity branching, then minimize remaining "
+            "tract and absolute-flow variables farthest from the root first"
+        ),
+    )
+    ap.add_argument(
         "--no-flow-count-envelope",
         action="store_true",
         help="Disable dynamic signed-flow bounds based on selected-node count",
@@ -6716,8 +7024,17 @@ def main():
     )
     ap.add_argument("--verbose", action="store_true", help="Verbose CP-SAT logs")
     args = ap.parse_args()
-    if args.use_tract_first_search and args.use_flow_first_search:
-        ap.error("--use-tract-first-search and --use-flow-first-search are mutually exclusive")
+    if sum(map(bool, (
+        args.use_tract_first_search,
+        args.use_flow_first_search,
+        args.use_tract_capacity_search,
+        args.use_flow_capacity_hybrid_search,
+    ))) > 1:
+        ap.error(
+            "--use-tract-first-search, --use-tract-capacity-search, "
+            "--use-flow-first-search, and --use-flow-capacity-hybrid-search "
+            "are mutually exclusive"
+        )
 
     # Load input table
     inp = args.input
@@ -6787,6 +7104,8 @@ def main():
         use_root_articulation_implications=args.use_root_articulation_implications,
         use_tract_first_search=args.use_tract_first_search,
         use_flow_first_search=args.use_flow_first_search,
+        use_tract_capacity_search=args.use_tract_capacity_search,
+        use_flow_capacity_hybrid_search=args.use_flow_capacity_hybrid_search,
         use_flow_count_envelope=not args.no_flow_count_envelope,
         use_small_root_separators=not args.no_small_root_separators,
         root_separator_max_size=args.root_separator_max_size,

@@ -34,7 +34,9 @@ build_asu(
   combine_time_limit = NA_integer_,
   verbose = interactive(),
   parallel_asus = 1L,
-  use_flow_first_search = FALSE
+  use_flow_first_search = FALSE,
+  use_tract_capacity_search = FALSE,
+  use_flow_capacity_hybrid_search = FALSE
 )
 }
 \arguments{
@@ -60,11 +62,6 @@ subsolver portfolio instead of the ASU-specific portfolio}
 \item{use_tract_first_search}{logical; enable the experimental
 incumbent-boundary worker, trying safe exclusions before frontier
 additions, within the ASU-specific portfolio}
-
-\item{use_flow_first_search}{logical; enable the experimental flow-first
-worker, choosing the widest flow domain, breaking ties by incident tract
-unemployment rate and count, and selecting the minimum value. Requires
-\code{configure_subsolvers = TRUE} and cannot be combined with tract-first search}
 
 \item{use_flow_count_envelope}{logical; dynamically bound signed-flow values
 by the number of selected nodes}
@@ -140,6 +137,25 @@ specifically for the uncapped combine/re-solve pass (\code{NA_integer_} uses
 \item{parallel_asus}{maximum number of ASU windows or standalone expansions
 solved concurrently. Use \code{1} (the default) to solve ASUs sequentially;
 the configured \code{workers} are then available to each solve}
+
+\item{use_flow_first_search}{logical; enable the experimental flow-first
+worker, choosing the widest flow domain, breaking ties by incident tract
+unemployment rate and count, and selecting the minimum value. Requires
+\code{configure_subsolvers = TRUE} and cannot be combined with another custom
+fixed-search worker}
+
+\item{use_tract_capacity_search}{logical; enable the experimental
+tract-capacity worker, selecting nonnegative exact unemployment-rate
+capacity from highest to lowest, then rejecting negative capacity from
+lowest to highest. Requires \code{configure_subsolvers = TRUE} and cannot be
+combined with another custom fixed-search worker}
+
+\item{use_flow_capacity_hybrid_search}{logical; enable the experimental
+hybrid worker: minimize a flow-first prefix, apply tract-capacity
+branching, then minimize remaining tract and absolute-flow variables from
+farthest to nearest root distance. Requires \code{configure_subsolvers = TRUE},
+an integer-flow formulation, and cannot be combined with another custom
+fixed-search worker}
 }
 \value{
 df with added \code{asu_id} column (integer; -1 means unassigned)

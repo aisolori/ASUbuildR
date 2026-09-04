@@ -19,7 +19,19 @@
 #' @param use_flow_first_search logical; enable the experimental flow-first
 #'   worker, choosing the widest flow domain, breaking ties by incident tract
 #'   unemployment rate and count, and selecting the minimum value. Requires
-#'   `configure_subsolvers = TRUE` and cannot be combined with tract-first search
+#'   `configure_subsolvers = TRUE` and cannot be combined with another custom
+#'   fixed-search worker
+#' @param use_tract_capacity_search logical; enable the experimental
+#'   tract-capacity worker, selecting nonnegative exact unemployment-rate
+#'   capacity from highest to lowest, then rejecting negative capacity from
+#'   lowest to highest. Requires `configure_subsolvers = TRUE` and cannot be
+#'   combined with another custom fixed-search worker
+#' @param use_flow_capacity_hybrid_search logical; enable the experimental
+#'   hybrid worker: minimize a flow-first prefix, apply tract-capacity
+#'   branching, then minimize remaining tract and absolute-flow variables from
+#'   farthest to nearest root distance. Requires `configure_subsolvers = TRUE`,
+#'   an integer-flow formulation, and cannot be combined with another custom
+#'   fixed-search worker
 #' @param use_flow_count_envelope logical; dynamically bound signed-flow values
 #'   by the number of selected nodes
 #' @param use_small_root_separators logical; add valid size-2/3 rooted
@@ -105,7 +117,9 @@ build_asu <- function(
     combine_time_limit = NA_integer_,
     verbose = interactive(),
     parallel_asus = 1L,
-    use_flow_first_search = FALSE
+    use_flow_first_search = FALSE,
+    use_tract_capacity_search = FALSE,
+    use_flow_capacity_hybrid_search = FALSE
 ) {
   asu_use_python(required = TRUE)
   if (!reticulate::py_module_available("ortools"))
@@ -140,6 +154,8 @@ build_asu <- function(
     configure_subsolvers = isTRUE(configure_subsolvers),
     use_tract_first_search = isTRUE(use_tract_first_search),
     use_flow_first_search = isTRUE(use_flow_first_search),
+    use_tract_capacity_search = isTRUE(use_tract_capacity_search),
+    use_flow_capacity_hybrid_search = isTRUE(use_flow_capacity_hybrid_search),
     use_flow_count_envelope = isTRUE(use_flow_count_envelope),
     use_small_root_separators = isTRUE(use_small_root_separators),
     root_separator_max_size = as.integer(root_separator_max_size),
