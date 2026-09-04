@@ -2035,6 +2035,7 @@ def solve_one_asu_cpsat(
             ]
             return min(bounds) if bounds else None
 
+        abs_flow = []
         if use_signed_flow:
             f = []
             for idx, (i, j) in enumerate(edges):
@@ -2054,7 +2055,14 @@ def solve_one_asu_cpsat(
                     if -cap_in > lo:
                         lo = -cap_in
                         distance_tightened += 1
-                f.append(model.NewIntVar(lo, hi, f"f_{i}_{j}"))
+                flow_var = model.NewIntVar(lo, hi, f"f_{i}_{j}")
+                f.append(flow_var)
+                if flow_first_enabled:
+                    magnitude = model.NewIntVar(
+                        0, max(abs(lo), abs(hi)), f"abs_f_{i}_{j}"
+                    )
+                    model.AddAbsEquality(magnitude, flow_var)
+                    abs_flow.append(magnitude)
             net_out_for = [[] for _ in range(N)]
             for edge_index, (i, j) in enumerate(edges):
                 model.Add(f[edge_index] == 0).OnlyEnforceIf(x[i].Not())
@@ -2066,10 +2074,12 @@ def solve_one_asu_cpsat(
                 net_out_for[i].append(f[edge_index])
                 net_out_for[j].append(-f[edge_index])
 
-                model.AddHint(
-                    f[edge_index],
-                    flow_hints.get((i, j), 0) - flow_hints.get((j, i), 0),
+                hinted_flow = (
+                    flow_hints.get((i, j), 0) - flow_hints.get((j, i), 0)
                 )
+                model.AddHint(f[edge_index], hinted_flow)
+                if flow_first_enabled:
+                    model.AddHint(abs_flow[edge_index], abs(hinted_flow))
             for i in range(N):
                 net_outflow = sum(net_out_for[i]) if net_out_for[i] else 0
                 model.Add(net_outflow == (selected_count - 1 if i == root_local else -x[i]))
@@ -2089,6 +2099,8 @@ def solve_one_asu_cpsat(
                     distance_tightened += 1
                 directed_bounds.append(bound_value)
             f = [model.NewIntVar(0, directed_bounds[idx], f"f_{i}_{j}") for idx, (i, j) in enumerate(edges)]
+            if flow_first_enabled:
+                abs_flow = f
             in_edges_for = [[] for _ in range(N)]
             out_edges_for = [[] for _ in range(N)]
             for edge_index, (i, j) in enumerate(edges):
@@ -2155,10 +2167,12 @@ def solve_one_asu_cpsat(
             target_model.AddHint(selected_count, len(sel_set))
             if use_signed_flow:
                 for edge_index, (edge_u, edge_v) in enumerate(edges):
-                    target_model.AddHint(
-                        f[edge_index],
-                        sf.get((edge_u, edge_v), 0) - sf.get((edge_v, edge_u), 0),
+                    flow_value = (
+                        sf.get((edge_u, edge_v), 0) - sf.get((edge_v, edge_u), 0)
                     )
+                    target_model.AddHint(f[edge_index], flow_value)
+                    if flow_first_enabled:
+                        target_model.AddHint(abs_flow[edge_index], abs(flow_value))
             else:
                 for edge_index, (edge_u, edge_v) in enumerate(edges):
                     target_model.AddHint(f[edge_index], sf.get((edge_u, edge_v), 0))
@@ -2286,15 +2300,15 @@ def solve_one_asu_cpsat(
             flow_branch_order = _asu_flow_branch_order(edges, u_g, E_g)
             if flow_branch_order:
                 model.AddDecisionStrategy(
-                    [f[edge_index] for edge_index in flow_branch_order],
+                    [abs_flow[edge_index] for edge_index in flow_branch_order],
                     cp_model.CHOOSE_MAX_DOMAIN_SIZE,
                     cp_model.SELECT_MIN_VALUE,
                 )
             if log:
                 print(
                     f"  flow-first worker: branch on {len(flow_branch_order)} "
-                    "flow variables by largest domain; ties use incident tract "
-                    "UR then unemployment; select minimum value",
+                    "absolute-flow variables by largest domain; ties use incident "
+                    "tract UR then unemployment; select minimum magnitude",
                     flush=True,
                 )
 
