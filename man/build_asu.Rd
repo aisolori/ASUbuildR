@@ -33,7 +33,8 @@ build_asu(
   combine_capped_asus = TRUE,
   combine_time_limit = NA_integer_,
   verbose = interactive(),
-  parallel_asus = 1L
+  parallel_asus = 1L,
+  use_flow_first_search = FALSE
 )
 }
 \arguments{
@@ -59,6 +60,11 @@ subsolver portfolio instead of the ASU-specific portfolio}
 \item{use_tract_first_search}{logical; enable the experimental
 incumbent-boundary worker, trying safe exclusions before frontier
 additions, within the ASU-specific portfolio}
+
+\item{use_flow_first_search}{logical; enable the experimental flow-first
+worker, choosing the widest flow domain, breaking ties by incident tract
+unemployment rate and count, and selecting the minimum value. Requires
+\code{configure_subsolvers = TRUE} and cannot be combined with tract-first search}
 
 \item{use_flow_count_envelope}{logical; dynamically bound signed-flow values
 by the number of selected nodes}

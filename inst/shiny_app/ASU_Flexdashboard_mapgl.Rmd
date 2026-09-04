@@ -1194,6 +1194,7 @@ kwargs = dict(
     use_arborescence=False,
     use_root_articulation_implications=True,
     use_tract_first_search=False,
+    use_flow_first_search=True,
     use_flow_count_envelope=False,
     use_small_root_separators=True,
     root_separator_max_size=6,
@@ -1210,7 +1211,7 @@ kwargs = dict(
     use_connectivity_free_repair=True,
     connectivity_free_time_limit=30.0,
     harvest_connectivity_free_asus=True,
-    standalone_expansion_time_limit=600.0,
+    standalone_expansion_time_limit=1000.0,
     stop_flag_path=r'%s',
     skip_flag_path=r'%s'
 )

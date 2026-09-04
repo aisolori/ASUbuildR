@@ -38,6 +38,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass
+from fractions import Fraction
 from typing import List, Optional, Dict, Sequence, Tuple
 
 import numpy as np
@@ -686,18 +687,45 @@ def _asu_branch_challenges(
     return additions, removals
 
 
+def _asu_flow_branch_order(
+    edges: Sequence[Tuple[int, int]],
+    u_g: np.ndarray,
+    E_g: np.ndarray,
+) -> List[int]:
+    """Order flow edges by incident tract UR, then unemployment count."""
+    node_priority = []
+    for node in range(len(u_g)):
+        unemployed = int(u_g[node])
+        labor_force = unemployed + int(E_g[node])
+        unemployment_rate = (
+            Fraction(unemployed, labor_force)
+            if labor_force > 0 else Fraction(0, 1)
+        )
+        node_priority.append((unemployment_rate, unemployed))
+
+    def edge_priority(edge_index: int) -> Tuple:
+        left, right = edges[edge_index]
+        primary, secondary = sorted(
+            (node_priority[left], node_priority[right]),
+            reverse=True,
+        )
+        return primary + secondary
+
+    return sorted(range(len(edges)), key=edge_priority, reverse=True)
+
+
 _ASU_FULL_SUBSOLVER_PATTERN = (
-    "default_lp",
-    "asu_probe_fast",
-    "asu_probe_very_deep",
-    "lb_tree_search",
     "portfolio_max_lp",
+    "asu_probe_fast",
+    "asu_probe_standard",
+    "lb_tree_search",
     "quick_restart",
+    "probing",
 
     "pseudo_costs",
     "reduced_costs",
     "core_max_lp",
-    "probing",
+
     "quick_restart_no_lp",
 
     "core",
@@ -709,18 +737,21 @@ _ASU_FULL_SUBSOLVER_PATTERN = (
 def _asu_full_subsolvers(
     workers: int,
     use_tract_first_search: bool = False,
+    use_flow_first_search: bool = False,
     use_tract_first_probing: bool = False,
 ) -> List[str]:
     """Return the bounded full-problem portfolio for one ASU solve."""
     workers = max(1, int(workers))
-    if workers < 8:
+    if workers < 6:
         return []
 
     full_budget = max(6, min(16, round(workers *.3)))
-    full_subsolvers = list(_ASU_FULL_SUBSOLVER_PATTERN[:full_budget])
-    if use_tract_first_search:
+    full_subsolvers: List[str] = list(_ASU_FULL_SUBSOLVER_PATTERN[:full_budget])
+    if use_tract_first_search and use_flow_first_search:
+        raise ValueError("tract-first and flow-first search are mutually exclusive")
+    if use_tract_first_search or use_flow_first_search:
         # Preserve reduced-cost and pseudo-cost search. At large budgets, use
-        # one of the duplicate max-LP slots for the boundary worker instead.
+        # one of the duplicate max-LP slots for the custom worker instead.
         max_lp_indices = [
             index for index, name in enumerate(full_subsolvers)
             if name == "max_lp"
@@ -732,7 +763,9 @@ def _asu_full_subsolvers(
             if "portfolio_max_lp" in full_subsolvers
             else len(full_subsolvers) - 1
         )
-        full_subsolvers[replace_index] = "asu_tract_first"
+        full_subsolvers[replace_index] = (
+            "asu_tract_first" if use_tract_first_search else "asu_flow_first"
+        )
     if use_tract_first_probing:
         for source, replacement in (
             ("asu_probe_fast", "asu_probe_fast_tract_first"),
@@ -1401,6 +1434,7 @@ def solve_one_asu_cpsat(
     initial_connectivity_cuts: Optional[
         Sequence[Tuple[Sequence[int], Sequence[int]]]
     ] = None,
+    use_flow_first_search: bool = False,
 ) -> Optional[CpsatResult]:
     """
         Connectivity via iterative vertex-separator cuts. Each disconnected incumbent
@@ -1433,6 +1467,10 @@ def solve_one_asu_cpsat(
     N = len(nb_local)
     if N == 0:
         return None
+    if use_tract_first_search and use_flow_first_search:
+        raise ValueError("tract-first and flow-first search are mutually exclusive")
+    if use_flow_first_search and use_arborescence:
+        raise ValueError("flow-first search requires an integer flow formulation")
 
     if hint is not None:
         hint = sorted({int(node) for node in hint})
@@ -1466,6 +1504,11 @@ def solve_one_asu_cpsat(
         configure_subsolvers
         and use_tract_first_search
         and max(1, int(workers)) >= 8
+    )
+    flow_first_enabled = (
+        configure_subsolvers
+        and use_flow_first_search
+        and max(1, int(workers)) >= 6
     )
     if hint is not None:
         hint = sorted({int(node_map_c[v]) for v in hint})
@@ -2239,6 +2282,22 @@ def solve_one_asu_cpsat(
         if remaining_time <= 0.01:
             return _to_orig(best_connected, "FEASIBLE") if best_connected else None
 
+        if flow_first_enabled:
+            flow_branch_order = _asu_flow_branch_order(edges, u_g, E_g)
+            if flow_branch_order:
+                model.AddDecisionStrategy(
+                    [f[edge_index] for edge_index in flow_branch_order],
+                    cp_model.CHOOSE_MAX_DOMAIN_SIZE,
+                    cp_model.SELECT_MIN_VALUE,
+                )
+            if log:
+                print(
+                    f"  flow-first worker: branch on {len(flow_branch_order)} "
+                    "flow variables by largest domain; ties use incident tract "
+                    "UR then unemployment; select minimum value",
+                    flush=True,
+                )
+
         if tract_first_enabled:
             branch_order, _ = _asu_branch_order(
                 nb_local=nb_local,
@@ -2312,7 +2371,7 @@ def solve_one_asu_cpsat(
         def configure_asu_subsolvers(params, workers):
             workers = max(1, int(workers))
 
-            if workers < 8:
+            if workers < 6:
                 return
 
             # Prevent old/default custom subsolvers from being inserted
@@ -2320,6 +2379,17 @@ def solve_one_asu_cpsat(
             params.extra_subsolvers.clear()
             params.subsolvers.clear()
             params.filter_subsolvers.clear()
+
+            if flow_first_enabled:
+                _append_asu_subsolver_params(
+                    params,
+                    "asu_flow_first",
+                    search_branching=cp_model.PARTIAL_FIXED_SEARCH,
+                    linearization_level=2,
+                    root_lp_iterations=25_000,
+                    add_lp_constraints_lazily=False,
+                    max_cut_rounds_at_level_zero=4,
+                )
 
             if tract_first_enabled:
                 _append_asu_subsolver_params(
@@ -2383,6 +2453,7 @@ def solve_one_asu_cpsat(
             full_subsolvers = _asu_full_subsolvers(
                 workers,
                 use_tract_first_search=tract_first_enabled,
+                use_flow_first_search=flow_first_enabled,
                 use_tract_first_probing=tract_first_probing_enabled,
             )
 
@@ -5094,6 +5165,7 @@ def build_many_asus_cpsat(
     harvest_connectivity_free_asus: bool = False,
     standalone_expansion_time_limit: float = 30.0,
     final_asu_polish_time_limit: Optional[float] = None,
+    use_flow_first_search: bool = False,
 ) -> Dict[str, np.ndarray]:
     """
     Build ASUs in batches of up to `parallel_asus` disjoint candidate windows, solved
@@ -5159,6 +5231,11 @@ def build_many_asus_cpsat(
     incumbent is committed as its ASU and the loop continues on to build the
     next ASU window normally.
     """
+    if use_tract_first_search and use_flow_first_search:
+        raise ValueError("tract-first and flow-first search are mutually exclusive")
+    if use_flow_first_search and use_arborescence:
+        raise ValueError("flow-first search requires an integer flow formulation")
+
     def _round_to_int64(col: pd.Series, name: str) -> np.ndarray:
         # BLS/ACS counts should already be whole numbers; round explicitly
         # instead of truncating so any upstream fractional noise is caught
@@ -5496,6 +5573,7 @@ def build_many_asus_cpsat(
                         use_arborescence=use_arborescence,
                         configure_subsolvers=configure_subsolvers,
                         use_tract_first_search=use_tract_first_search,
+                        use_flow_first_search=use_flow_first_search,
                         use_flow_count_envelope=use_flow_count_envelope,
                         use_small_root_separators=use_small_root_separators,
                         root_separator_max_size=root_separator_max_size,
@@ -5658,6 +5736,7 @@ def build_many_asus_cpsat(
                 use_arborescence=use_arborescence,
                 configure_subsolvers=configure_subsolvers,
                 use_tract_first_search=use_tract_first_search,
+                use_flow_first_search=use_flow_first_search,
                 use_flow_count_envelope=use_flow_count_envelope,
                 use_small_root_separators=use_small_root_separators,
                 root_separator_max_size=root_separator_max_size,
@@ -5797,6 +5876,7 @@ def build_many_asus_cpsat(
                 use_arborescence=use_arborescence,
                 configure_subsolvers=configure_subsolvers,
                 use_tract_first_search=use_tract_first_search,
+                use_flow_first_search=use_flow_first_search,
                 use_flow_count_envelope=use_flow_count_envelope,
                 use_small_root_separators=use_small_root_separators,
                 root_separator_max_size=root_separator_max_size,
@@ -6085,6 +6165,7 @@ def build_many_asus_cpsat(
                     use_arborescence=use_arborescence,
                     configure_subsolvers=configure_subsolvers,
                     use_tract_first_search=use_tract_first_search,
+                    use_flow_first_search=use_flow_first_search,
                     use_flow_count_envelope=use_flow_count_envelope,
                     use_small_root_separators=use_small_root_separators,
                     root_separator_max_size=root_separator_max_size,
@@ -6255,6 +6336,7 @@ def build_many_asus_cpsat(
             use_arborescence=use_arborescence,
             configure_subsolvers=configure_subsolvers,
             use_tract_first_search=use_tract_first_search,
+            use_flow_first_search=use_flow_first_search,
             use_flow_count_envelope=use_flow_count_envelope,
             use_small_root_separators=use_small_root_separators,
             root_separator_max_size=root_separator_max_size,
@@ -6470,6 +6552,15 @@ def main():
         ),
     )
     ap.add_argument(
+        "--use-flow-first-search",
+        action="store_true",
+        help=(
+            "Enable an experimental partial fixed-search worker that chooses "
+            "the widest flow domain, breaks ties by incident tract UR and "
+            "unemployment, and selects the minimum value"
+        ),
+    )
+    ap.add_argument(
         "--no-flow-count-envelope",
         action="store_true",
         help="Disable dynamic signed-flow bounds based on selected-node count",
@@ -6611,6 +6702,8 @@ def main():
     )
     ap.add_argument("--verbose", action="store_true", help="Verbose CP-SAT logs")
     args = ap.parse_args()
+    if args.use_tract_first_search and args.use_flow_first_search:
+        ap.error("--use-tract-first-search and --use-flow-first-search are mutually exclusive")
 
     # Load input table
     inp = args.input
@@ -6679,6 +6772,7 @@ def main():
         deterministic_ties=not args.no_deterministic_ties,
         use_root_articulation_implications=args.use_root_articulation_implications,
         use_tract_first_search=args.use_tract_first_search,
+        use_flow_first_search=args.use_flow_first_search,
         use_flow_count_envelope=not args.no_flow_count_envelope,
         use_small_root_separators=not args.no_small_root_separators,
         root_separator_max_size=args.root_separator_max_size,
