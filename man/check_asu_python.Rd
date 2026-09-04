@@ -10,5 +10,6 @@ check_asu_python()
 Logical. TRUE if properly configured, FALSE otherwise.
 }
 \description{
-Checks if the Python environment is properly configured for ASUbuildR.
+Checks if the Python environment is properly configured for ASUbuildR,
+including OR-Tools version compatibility (>= 9.15).
 }

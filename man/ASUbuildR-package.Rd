@@ -4,9 +4,17 @@
 \name{ASUbuildR-package}
 \alias{ASUbuildR}
 \alias{ASUbuildR-package}
-\title{ASUbuildR: A Shiny Interface for Constructing Areas of Substantial Unemployment}
+\title{ASUbuildR: Build Areas of Substantial Unemployment}
 \description{
-Provides a point-and-click GUI together with helper algorithms for building Areas of Substantial Unemployment (ASUs) from Census tract and BLS data. The package wraps a Shiny Flexdashboard interface and utilities for optimizing tract groupings and exporting results.
+ASUbuildR provides an interactive Shiny Flexdashboard plus supporting
+algorithms for constructing Areas of Substantial Unemployment (ASUs) from
+Census tract geometry and BLS workbook inputs.
+}
+\details{
+The package includes multiple build strategies, including an optional
+CP-SAT workflow backed by OR-Tools. For stable CP-SAT behavior, use
+\code{setup_asu_python()} to provision the managed Python environment and
+ensure OR-Tools \code{>= 9.15}.
 }
 \seealso{
 Useful links:

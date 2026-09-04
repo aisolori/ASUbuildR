@@ -1,7 +1,7 @@
 Package: ASUbuildR
 Type: Package
 Title: A Shiny Interface for Constructing Areas of Substantial Unemployment
-Version: 0.6.41
+Version: 0.6.5
 Authors@R: c(
     person("David", "Schmidt", email = "deschmidt@detr.nv.gov", role = c("aut", "cre")),
     person("Michael", "Frank", role = "aut"),
@@ -10,7 +10,8 @@ Authors@R: c(
 Description: Provides a point-and-click GUI together with helper algorithms
     for building Areas of Substantial Unemployment (ASUs) from Census tract
     and BLS data. The package wraps a Shiny Flexdashboard interface and
-    utilities for optimizing tract groupings and exporting results.
+  utilities for optimizing tract groupings and exporting results. The
+  optional CP-SAT workflow requires OR-Tools 9.15 or newer.
 License: MIT + file LICENSE
 URL: https://github.com/aisolori/ASUbuildR
 BugReports: https://github.com/aisolori/ASUbuildR/issues
@@ -41,7 +42,7 @@ Imports:
     processx,
     rappdirs
 LinkingTo: Rcpp
-SystemRequirements: C++11; Pandoc (>= 1.12.3); Python (>= 3.9) with packages: ortools, numpy, pandas, networkx, openpyxl
+SystemRequirements: C++11; Pandoc (>= 1.12.3); Python (>= 3.9) with packages: ortools (>= 9.15), numpy, pandas, networkx, openpyxl
 Suggests:
   freestiler,
   knitr,

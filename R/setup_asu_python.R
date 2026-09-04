@@ -5,10 +5,10 @@
 #' necessary), creates a conda environment using only the \emph{conda-forge}
 #' channel for the Python interpreter itself (avoiding channels that require
 #' Terms of Service acceptance), and installs the required Python packages
-#' (\code{numpy}, \code{pandas}, \code{networkx}, \code{ortools},
-#' \code{openpyxl}) via pip inside that environment. OR-Tools is not
-#' distributed on conda-forge, so
-#' pip is used for the packages rather than \code{conda install}.
+#' (\code{numpy}, \code{pandas}, \code{networkx}, \code{openpyxl}, and
+#' \code{ortools >= 9.15}) via pip inside that environment. OR-Tools is not
+#' distributed on conda-forge, so pip is used for packages rather than
+#' \code{conda install}.
 #'
 #' @param force Logical. If TRUE, recreates the conda environment even if it exists.
 #' @return Invisible NULL. Called for side effects.
@@ -26,6 +26,7 @@ setup_asu_python <- function(force = FALSE) {
   message("Setting up Python environment for ASUbuildR...")
 
   env_name <- "asu-cpsat"
+  min_ortools_version <- "9.15"
 
   # Run a conda subcommand and stop with an informative error if it fails,
   # instead of silently continuing as if the step had succeeded.
@@ -161,7 +162,6 @@ setup_asu_python <- function(force = FALSE) {
     numpy = "numpy",
     pandas = "pandas",
     networkx = "networkx",
-    ortools = "ortools.sat.python.cp_model",
     openpyxl = "openpyxl"
   )
   required_imports_py <- paste0(
@@ -174,9 +174,10 @@ setup_asu_python <- function(force = FALSE) {
   )
 
   # Write Python snippets to temp files to avoid Windows cmd.exe quoting issues.
-  check_file  <- tempfile(fileext = ".py")
-  verify_file <- tempfile(fileext = ".py")
-  on.exit(unlink(c(check_file, verify_file), force = TRUE), add = TRUE)
+  check_file   <- tempfile(fileext = ".py")
+  version_file <- tempfile(fileext = ".py")
+  verify_file  <- tempfile(fileext = ".py")
+  on.exit(unlink(c(check_file, version_file, verify_file), force = TRUE), add = TRUE)
 
   writeLines(c(
     "import importlib",
@@ -192,6 +193,24 @@ setup_asu_python <- function(force = FALSE) {
 
   raw          <- system2(python_path, args = check_file, stdout = TRUE, stderr = FALSE)
   missing_pkgs <- raw[nzchar(trimws(raw))]
+
+  writeLines(c(
+    "try:",
+    "    import ortools",
+    "    print(getattr(ortools, '__version__', ''))",
+    "except Exception:",
+    "    print('')"
+  ), version_file)
+
+  ortools_version <- system2(python_path, args = version_file, stdout = TRUE, stderr = FALSE)
+  ortools_version <- if (length(ortools_version) > 0L) trimws(ortools_version[1]) else ""
+  ortools_spec <- paste0("ortools>=", min_ortools_version)
+  if (!nzchar(ortools_version) ||
+      utils::compareVersion(ortools_version, min_ortools_version) < 0L) {
+    if (!any(startsWith(missing_pkgs, "ortools"))) {
+      missing_pkgs <- c(missing_pkgs, ortools_spec)
+    }
+  }
 
   if (length(missing_pkgs) == 0) {
     message("All required Python packages are already installed.")
@@ -212,6 +231,7 @@ setup_asu_python <- function(force = FALSE) {
 
   writeLines(c(
     "import importlib",
+    "import re",
     paste0("required = ", required_imports_py),
     "errors = []",
     "for package, module in required.items():",
@@ -219,6 +239,19 @@ setup_asu_python <- function(force = FALSE) {
     "        importlib.import_module(module)",
     "    except Exception as exc:",
     "        errors.append(f'{package}: {type(exc).__name__}: {exc}')",
+    "def _version_tuple(value):",
+    "    numbers = [int(piece) for piece in re.findall(r'\\d+', str(value))]",
+    "    numbers = (numbers + [0, 0, 0])[:3]",
+    "    return tuple(numbers)",
+    "try:",
+    "    import ortools",
+    "    ortools_version = getattr(ortools, '__version__', '')",
+    "    if not ortools_version:",
+    "        errors.append('ortools: version not reported')",
+    "    elif _version_tuple(ortools_version) < (9, 15, 0):",
+    "        errors.append(f'ortools: version {ortools_version} is below required 9.15')",
+    "except Exception as exc:",
+    "    errors.append(f'ortools: {type(exc).__name__}: {exc}')",
     'print("\\n".join(errors) if errors else "OK")'
   ), verify_file)
 
@@ -238,7 +271,8 @@ setup_asu_python <- function(force = FALSE) {
 
 #' Check Python Setup for ASUbuildR
 #'
-#' Checks if the Python environment is properly configured for ASUbuildR.
+#' Checks if the Python environment is properly configured for ASUbuildR,
+#' including OR-Tools version compatibility (>= 9.15).
 #'
 #' @return Logical. TRUE if properly configured, FALSE otherwise.
 #' @export
@@ -253,20 +287,44 @@ check_asu_python <- function() {
     numpy = "numpy",
     pandas = "pandas",
     networkx = "networkx",
-    ortools = "ortools.sat.python.cp_model",
     openpyxl = "openpyxl"
   )
   available <- vapply(
     unname(required), reticulate::py_module_available, logical(1)
   )
-
-  if (all(available)) {
-    message("Python environment is properly configured")
-    return(TRUE)
-  } else {
-    missing <- names(required)[!available]
-    message("Missing packages: ", paste(missing, collapse = ", "))
-    message("Run setup_asu_python() to install missing packages.")
-    return(FALSE)
+  ortools_present <- reticulate::py_module_available("ortools")
+  ortools_version <- NA_character_
+  if (ortools_present) {
+    ortools_mod <- tryCatch(reticulate::import("ortools", convert = TRUE), error = function(e) NULL)
+    if (!is.null(ortools_mod)) {
+      ortools_version <- tryCatch(as.character(ortools_mod$`__version__`), error = function(e) NA_character_)
+      ortools_version <- if (length(ortools_version) > 0L) trimws(ortools_version[1]) else NA_character_
+      if (!is.na(ortools_version) && !nzchar(ortools_version)) ortools_version <- NA_character_
+    }
   }
+  min_ortools_version <- "9.15"
+  ortools_ok <- ortools_present && !is.na(ortools_version) &&
+    utils::compareVersion(ortools_version, min_ortools_version) >= 0L
+
+  if (all(available) && ortools_ok) {
+    message("Python environment is properly configured (OR-Tools ", ortools_version, ")")
+    return(TRUE)
+  }
+
+  missing <- names(required)[!available]
+  if (!ortools_present) {
+    missing <- c(missing, "ortools")
+  }
+  if (length(missing) > 0L) {
+    message("Missing packages: ", paste(unique(missing), collapse = ", "))
+  }
+  if (ortools_present && !ortools_ok) {
+    message(
+      "OR-Tools version is incompatible. Detected: ",
+      if (is.na(ortools_version)) "unknown" else ortools_version,
+      ". Required: >= ", min_ortools_version, "."
+    )
+  }
+  message("Run setup_asu_python(force = TRUE) to install or repair required packages.")
+  return(FALSE)
 }

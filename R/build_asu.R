@@ -1,5 +1,8 @@
 #' Build ASUs using OR-Tools CP-SAT (Python) from an R data frame
 #'
+#' Requires the managed Python environment created by
+#' \code{setup_asu_python()}, including OR-Tools \code{>= 9.15}.
+#'
 #' @param df data.frame with columns: geoid, tract_ASU_unemp, tract_ASU_emp, tract_pop2024
 #' @param neighbors list of integer vectors (0-based or 1-based ok). If NULL, you must use CLI with --geometry.
 #' @param tau numeric unemployment rate threshold (e.g. 0.0645)
@@ -122,8 +125,7 @@ build_asu <- function(
     use_flow_capacity_hybrid_search = FALSE
 ) {
   asu_use_python(required = TRUE)
-  if (!reticulate::py_module_available("ortools"))
-    stop("Python env missing 'ortools'. Run ASUbuildR::setup_asu_python() first.")
+  asu_assert_ortools_version(required = TRUE)
 
   # Normalize neighbor indexing to 0-based
   if (is.null(neighbors)) stop("Provide `neighbors` as a list of integer vectors (contiguity).")

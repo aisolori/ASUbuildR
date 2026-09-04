@@ -161,5 +161,6 @@ fixed-search worker}
 df with added \code{asu_id} column (integer; -1 means unassigned)
 }
 \description{
-Build ASUs using OR-Tools CP-SAT (Python) from an R data frame
+Requires the managed Python environment created by
+\code{setup_asu_python()}, including OR-Tools \code{>= 9.15}.
 }

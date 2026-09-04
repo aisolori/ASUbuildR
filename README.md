@@ -36,8 +36,8 @@ RStudio and Quarto. Tract Hunter and Simple Snake require no separate
 Python setup.
 
 The optional CP-SAT solver uses a managed Python 3.11 environment with
-OR-Tools, NumPy, pandas, NetworkX, and openpyxl. Configure it once after
-installing the R package:
+OR-Tools (version 9.15 or newer), NumPy, pandas, NetworkX, and openpyxl.
+Configure it once after installing the R package:
 
 ``` r
 ASUbuildR::setup_asu_python()
@@ -45,7 +45,13 @@ ASUbuildR::check_asu_python()
 ```
 
 The first setup can take several minutes because it installs Miniconda
-when Conda is not already available.
+when Conda is not already available. If you previously created the
+environment with an older OR-Tools release, rerun setup with
+`force = TRUE` to upgrade:
+
+``` r
+ASUbuildR::setup_asu_python(force = TRUE)
+```
 
 ## Running the Application
 
