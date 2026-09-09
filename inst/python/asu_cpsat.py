@@ -349,6 +349,54 @@ def _articulation_points_igraph(nb_local: List[List[int]], selected: np.ndarray)
     return {int(node_ids[i]) for i in sub.articulation_points()}
 
 
+def _connected_components_igraph(
+    nb_local: List[List[int]], selected: np.ndarray,
+) -> List[List[int]]:
+    node_ids = np.flatnonzero(selected)
+    if node_ids.size == 0:
+        return []
+    sub = _get_igraph_graph(nb_local).induced_subgraph(node_ids.tolist())
+    return [
+        [int(node_ids[i]) for i in members]
+        for members in sub.connected_components(mode="weak")
+    ]
+
+
+def _connected_components_python(
+    nb_local: List[List[int]], selected: np.ndarray,
+) -> List[List[int]]:
+    N = len(nb_local)
+    seen = np.zeros(N, dtype=bool)
+    components: List[List[int]] = []
+    for start in range(N):
+        if not selected[start] or seen[start]:
+            continue
+        seen[start] = True
+        component = [start]
+        stack = [start]
+        while stack:
+            node = stack.pop()
+            for neighbor in nb_local[node]:
+                if selected[neighbor] and not seen[neighbor]:
+                    seen[neighbor] = True
+                    component.append(neighbor)
+                    stack.append(neighbor)
+        components.append(component)
+    return components
+
+
+def _connected_components(
+    nb_local: List[List[int]], selected: np.ndarray,
+) -> List[List[int]]:
+    """Connected components of the induced subgraph on `selected` nodes.
+
+    Same igraph-first/pure-Python-fallback dispatch as `_articulation_points`.
+    """
+    if _ig is not None:
+        return _connected_components_igraph(nb_local, selected)
+    return _connected_components_python(nb_local, selected)
+
+
 def _articulation_points_python(nb_local: List[List[int]], selected: np.ndarray) -> set:
     """
     Iterative Tarjan articulation-point finder restricted to the induced subgraph
@@ -452,7 +500,76 @@ def _root_articulation_implications(
     return implications
 
 
-def _bounded_root_vertex_separator(
+def _get_igraph_separator_graph(nb_local: List[List[int]]):
+    """Build (or reuse) the cached vertex-split directed graph used by
+    `_bounded_root_vertex_separator_igraph`. Each node is split into an
+    "in" copy (2*i) and "out" copy (2*i+1); every root-target pair reuses
+    the same graph topology and only the per-call capacity list changes,
+    so this (like `_get_igraph_graph`) is cached per-thread and keyed by
+    object identity.
+    """
+    cached = getattr(_igraph_cache, "sep_entry", None)
+    if cached is not None and cached[0] is nb_local:
+        return cached[1], cached[2]
+    N = len(nb_local)
+    edges = [(2 * i, 2 * i + 1) for i in range(N)]
+    undirected_edges = sorted({
+        (min(node, neighbor), max(node, neighbor))
+        for node, neighbors in enumerate(nb_local)
+        for neighbor in neighbors
+        if node != neighbor
+    })
+    for left, right in undirected_edges:
+        edges.append((2 * left + 1, 2 * right))
+        edges.append((2 * right + 1, 2 * left))
+    graph = _ig.Graph(n=2 * N, edges=edges, directed=True)
+    _igraph_cache.sep_entry = (nb_local, graph, N)
+    return graph, N
+
+
+def _bounded_root_vertex_separator_igraph(
+    nb_local: List[List[int]],
+    root_local: int,
+    target: int,
+    max_size: int,
+) -> Optional[Tuple[int, ...]]:
+    """igraph-backed equivalent of `_bounded_root_vertex_separator_python`.
+
+    Reuses the same vertex-split reduction (see that function's docstring)
+    but hands the resulting capacitated digraph to igraph's C-backed
+    `Graph.mincut()` instead of a hand-rolled Edmonds-Karp loop. Edge
+    capacity `cutoff = max_size + 1` is used in place of true infinity,
+    which is safe here: any cut using one such edge already costs more
+    than `max_size`, so it can never underbid a genuine vertex-only
+    separator of size <= max_size (the only range this function reports).
+    """
+    if target == root_local or max_size < 2:
+        return None
+    cutoff = int(max_size) + 1
+    graph, N = _get_igraph_separator_graph(nb_local)
+    num_internal = N
+    capacity = [1] * num_internal + [cutoff] * (graph.ecount() - num_internal)
+    capacity[root_local] = cutoff
+    capacity[target] = cutoff
+    source = 2 * root_local + 1
+    sink = 2 * target
+    cut = graph.mincut(source=source, target=sink, capacity=capacity)
+    flow = int(round(cut.value))
+    if flow < 2 or flow > max_size:
+        return None
+    source_side = set(cut.partition[0] if source in cut.partition[0] else cut.partition[1])
+    separator = tuple(
+        sorted(
+            node for node in range(N)
+            if node not in (root_local, target)
+            and (2 * node) in source_side
+            and (2 * node + 1) not in source_side
+        )
+    )
+    return separator if 2 <= len(separator) <= max_size else None
+
+
+def _bounded_root_vertex_separator_python(
     nb_local: List[List[int]],
     root_local: int,
     target: int,
@@ -539,6 +656,26 @@ def _bounded_root_vertex_separator(
         and 2 * node + 1 not in reachable
     )
     return separator if 2 <= len(separator) <= max_size else None
+
+
+def _bounded_root_vertex_separator(
+    nb_local: List[List[int]],
+    root_local: int,
+    target: int,
+    max_size: int,
+) -> Optional[Tuple[int, ...]]:
+    """Minimum root-target vertex separator when its size is 2..max_size.
+
+    Uses igraph's C-backed `mincut()` on the same vertex-split reduction
+    when available, falling back to the hand-rolled bounded Edmonds-Karp
+    search otherwise. Both report a minimum separator of the same size;
+    when several minimum separators tie in size, the specific vertex set
+    returned can differ between backends (any such set is equally valid/
+    sound as a `x_i <= OR(x_s for s in separator)` clause).
+    """
+    if _ig is not None:
+        return _bounded_root_vertex_separator_igraph(nb_local, root_local, target, max_size)
+    return _bounded_root_vertex_separator_python(nb_local, root_local, target, max_size)
 
 
 def _small_root_separator_implications(
@@ -881,13 +1018,16 @@ def _asu_flow_capacity_hybrid_groups(
 
 _ASU_FULL_SUBSOLVER_PATTERN = (
     "portfolio_max_lp",
+    "portfolio_max_lp",
     "asu_probe_fast",
     "asu_probe_standard",
     "lb_tree_search",
     "quick_restart",
 
     "asu_probe_deep",
+    "asu_probe_mega_deep",
     "quick_restart_no_lp",
+    "default_lp",
     "pseudo_costs",
     "reduced_costs",
     "core_max_lp",
@@ -1030,7 +1170,8 @@ def _configure_asu_probe_variants(
         ("asu_probe_fast",       25_000, 0.05, False),
         ("asu_probe_standard", 50_000, 0.01, False),
         ("asu_probe_deep", 100_000, 0.01, False),
-        ("asu_probe_very_deep", 200_000, 0.01, False)
+        ("asu_probe_very_deep", 200_000, 0.01, False),
+        ("asu_probe_mega_deep", 500_000, 0.01, False),
     ]
 
     tract_first_enabled = tract_first and _supports_tract_first_probing(params)
@@ -3488,9 +3629,11 @@ def solve_one_asu_cpsat(
 
 
 # ---------- Simple improver (local trades) ----------
-def frontier_candidates(S: List[int], nb: List[List[int]], allowed: np.ndarray) -> List[int]:
+def frontier_candidates(S: List[int], nb: List[List[int]], allowed) -> List[int]:
     Sset = set(S)
-    allowed_set = set(int(a) for a in allowed)
+    # Callers on a hot path (e.g. improve_by_trades) pass an already-built set
+    # to skip re-deriving it from `allowed` on every single call.
+    allowed_set = allowed if isinstance(allowed, set) else set(int(a) for a in allowed)
     cand = set()
     for v in S:
         for w in nb[v]:
@@ -3502,6 +3645,8 @@ def frontier_candidates(S: List[int], nb: List[List[int]], allowed: np.ndarray) 
 def improve_by_trades(S0: List[int], u: np.ndarray, E: np.ndarray, P: np.ndarray, nb: List[List[int]],
                       tau: float, pop_thresh: int, allowed: np.ndarray, max_iter: int = 200,
                       max_swap_checks: Optional[int] = None, max_size: Optional[int] = None) -> List[int]:
+    N = len(nb)
+    allowed_set = set(int(a) for a in allowed)
     S = sorted(set(S0))
     selected = set(S)
     sum_u = int(u[S].sum())
@@ -3512,7 +3657,7 @@ def improve_by_trades(S0: List[int], u: np.ndarray, E: np.ndarray, P: np.ndarray
         # Greedy adds: frontier nodes are adjacent to S so S∪{t} is always connected.
         # Skipped entirely once max_size is reached (swaps below keep size constant).
         if max_size is None or len(S) < max_size:
-            for t in sorted(frontier_candidates(S, nb, allowed), key=lambda i: u[i], reverse=True):
+            for t in sorted(frontier_candidates(S, nb, allowed_set), key=lambda i: u[i], reverse=True):
                 next_u = sum_u + int(u[t])
                 next_E = sum_E + int(E[t])
                 next_P = sum_P + int(P[t])
@@ -3528,20 +3673,26 @@ def improve_by_trades(S0: List[int], u: np.ndarray, E: np.ndarray, P: np.ndarray
         # max_swap_checks=0 skips this entirely (used after CP-SAT solve where
         # the solution is already optimal within the window).
         if len(S) > 1 and max_swap_checks != 0:
+            selected_mask = np.zeros(N, dtype=bool)
+            selected_mask[S] = True
+            # S is always connected here, so a non-articulation-point candidate
+            # is guaranteed to leave S2 connected -- this one igraph call replaces
+            # a full connectivity BFS (component_ok) per removal candidate below.
+            articulations = _articulation_points(nb, selected_mask)
             n_checked = 0
             for r in sorted(S, key=lambda i: u[i]):
                 if max_swap_checks is not None and n_checked >= max_swap_checks:
                     break
                 n_checked += 1
+                if r in articulations:
+                    continue
                 reduced_u = sum_u - int(u[r])
                 reduced_E = sum_E - int(E[r])
                 reduced_P = sum_P - int(P[r])
                 if reduced_P < pop_thresh or ur_of(reduced_u, reduced_E) < tau:
                     continue
                 S2 = sorted(selected - {r})
-                if not component_ok(S2, u, E, P, tau, pop_thresh, nb):
-                    continue
-                for a in sorted(frontier_candidates(S2, nb, allowed), key=lambda i: u[i], reverse=True):
+                for a in sorted(frontier_candidates(S2, nb, allowed_set), key=lambda i: u[i], reverse=True):
                     next_u = reduced_u + int(u[a])
                     next_E = reduced_E + int(E[a])
                     next_P = reduced_P + int(P[a])
@@ -5022,8 +5173,18 @@ def repair_connectivity_free_selection(
     forced_selected: Optional[Sequence[int]] = None,
     max_nodes: Optional[int] = None,
     log: bool = False,
+    deadline: Optional[float] = None,
 ) -> List[int]:
-    """Connect valuable relaxed components, then prune and refill to feasibility."""
+    """Connect valuable relaxed components, then prune and refill to feasibility.
+
+    `deadline`, if given, is an absolute `time.monotonic()` cutoff: once passed,
+    the pending-component attachment loop stops starting new attachments, the
+    prune loop gives up rather than keep trimming, and the (expensive) beam-
+    refill/trade-improvement polish step is skipped in favor of returning
+    whatever valid candidate is already in hand -- callers with their own
+    overall time budget (e.g. graph-cut) should pass their own deadline so
+    repair can't run past it.
+    """
     N = len(nb_local)
     forced = {int(i) for i in (forced_selected or [])} | {int(root_local)}
     relaxed = {int(i) for i in relaxed_selected if 0 <= int(i) < N} | forced
@@ -5037,30 +5198,25 @@ def repair_connectivity_free_selection(
         if not log:
             return
         now = time.monotonic()
-        if now - _progress_last[0] < 2.0:
+        if now - _progress_last[0] < 10.0:
             return
         _progress_last[0] = now
         print(f"    [repair] {msg}, elapsed={now - _progress_start:.1f}s", flush=True)
 
     def _component(start: int, allowed: set) -> set:
-        reached = {start}
-        stack = [start]
-        while stack:
-            node = stack.pop()
-            for neighbor in nb_local[node]:
-                if neighbor in allowed and neighbor not in reached:
-                    reached.add(neighbor)
-                    stack.append(neighbor)
-        return reached
+        mask = np.zeros(N, dtype=bool)
+        mask[list(allowed)] = True
+        for comp in _connected_components(nb_local, mask):
+            if start in comp:
+                return set(comp)
+        return {start}
 
     def _components(nodes: set) -> List[set]:
-        remaining = set(nodes)
-        result: List[set] = []
-        while remaining:
-            component = _component(min(remaining), remaining)
-            remaining.difference_update(component)
-            result.append(component)
-        return result
+        if not nodes:
+            return []
+        mask = np.zeros(N, dtype=bool)
+        mask[list(nodes)] = True
+        return [set(comp) for comp in _connected_components(nb_local, mask)]
 
     def _valid(nodes: set) -> bool:
         selected = sorted(nodes)
@@ -5086,6 +5242,8 @@ def repair_connectivity_free_selection(
             too_large = max_nodes is not None and len(candidate) > int(max_nodes)
             if not too_large and slack_sum >= 0:
                 return candidate if pop_sum >= pop_thresh else None
+            if deadline is not None and time.monotonic() >= deadline:
+                return None
 
             _log_progress(
                 f"pruning: candidate size={len(candidate)}, pop={pop_sum}, "
@@ -5138,41 +5296,106 @@ def repair_connectivity_free_selection(
     economic_value = u_g.astype(float) - 2.2 * capacity_cost
     path_cost = np.maximum(0.01, -economic_value)
 
+    # Edge weights (cost of entering the target node) depend only on `relaxed`
+    # and `path_cost`, both fixed for the whole call, so the directed graph is
+    # built ONCE here instead of redoing a full Python Dijkstra on every
+    # pending-component attachment below. Each iteration only needs to refresh
+    # the super-source's outgoing edges (one per node in the current multi-
+    # source frontier) and run a single C-backed multi-target Dijkstra.
+    if _ig is not None:
+        _repair_ss = N
+        _repair_digraph = _ig.Graph(
+            n=N + 1,
+            edges=[(a, b) for a in range(N) for b in nb_local[a]],
+            directed=True,
+        )
+        _repair_digraph.es["weight"] = [
+            0.0 if b in relaxed else float(path_cost[b])
+            for a in range(N) for b in nb_local[a]
+        ]
+
+        def _shortest_paths(current_set: set):
+            old_out = _repair_digraph.incident(_repair_ss, mode="out")
+            if old_out:
+                _repair_digraph.delete_edges(old_out)
+            nodes = list(current_set)
+            _repair_digraph.add_edges([(_repair_ss, node) for node in nodes])
+            if nodes:
+                new_eids = list(range(
+                    _repair_digraph.ecount() - len(nodes), _repair_digraph.ecount()
+                ))
+                _repair_digraph.es[new_eids]["weight"] = [0.0] * len(nodes)
+            dist_row = _repair_digraph.distances(
+                source=[_repair_ss], weights="weight", mode="out"
+            )[0]
+
+            def _paths_batch(endpoints: List[int]) -> List[set]:
+                if not endpoints:
+                    return []
+                vpaths = _repair_digraph.get_shortest_paths(
+                    _repair_ss, to=endpoints, weights="weight", mode="out",
+                    output="vpath",
+                )
+                return [set(vpath) - current_set - {_repair_ss} for vpath in vpaths]
+
+            return dist_row, _paths_batch
+    else:
+        def _shortest_paths(current_set: set):
+            distances = [math.inf] * N
+            previous = [-1] * N
+            queue: List[Tuple[float, int]] = []
+            for node in current_set:
+                distances[node] = 0.0
+                heapq.heappush(queue, (0.0, node))
+
+            while queue:
+                distance, node = heapq.heappop(queue)
+                if distance > distances[node]:
+                    continue
+                for neighbor in nb_local[node]:
+                    step_cost = 0.0 if neighbor in relaxed else float(path_cost[neighbor])
+                    next_distance = distance + step_cost
+                    if next_distance + 1e-12 < distances[neighbor]:
+                        distances[neighbor] = next_distance
+                        previous[neighbor] = node
+                        heapq.heappush(queue, (next_distance, neighbor))
+
+            def _paths_batch(endpoints: List[int]) -> List[set]:
+                result = []
+                for endpoint in endpoints:
+                    path = set()
+                    node = endpoint
+                    while node not in current_set:
+                        path.add(node)
+                        node = previous[node]
+                        if node < 0:
+                            path = set()
+                            break
+                    result.append(path)
+                return result
+
+            return distances, _paths_batch
+
     while pending:
-        distances = [math.inf] * N
-        previous = [-1] * N
-        queue: List[Tuple[float, int]] = []
-        for node in current:
-            distances[node] = 0.0
-            heapq.heappush(queue, (0.0, node))
+        if deadline is not None and time.monotonic() >= deadline:
+            break
+        distances, paths_batch = _shortest_paths(current)
 
-        while queue:
-            distance, node = heapq.heappop(queue)
-            if distance > distances[node]:
-                continue
-            for neighbor in nb_local[node]:
-                step_cost = 0.0 if neighbor in relaxed else float(path_cost[neighbor])
-                next_distance = distance + step_cost
-                if next_distance + 1e-12 < distances[neighbor]:
-                    distances[neighbor] = next_distance
-                    previous[neighbor] = node
-                    heapq.heappush(queue, (next_distance, neighbor))
-
-        choices = []
+        reachable_positions = []
+        endpoints = []
         for position, component in enumerate(pending):
             endpoint = min(component, key=lambda node: (distances[node], node))
             if not math.isfinite(distances[endpoint]):
                 continue
-            path = set()
-            node = endpoint
-            while node not in current:
-                path.add(node)
-                node = previous[node]
-                if node < 0:
-                    path.clear()
-                    break
+            reachable_positions.append(position)
+            endpoints.append(endpoint)
+        paths = paths_batch(endpoints)
+
+        choices = []
+        for position, path in zip(reachable_positions, paths):
             if not path:
                 continue
+            component = pending[position]
             added = (component | path) - current
             connector = path - relaxed
             connector_burden = float(np.maximum(0.0, capacity_cost[list(connector)]).sum()) if connector else 0.0
@@ -5198,14 +5421,15 @@ def repair_connectivity_free_selection(
         current = repaired
         if _valid(current):
             candidate = set(current)
-            if max_nodes is None:
-                candidate = _beam_refill(
-                    candidate, set(), nb_local, u_g, slack, 32, 256
-                )
-            candidate = set(improve_by_trades(
-                sorted(candidate), u_g, E_g, P_g, nb_local, tau, pop_thresh,
-                np.arange(N), max_iter=100, max_size=max_nodes,
-            ))
+            if deadline is None or time.monotonic() < deadline:
+                if max_nodes is None:
+                    candidate = _beam_refill(
+                        candidate, set(), nb_local, u_g, slack, 32, 256
+                    )
+                candidate = set(improve_by_trades(
+                    sorted(candidate), u_g, E_g, P_g, nb_local, tau, pop_thresh,
+                    np.arange(N), max_iter=100, max_size=max_nodes,
+                ))
             if _valid(candidate) and (
                 not best
                 or _selection_key(candidate, u_g, slack) > _selection_key(best, u_g, slack)
@@ -5445,15 +5669,14 @@ def solve_asu_graph_cut_only(
             break
 
         selected = [i for i in range(N) if solver.BooleanValue(x[i])]
-        selected_set = set(selected)
-        root_component = {root_local}
-        stack = [root_local]
-        while stack:
-            v = stack.pop()
-            for w in nb_local[v]:
-                if w in selected_set and w not in root_component:
-                    root_component.add(w)
-                    stack.append(w)
+        selected_mask = np.zeros(N, dtype=bool)
+        selected_mask[selected] = True
+        # One igraph call replaces the old two-pass root-BFS + unseen-BFS: it
+        # partitions the whole selection at once, root's own component included.
+        all_components = _connected_components(nb_local, selected_mask)
+        root_component = next(
+            (set(c) for c in all_components if root_local in c), {root_local}
+        )
 
         if len(root_component) == len(selected):
             best_connected = selected
@@ -5475,8 +5698,6 @@ def solve_asu_graph_cut_only(
             cut_round += 1
             continue
 
-        unseen = selected_set - root_component
-
         # A disconnected result can't be the answer, but its components can
         # often be corridor-connected into a real (if suboptimal) feasible
         # ASU right now -- reuse the same repair used elsewhere, and treat it
@@ -5485,6 +5706,7 @@ def solve_asu_graph_cut_only(
         repaired = repair_connectivity_free_selection(
             selected, repair_fallback, nb_local, u_g, E_g, P_g, tau, pop_thresh, root_local,
             forced_selected=sorted(forced_set), max_nodes=max_nodes, log=log,
+            deadline=start_time + float(time_limit),
         )
         if component_ok(repaired, u_g, E_g, P_g, tau, pop_thresh, nb_local) and (
             max_nodes is None or len(repaired) <= int(max_nodes)
@@ -5502,19 +5724,8 @@ def solve_asu_graph_cut_only(
                     )
                 model.Add(obj_expr >= best_obj + 1)
 
-        components: List[set] = []
-        while unseen:
-            seed = unseen.pop()
-            component = {seed}
-            stack = [seed]
-            while stack:
-                v = stack.pop()
-                for w in nb_local[v]:
-                    if w in unseen:
-                        unseen.remove(w)
-                        component.add(w)
-                        stack.append(w)
-            components.append(component)
+        components: List[set] = [set(c) for c in all_components if root_local not in c]
+        for component in components:
             boundary = sorted({
                 w for v in component for w in nb_local[v]
                 if w not in component
@@ -6293,8 +6504,24 @@ def build_many_asus_cpsat(
                 print(f"\nNo high-UR tracts (UR >= {tau*100:.2f}%) have remaining neighbors. Stopping.", flush=True)
             break
 
-        # Prioritize by UR (descending) then population (descending)
-        order = np.lexsort((-df.loc[cand_seeds, "tract_pop2024"].to_numpy(), -UR[cand_seeds]))
+        # A connected component that already meets tau/pop_thresh on its own is a
+        # ready-made ASU: rooting there means the solver never needs to reach
+        # outside it, so graph-cut's output needs far less repair-stitching.
+        components = _connected_components(nb, remaining)
+        comp_id = np.full(n, -1, dtype=int)
+        comp_qualifies = np.zeros(len(components), dtype=bool)
+        for ci, component in enumerate(components):
+            comp_id[component] = ci
+            comp_qualifies[ci] = can_hit_tau(u[component], E[component], P[component], [], tau, pop_thresh)
+        seed_qualifies = comp_qualifies[comp_id[cand_seeds]]
+
+        # Prioritize seeds whose component already qualifies as a standalone ASU,
+        # then UR (descending), then population (descending).
+        order = np.lexsort((
+            -df.loc[cand_seeds, "tract_pop2024"].to_numpy(),
+            -UR[cand_seeds],
+            -seed_qualifies.astype(np.int8),
+        ))
         seed_pool = cand_seeds[order]
 
         # ---- Select up to batch_size disjoint feasible windows ----
@@ -6347,10 +6574,23 @@ def build_many_asus_cpsat(
                 tried[s] = True
                 continue
 
-            top = cand[np.argmax(u_g[cand] / np.maximum(u_g[cand] + E_g[cand], 1e-12))]
+            # If s's own component already qualifies as a standalone ASU, keep the
+            # root inside it rather than letting a higher-UR tract elsewhere in the
+            # (much larger, under full_graph_window) window win the argmax below.
+            cand_root = cand
+            if comp_qualifies[comp_id[s]]:
+                same_comp_local = np.fromiter(
+                    (local_index[g] for g in components[comp_id[s]] if g in local_index), dtype=int,
+                )
+                restricted = np.intersect1d(cand, same_comp_local)
+                if restricted.size > 0:
+                    cand_root = restricted
+
+            top = cand_root[np.argmax(u_g[cand_root] / np.maximum(u_g[cand_root] + E_g[cand_root], 1e-12))]
             tie = np.where(
                 (u_g / np.maximum(u_g + E_g, 1e-12)) == (u_g[top] / max(u_g[top] + E_g[top], 1e-12))
             )[0]
+            tie = np.intersect1d(tie, cand_root)
             root_local = int(tie[np.argmax(P_g[tie])]) if len(tie) > 1 else int(top)
 
             if "geoid" in df.columns:
