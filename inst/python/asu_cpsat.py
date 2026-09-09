@@ -114,16 +114,28 @@ def _partition_standalone_expansion_territories(
     standalone_units: Sequence[Sequence[int]],
     nb: List[List[int]],
     allowed: np.ndarray,
+    u: Optional[np.ndarray] = None,
 ) -> List[List[int]]:
-    """Assign reachable allowed tracts to the nearest standalone ASU seed."""
+    """Assign reachable allowed tracts to the nearest standalone ASU seed.
+
+    Ties (equal graph distance to two or more seeds) go to the unit with the
+    least unemployment already captured in its own seed, so a tract on the
+    boundary between two standalone ASUs helps grow the weaker one first;
+    `unit_index` is only the final, fully-deterministic tiebreaker.
+    """
     n = len(nb)
     allowed_mask = np.asarray(allowed, dtype=bool)
     if allowed_mask.size != n:
         raise ValueError("allowed mask must match the adjacency size")
 
+    if u is None:
+        unit_priority = [0] * len(standalone_units)
+    else:
+        unit_priority = [int(u[np.array(nodes, dtype=int)].sum()) for nodes in standalone_units]
+
     owner = np.full(n, -1, dtype=int)
     distance = np.full(n, np.iinfo(np.int32).max, dtype=np.int64)
-    queue: List[Tuple[int, int, int]] = []
+    queue: List[Tuple[int, int, int, int]] = []
     for unit_index, nodes in enumerate(standalone_units):
         for raw_node in nodes:
             node = int(raw_node)
@@ -133,23 +145,29 @@ def _partition_standalone_expansion_territories(
                 raise ValueError("standalone ASU seeds must be disjoint")
             owner[node] = unit_index
             distance[node] = 0
-            heapq.heappush(queue, (0, unit_index, node))
+            heapq.heappush(queue, (0, unit_priority[unit_index], unit_index, node))
 
     while queue:
-        node_distance, unit_index, node = heapq.heappop(queue)
+        node_distance, _, unit_index, node = heapq.heappop(queue)
         if distance[node] != node_distance or owner[node] != unit_index:
             continue
         for neighbor in nb[node]:
             if not allowed_mask[neighbor]:
                 continue
-            candidate = (node_distance + 1, unit_index)
-            current = (int(distance[neighbor]), int(owner[neighbor]))
+            candidate = (node_distance + 1, unit_priority[unit_index], unit_index)
+            current_owner = int(owner[neighbor])
+            current = (
+                int(distance[neighbor]),
+                unit_priority[current_owner] if current_owner >= 0 else 0,
+                current_owner,
+            )
             if candidate >= current:
                 continue
             distance[neighbor] = node_distance + 1
             owner[neighbor] = unit_index
             heapq.heappush(
-                queue, (node_distance + 1, unit_index, int(neighbor))
+                queue,
+                (node_distance + 1, unit_priority[unit_index], unit_index, int(neighbor)),
             )
 
     return [
@@ -6007,11 +6025,25 @@ def _prepare_window_hint(
                 # Separate experiment: re-optimize via lazy vertex-separator
                 # cuts alone (no flow phase), seeded from this same relaxation.
                 # Independent of repair_connectivity_free_selection above --
-                # does not consume or alter its output. Always runs when
-                # requested, even if harvest_connectivity_free_asus carved off
-                # other independently-feasible components in this same window.
+                # does not consume or alter its output.
                 best_graph_cut: Optional[List[int]] = None
-                if use_graph_cut_repair:
+                # Once harvest has already carved off independently-feasible
+                # standalone ASUs from this relaxation, each one is expanded
+                # within its own disjoint territory (via solve_one_asu_cpsat's
+                # own cut-pass) instead -- a whole-graph graph-cut-only solve
+                # here would just be discarded, since this window's own main
+                # solve is skipped once standalone units are harvested.
+                run_graph_cut_repair = use_graph_cut_repair and not (
+                    harvest_connectivity_free_asus and connectivity_free_standalone_asus
+                )
+                if use_graph_cut_repair and not run_graph_cut_repair and verbose:
+                    print(
+                        "  [heuristic] graph-cut-only solve skipped: "
+                        f"{len(connectivity_free_standalone_asus)} standalone ASU(s) "
+                        "already harvested",
+                        flush=True,
+                    )
+                if run_graph_cut_repair:
                     graph_cut_hint = (
                         best_repaired if best_repaired is not None
                         else (best["hint_improved"] if best["hint_valid"] else None)
@@ -6696,7 +6728,7 @@ def build_many_asus_cpsat(
                 round_seeds = active_units
                 territory_sources = round_seeds + protected_units
                 all_territories = _partition_standalone_expansion_territories(
-                    territory_sources, nb, remaining
+                    territory_sources, nb, remaining, u=u
                 )
                 territories = all_territories[:len(round_seeds)]
                 expansion_parallelism = min(
