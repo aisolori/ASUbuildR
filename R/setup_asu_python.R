@@ -6,8 +6,8 @@
 #' channel for the Python interpreter itself (avoiding channels that require
 #' Terms of Service acceptance), and installs the required Python packages
 #' (\code{numpy}, \code{pandas}, \code{networkx}, \code{ortools},
-#' \code{openpyxl}) via pip inside that environment. OR-Tools is not
-#' distributed on conda-forge, so
+#' \code{openpyxl}, \code{python-igraph}) via pip inside that environment.
+#' OR-Tools is not distributed on conda-forge, so
 #' pip is used for the packages rather than \code{conda install}.
 #'
 #' @param force Logical. If TRUE, recreates the conda environment even if it exists.
@@ -162,7 +162,8 @@ setup_asu_python <- function(force = FALSE) {
     pandas = "pandas",
     networkx = "networkx",
     ortools = "ortools.sat.python.cp_model",
-    openpyxl = "openpyxl"
+    openpyxl = "openpyxl",
+    `python-igraph` = "igraph"
   )
   required_imports_py <- paste0(
     "{",
@@ -254,7 +255,8 @@ check_asu_python <- function() {
     pandas = "pandas",
     networkx = "networkx",
     ortools = "ortools.sat.python.cp_model",
-    openpyxl = "openpyxl"
+    openpyxl = "openpyxl",
+    `python-igraph` = "igraph"
   )
   available <- vapply(
     unname(required), reticulate::py_module_available, logical(1)

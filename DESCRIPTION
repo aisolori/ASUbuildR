@@ -41,7 +41,7 @@ Imports:
     processx,
     rappdirs
 LinkingTo: Rcpp
-SystemRequirements: C++11; Pandoc (>= 1.12.3); Python (>= 3.9) with packages: ortools, numpy, pandas, networkx, openpyxl
+SystemRequirements: C++11; Pandoc (>= 1.12.3); Python (>= 3.9) with packages: ortools, numpy, pandas, networkx, openpyxl, python-igraph
 Suggests:
   freestiler,
   knitr,
@@ -52,5 +52,6 @@ Config/reticulate: list(packages = list(
     list(package = "numpy"),
     list(package = "pandas"),
     list(package = "networkx"),
-    list(package = "openpyxl")
+    list(package = "openpyxl"),
+    list(package = "python-igraph")
   ))

@@ -19,8 +19,8 @@ necessary), creates a conda environment using only the \emph{conda-forge}
 channel for the Python interpreter itself (avoiding channels that require
 Terms of Service acceptance), and installs the required Python packages
 (\code{numpy}, \code{pandas}, \code{networkx}, \code{ortools},
-\code{openpyxl}) via pip inside that environment. OR-Tools is not
-distributed on conda-forge, so
+\code{openpyxl}, \code{python-igraph}) via pip inside that environment.
+OR-Tools is not distributed on conda-forge, so
 pip is used for the packages rather than \code{conda install}.
 }
 \examples{

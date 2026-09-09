@@ -55,6 +55,12 @@ except Exception:
     Queen = None
     shapely_make_valid = None
 
+# Optional (C-backed graph algorithms; falls back to pure-Python if absent)
+try:
+    import igraph as _ig
+except Exception:
+    _ig = None
+
 
 # ---------- Helpers ----------
 def as_fraction_tau(tau: float) -> Tuple[int, int]:
@@ -313,7 +319,37 @@ def greedy_snake_hint(
     return sorted(groups[root_gid])
 
 
-def _articulation_points(nb_local: List[List[int]], selected: np.ndarray) -> set:
+_igraph_cache = threading.local()
+
+
+def _get_igraph_graph(nb_local: List[List[int]]):
+    """Build (or reuse) a cached igraph.Graph mirroring `nb_local`.
+
+    Cached per-thread and keyed by object identity (not content) so concurrent
+    ASU solves (parallel_asus > 1) never share a cache entry, and holding a
+    strong reference to `nb_local` guarantees `id()` can't be reused for a
+    different adjacency list while the cache entry is alive.
+    """
+    cached = getattr(_igraph_cache, "entry", None)
+    if cached is not None and cached[0] is nb_local:
+        return cached[1]
+    edges = [
+        (i, w) for i, neighbors in enumerate(nb_local) for w in neighbors if w > i
+    ]
+    graph = _ig.Graph(n=len(nb_local), edges=edges)
+    _igraph_cache.entry = (nb_local, graph)
+    return graph
+
+
+def _articulation_points_igraph(nb_local: List[List[int]], selected: np.ndarray) -> set:
+    node_ids = np.flatnonzero(selected)
+    if node_ids.size < 2:
+        return set()
+    sub = _get_igraph_graph(nb_local).induced_subgraph(node_ids.tolist())
+    return {int(node_ids[i]) for i in sub.articulation_points()}
+
+
+def _articulation_points_python(nb_local: List[List[int]], selected: np.ndarray) -> set:
     """
     Iterative Tarjan articulation-point finder restricted to the induced subgraph
     on `selected` nodes. A cut vertex's removal disconnects the remainder of its
@@ -367,6 +403,20 @@ def _articulation_points(nb_local: List[List[int]], selected: np.ndarray) -> set
         if root_children[start] > 1:
             is_art.add(start)
     return is_art
+
+
+def _articulation_points(nb_local: List[List[int]], selected: np.ndarray) -> set:
+    """Cut vertices of the induced subgraph on `selected` nodes.
+
+    Uses igraph's C-backed implementation when available (much faster on
+    large graphs, since this is called repeatedly per-node-removal in several
+    hot repair/pruning loops); falls back to the pure-Python iterative Tarjan
+    finder otherwise. Both return identical results (cross-checked against
+    500 randomized graphs).
+    """
+    if _ig is not None:
+        return _articulation_points_igraph(nb_local, selected)
+    return _articulation_points_python(nb_local, selected)
 
 
 def _root_articulation_implications(
@@ -714,14 +764,130 @@ def _asu_flow_branch_order(
     return sorted(range(len(edges)), key=edge_priority, reverse=True)
 
 
+def _root_graph_distances(
+    nb_local: List[List[int]],
+    root_local: int,
+) -> List[int]:
+    """Shortest-path distances from root on the local graph."""
+    n = len(nb_local)
+    distances = [n] * n
+    if not (0 <= int(root_local) < n):
+        return distances
+
+    distances[int(root_local)] = 0
+    queue = [int(root_local)]
+    head = 0
+    while head < len(queue):
+        node = queue[head]
+        head += 1
+        next_distance = distances[node] + 1
+        for neighbor in nb_local[node]:
+            if distances[neighbor] <= next_distance:
+                continue
+            distances[neighbor] = next_distance
+            queue.append(int(neighbor))
+    return distances
+
+
+def _asu_tract_capacity_orders(
+    u_g: np.ndarray,
+    E_g: np.ndarray,
+    num: int,
+    den: int,
+) -> Tuple[List[int], List[int]]:
+    """Order tracts by exact UR-surplus sign and magnitude."""
+    q_surplus = den * u_g.astype(np.int64) - num * E_g.astype(np.int64)
+
+    select_order = sorted(
+        (int(i) for i in range(len(q_surplus)) if q_surplus[i] >= 0),
+        key=lambda i: (
+            int(q_surplus[i]),
+            int(u_g[i]),
+            -i,
+        ),
+        reverse=True,
+    )
+    reject_order = sorted(
+        (int(i) for i in range(len(q_surplus)) if q_surplus[i] < 0),
+        key=lambda i: (
+            int(q_surplus[i]),
+            int(u_g[i]),
+            i,
+        ),
+    )
+    return select_order, reject_order
+
+
+_ASU_HYBRID_PREFIX_SIZE = 256
+
+
+def _asu_flow_capacity_hybrid_groups(
+    edges: Sequence[Tuple[int, int]],
+    u_g: np.ndarray,
+    E_g: np.ndarray,
+    num: int,
+    den: int,
+    root_distances: Sequence[int],
+    max_prefix: int = _ASU_HYBRID_PREFIX_SIZE,
+) -> Tuple[List[int], List[int], List[int], List[Tuple[str, int]]]:
+    """Build hybrid branching groups: flow prefix, capacity prefix, far tail."""
+    max_prefix = max(0, int(max_prefix))
+    flow_order = _asu_flow_branch_order(edges, u_g, E_g)
+    flow_prefix = flow_order[:max_prefix]
+
+    select_order, reject_order = _asu_tract_capacity_orders(u_g, E_g, num, den)
+    select_budget = (max_prefix + 1) // 2
+    reject_budget = max_prefix // 2
+    select_prefix = select_order[:select_budget]
+    reject_prefix = reject_order[:reject_budget]
+
+    used_flows = set(flow_prefix)
+    used_tracts = set(select_prefix) | set(reject_prefix)
+
+    far_items: List[Tuple[str, int, int]] = []
+    for tract_index in range(len(u_g)):
+        if tract_index in used_tracts:
+            continue
+        distance = (
+            int(root_distances[tract_index])
+            if tract_index < len(root_distances)
+            else len(root_distances)
+        )
+        far_items.append(("tract", int(tract_index), distance))
+
+    for edge_index, (left, right) in enumerate(edges):
+        if edge_index in used_flows:
+            continue
+        left_distance = (
+            int(root_distances[left]) if left < len(root_distances)
+            else len(root_distances)
+        )
+        right_distance = (
+            int(root_distances[right]) if right < len(root_distances)
+            else len(root_distances)
+        )
+        far_items.append(("flow", int(edge_index), max(left_distance, right_distance)))
+
+    far_items.sort(
+        key=lambda item: (
+            -item[2],
+            0 if item[0] == "tract" else 1,
+            -item[1],
+        )
+    )
+    far_order = [(kind, index) for kind, index, _ in far_items]
+    return flow_prefix, select_prefix, reject_prefix, far_order
+
+
 _ASU_FULL_SUBSOLVER_PATTERN = (
     "portfolio_max_lp",
     "asu_probe_fast",
     "asu_probe_standard",
     "lb_tree_search",
     "quick_restart",
-    "quick_restart_no_lp",
 
+    "asu_probe_deep",
+    "quick_restart_no_lp",
     "pseudo_costs",
     "reduced_costs",
     "core_max_lp",
@@ -730,6 +896,7 @@ _ASU_FULL_SUBSOLVER_PATTERN = (
     "core",
     "asu_probe_very_deep",
     "variables_shaving",
+    "variables_shaving_no_lp",
     "variables_shaving_max_lp",
 
 )
@@ -737,6 +904,8 @@ def _asu_full_subsolvers(
     workers: int,
     use_tract_first_search: bool = False,
     use_flow_first_search: bool = False,
+    use_tract_capacity_search: bool = False,
+    use_flow_capacity_hybrid_search: bool = False,
     use_tract_first_probing: bool = False,
 ) -> List[str]:
     """Return the bounded full-problem portfolio for one ASU solve."""
@@ -746,9 +915,26 @@ def _asu_full_subsolvers(
 
     full_budget = max(6, min(16, round(workers *.3)))
     full_subsolvers: List[str] = list(_ASU_FULL_SUBSOLVER_PATTERN[:full_budget])
-    if use_tract_first_search and use_flow_first_search:
-        raise ValueError("tract-first and flow-first search are mutually exclusive")
-    if use_tract_first_search or use_flow_first_search:
+    custom_modes = [
+        bool(use_tract_first_search),
+        bool(use_flow_first_search),
+        bool(use_tract_capacity_search),
+        bool(use_flow_capacity_hybrid_search),
+    ]
+    if sum(custom_modes) > 1:
+        raise ValueError("custom fixed-search workers are mutually exclusive")
+
+    custom_worker_name = None
+    if use_tract_first_search:
+        custom_worker_name = "asu_tract_first"
+    elif use_flow_first_search:
+        custom_worker_name = "asu_flow_first"
+    elif use_tract_capacity_search:
+        custom_worker_name = "asu_tract_capacity"
+    elif use_flow_capacity_hybrid_search:
+        custom_worker_name = "asu_flow_capacity_hybrid"
+
+    if custom_worker_name is not None:
         # Preserve reduced-cost and pseudo-cost search. At large budgets, use
         # one of the duplicate max-LP slots for the custom worker instead.
         max_lp_indices = [
@@ -762,9 +948,7 @@ def _asu_full_subsolvers(
             if "portfolio_max_lp" in full_subsolvers
             else len(full_subsolvers) - 1
         )
-        full_subsolvers[replace_index] = (
-            "asu_tract_first" if use_tract_first_search else "asu_flow_first"
-        )
+        full_subsolvers[replace_index] = custom_worker_name
     if use_tract_first_probing:
         for source, replacement in (
             ("asu_probe_fast", "asu_probe_fast_tract_first"),
@@ -1435,6 +1619,9 @@ def solve_one_asu_cpsat(
     ] = None,
     initial_components: Optional[Sequence[Sequence[int]]] = None,
     use_flow_first_search: bool = False,
+    use_tract_capacity_search: bool = False,
+    use_flow_capacity_hybrid_search: bool = False,
+    incumbent_stall_seconds: Optional[float] = None,
 ) -> Optional[CpsatResult]:
     """
         Connectivity via iterative vertex-separator cuts. Each disconnected incumbent
@@ -1463,14 +1650,30 @@ def solve_one_asu_cpsat(
     the file is consumed (deleted) once detected, so only this ASU's search is
     cut short -- callers such as `build_many_asus_cpsat` keep building further
     ASU windows afterward instead of halting entirely.
+
+    `incumbent_stall_seconds`, when given, finishes the solve early (keeping
+    the current incumbent, just like `stop_flag_path`) once that many seconds
+    pass with no incumbent improvement. Unlike the separate (currently
+    disabled) stall-then-restart/probe mechanism below -- found to lose
+    learned clauses and hurt performance when it rebuilds the solver --
+    this only ever stops the search; it never restarts it. `None` (default)
+    disables this early-finish check entirely.
     """
     N = len(nb_local)
     if N == 0:
         return None
-    if use_tract_first_search and use_flow_first_search:
-        raise ValueError("tract-first and flow-first search are mutually exclusive")
+    custom_modes = [
+        bool(use_tract_first_search),
+        bool(use_flow_first_search),
+        bool(use_tract_capacity_search),
+        bool(use_flow_capacity_hybrid_search),
+    ]
+    if sum(custom_modes) > 1:
+        raise ValueError("custom fixed-search workers are mutually exclusive")
     if use_flow_first_search and use_arborescence:
         raise ValueError("flow-first search requires an integer flow formulation")
+    if use_flow_capacity_hybrid_search and use_arborescence:
+        raise ValueError("flow-capacity hybrid search requires an integer flow formulation")
 
     if hint is not None:
         hint = sorted({int(node) for node in hint})
@@ -1509,6 +1712,25 @@ def solve_one_asu_cpsat(
         configure_subsolvers
         and use_flow_first_search
         and max(1, int(workers)) >= 6
+    )
+    tract_capacity_enabled = (
+        configure_subsolvers
+        and use_tract_capacity_search
+        and max(1, int(workers)) >= 6
+    )
+    flow_capacity_hybrid_enabled = (
+        configure_subsolvers
+        and use_flow_capacity_hybrid_search
+        and max(1, int(workers)) >= 6
+    )
+    custom_fixed_search_enabled = (
+        tract_first_enabled
+        or flow_first_enabled
+        or tract_capacity_enabled
+        or flow_capacity_hybrid_enabled
+    )
+    flow_magnitude_branching_enabled = (
+        flow_first_enabled or flow_capacity_hybrid_enabled
     )
     if hint is not None:
         hint = sorted({int(node_map_c[v]) for v in hint})
@@ -1840,7 +2062,11 @@ def solve_one_asu_cpsat(
                     f"(best so far={best_obj}), elapsed={time.monotonic() - start_time:.1f}s",
                     flush=True,
                 )
-            if status == cp_model.OPTIMAL and not deterministic_ties:
+            if (
+                status == cp_model.OPTIMAL
+                and not deterministic_ties
+                and not custom_fixed_search_enabled
+            ):
                 return _to_orig(selected, "OPTIMAL")
             break
 
@@ -1893,7 +2119,7 @@ def solve_one_asu_cpsat(
                 for v in component:
                     model.Add(x[v] == 0)
         cut_round += 1
-        if stall_rounds >= 5:
+        if stall_rounds >= 3:
             break
 
     # The cut-pass phase was deliberately left unfloored to explore smaller
@@ -2154,7 +2380,7 @@ def solve_one_asu_cpsat(
                         distance_tightened += 1
                 flow_var = model.NewIntVar(lo, hi, f"f_{i}_{j}")
                 f.append(flow_var)
-                if flow_first_enabled:
+                if flow_magnitude_branching_enabled:
                     magnitude = model.NewIntVar(
                         0, max(abs(lo), abs(hi)), f"abs_f_{i}_{j}"
                     )
@@ -2175,7 +2401,7 @@ def solve_one_asu_cpsat(
                     flow_hints.get((i, j), 0) - flow_hints.get((j, i), 0)
                 )
                 model.AddHint(f[edge_index], hinted_flow)
-                if flow_first_enabled:
+                if flow_magnitude_branching_enabled:
                     model.AddHint(abs_flow[edge_index], abs(hinted_flow))
             for i in range(N):
                 net_outflow = sum(net_out_for[i]) if net_out_for[i] else 0
@@ -2196,7 +2422,7 @@ def solve_one_asu_cpsat(
                     distance_tightened += 1
                 directed_bounds.append(bound_value)
             f = [model.NewIntVar(0, directed_bounds[idx], f"f_{i}_{j}") for idx, (i, j) in enumerate(edges)]
-            if flow_first_enabled:
+            if flow_magnitude_branching_enabled:
                 abs_flow = f
             in_edges_for = [[] for _ in range(N)]
             out_edges_for = [[] for _ in range(N)]
@@ -2249,8 +2475,6 @@ def solve_one_asu_cpsat(
         _lc = prev_num_components if prev_num_components is not None else "?"
         print(f"  cut phase: {cut_round} round(s), components {_fc}->{_lc}, "
               f"{time_limit - remaining_time:.1f}s used; {remaining_time:.1f}s for flow phase", flush=True)
-    if remaining_time <= 0:
-        return _to_orig(best_connected, "FEASIBLE") if best_connected else None
 
     def _seed_solution_hints(target_model: cp_model.CpModel, selection: Sequence[int]) -> None:
         """Refresh variable hints from a connected incumbent selection."""
@@ -2268,7 +2492,7 @@ def solve_one_asu_cpsat(
                         sf.get((edge_u, edge_v), 0) - sf.get((edge_v, edge_u), 0)
                     )
                     target_model.AddHint(f[edge_index], flow_value)
-                    if flow_first_enabled:
+                    if flow_magnitude_branching_enabled:
                         target_model.AddHint(abs_flow[edge_index], abs(flow_value))
             else:
                 for edge_index, (edge_u, edge_v) in enumerate(edges):
@@ -2389,11 +2613,57 @@ def solve_one_asu_cpsat(
                       f"testing {best_obj + 1}", flush=True)
 
     if status != cp_model.OPTIMAL:
-        remaining_time = float(time_limit) - (time.monotonic() - start_time)
-        if remaining_time <= 0.01:
-            return _to_orig(best_connected, "FEASIBLE") if best_connected else None
+        if flow_capacity_hybrid_enabled:
+            root_distances = _root_graph_distances(nb_local, root_local)
+            flow_prefix, select_prefix, reject_prefix, far_order = (
+                _asu_flow_capacity_hybrid_groups(
+                    edges,
+                    u_g,
+                    E_g,
+                    num=num,
+                    den=den,
+                    root_distances=root_distances,
+                    max_prefix=_ASU_HYBRID_PREFIX_SIZE,
+                )
+            )
 
-        if flow_first_enabled:
+            if flow_prefix:
+                model.add_decision_strategy(
+                    [abs_flow[edge_index] for edge_index in flow_prefix],
+                    cp_model.CHOOSE_MAX_DOMAIN_SIZE,
+                    cp_model.SELECT_MIN_VALUE,
+                )
+            if select_prefix:
+                model.add_decision_strategy(
+                    [x[i] for i in select_prefix],
+                    cp_model.CHOOSE_FIRST,
+                    cp_model.SELECT_MAX_VALUE,
+                )
+            if reject_prefix:
+                model.add_decision_strategy(
+                    [x[i] for i in reject_prefix],
+                    cp_model.CHOOSE_FIRST,
+                    cp_model.SELECT_MIN_VALUE,
+                )
+
+            far_tail_vars = [
+                x[index] if kind == "tract" else abs_flow[index]
+                for kind, index in far_order
+            ]
+            if far_tail_vars:
+                model.add_decision_strategy(
+                    far_tail_vars,
+                    cp_model.CHOOSE_FIRST,
+                    cp_model.SELECT_MIN_VALUE,
+                )
+            if log:
+                print(
+                    f"  hybrid worker: flow prefix {len(flow_prefix)}, "
+                    f"capacity select/reject {len(select_prefix)}/{len(reject_prefix)}, "
+                    f"distance tail {len(far_order)}",
+                    flush=True,
+                )
+        elif flow_first_enabled:
             flow_branch_order = _asu_flow_branch_order(edges, u_g, E_g)
             if flow_branch_order:
                 model.AddDecisionStrategy(
@@ -2409,7 +2679,33 @@ def solve_one_asu_cpsat(
                     flush=True,
                 )
 
-        if tract_first_enabled:
+        if tract_capacity_enabled:
+            select_order, reject_order = _asu_tract_capacity_orders(
+                u_g,
+                E_g,
+                num=num,
+                den=den,
+            )
+            if select_order:
+                model.add_decision_strategy(
+                    [x[i] for i in select_order],
+                    cp_model.CHOOSE_FIRST,
+                    cp_model.SELECT_MAX_VALUE,
+                )
+            if reject_order:
+                model.add_decision_strategy(
+                    [x[i] for i in reject_order],
+                    cp_model.CHOOSE_FIRST,
+                    cp_model.SELECT_MIN_VALUE,
+                )
+            if log:
+                print(
+                    f"  tract-capacity worker: select {len(select_order)} "
+                    f"nonnegative-q tracts, then reject {len(reject_order)} "
+                    "negative-q tracts",
+                    flush=True,
+                )
+        elif tract_first_enabled:
             branch_order, _ = _asu_branch_order(
                 nb_local=nb_local,
                 u_g=u_g,
@@ -2461,6 +2757,10 @@ def solve_one_asu_cpsat(
                     flush=True,
                 )
 
+        remaining_time = float(time_limit) - (time.monotonic() - start_time)
+        if remaining_time <= 0.01:
+            return _to_orig(best_connected, "FEASIBLE") if best_connected else None
+
         tract_first_probing_enabled = (
             tract_first_enabled
             and _supports_tract_first_probing(cp_model.CpSolver().parameters)
@@ -2502,10 +2802,29 @@ def solve_one_asu_cpsat(
                     max_cut_rounds_at_level_zero=4,
                 )
 
+            if flow_capacity_hybrid_enabled:
+                _append_asu_subsolver_params(
+                    params,
+                    "asu_flow_capacity_hybrid",
+                    search_branching=cp_model.PARTIAL_FIXED_SEARCH,
+                    linearization_level=2,
+                    root_lp_iterations=25_000,
+                    add_lp_constraints_lazily=False,
+                    max_cut_rounds_at_level_zero=4,
+                )
+
             if tract_first_enabled:
                 _append_asu_subsolver_params(
                     params,
                     "asu_tract_first",
+                    search_branching=cp_model.PARTIAL_FIXED_SEARCH,
+                    linearization_level=2,
+                )
+
+            if tract_capacity_enabled:
+                _append_asu_subsolver_params(
+                    params,
+                    "asu_tract_capacity",
                     search_branching=cp_model.PARTIAL_FIXED_SEARCH,
                     linearization_level=2,
                 )
@@ -2565,6 +2884,8 @@ def solve_one_asu_cpsat(
                 workers,
                 use_tract_first_search=tract_first_enabled,
                 use_flow_first_search=flow_first_enabled,
+                use_tract_capacity_search=tract_capacity_enabled,
+                use_flow_capacity_hybrid_search=flow_capacity_hybrid_enabled,
                 use_tract_first_probing=tract_first_probing_enabled,
             )
 
@@ -2587,7 +2908,7 @@ def solve_one_asu_cpsat(
                     "graph_arc_lns",
                     "graph_var_lns",
                     "graph_cst_lns",
-                    # "graph_dec_lns", not currently used proven weak with signed flow
+                    "graph_dec_lns", #testing might remove
 
                     # Diversification / basin escape
                     "rnd_var_lns",
@@ -2653,11 +2974,21 @@ def solve_one_asu_cpsat(
                 "  asu_probe_standard root_lp_iterations=100000",
                 flush=True,
             )
-        # stall_window_seconds has been disabled on purpose
-        # Currently every time the solver restarts, we end up losing progress
-        # We lose clauses, learned constraints, and any other progress made in the previous window.
-        # We were testing the effect of the stall window, but right now it seems to cause more harm than good.
-        stall_window_seconds = 30000.0  # Time window to detect solver stalling in seconds.
+        # The stall-then-restart/probe path below has been disabled on
+        # purpose: every time the solver restarts, we end up losing progress
+        # -- clauses, learned constraints, and any other progress made in the
+        # previous window. We were testing the effect of the stall window,
+        # but right now it seems to cause more harm than good.
+        #
+        # `incumbent_stall_seconds`, when set, is a separate, much simpler
+        # early-finish check: it reuses the same watchdog/timer machinery to
+        # detect the same stall condition, but on trigger it just keeps the
+        # current incumbent and stops (like `stop_flag_path`) instead of
+        # restarting the solver, so it can't hit the clause-loss problem above.
+        finish_on_stall = incumbent_stall_seconds is not None
+        stall_window_seconds = (
+            float(incumbent_stall_seconds) if finish_on_stall else 30000.0
+        )
         proof_feasibility_cap_seconds = 600.0
         proof_mid_gap_trigger = 5
         max_stall_restart_no_progress = 2  # consecutive no-progress cycles before giving up
@@ -2893,6 +3224,20 @@ def solve_one_asu_cpsat(
             if not stalled.is_set():
                 break
             if best_connected is None or best_obj < 0:
+                break
+
+            if finish_on_stall:
+                status = cp_model.FEASIBLE
+                status_name = "STALLED_FEASIBLE"
+                selected = list(best_connected)
+                objective = best_obj
+                if log:
+                    print(
+                        f"  stall watchdog: no incumbent movement for "
+                        f"{stall_window_seconds:.0f}s; finishing early with "
+                        f"current incumbent {best_obj}.",
+                        flush=True,
+                    )
                 break
 
             proof_remaining = float(time_limit) - (time.monotonic() - start_time)
@@ -4676,6 +5021,7 @@ def repair_connectivity_free_selection(
     *,
     forced_selected: Optional[Sequence[int]] = None,
     max_nodes: Optional[int] = None,
+    log: bool = False,
 ) -> List[int]:
     """Connect valuable relaxed components, then prune and refill to feasibility."""
     N = len(nb_local)
@@ -4683,6 +5029,18 @@ def repair_connectivity_free_selection(
     relaxed = {int(i) for i in relaxed_selected if 0 <= int(i) < N} | forced
     num, den = as_fraction_tau(tau)
     slack = den * u_g.astype(np.int64) - num * E_g.astype(np.int64)
+
+    _progress_start = time.monotonic()
+    _progress_last = [0.0]
+
+    def _log_progress(msg: str) -> None:
+        if not log:
+            return
+        now = time.monotonic()
+        if now - _progress_last[0] < 2.0:
+            return
+        _progress_last[0] = now
+        print(f"    [repair] {msg}, elapsed={now - _progress_start:.1f}s", flush=True)
 
     def _component(start: int, allowed: set) -> set:
         reached = {start}
@@ -4716,16 +5074,23 @@ def repair_connectivity_free_selection(
 
     def _prune(nodes: set) -> Optional[set]:
         candidate = set(nodes)
+        # pop_sum/slack_sum/selected_mask are maintained incrementally below
+        # instead of being resummed/rebuilt from scratch every iteration --
+        # the O(N+E) articulation-point recompute is unavoidable per removal,
+        # but there is no need to also redo O(N log N + N) bookkeeping around it.
+        selected_mask = np.zeros(N, dtype=bool)
+        selected_mask[sorted(candidate)] = True
+        pop_sum = int(P_g[sorted(candidate)].sum())
+        slack_sum = int(slack[sorted(candidate)].sum())
         while True:
-            selected = sorted(candidate)
-            pop_sum = int(P_g[selected].sum())
-            slack_sum = int(slack[selected].sum())
             too_large = max_nodes is not None and len(candidate) > int(max_nodes)
             if not too_large and slack_sum >= 0:
                 return candidate if pop_sum >= pop_thresh else None
 
-            selected_mask = np.zeros(N, dtype=bool)
-            selected_mask[selected] = True
+            _log_progress(
+                f"pruning: candidate size={len(candidate)}, pop={pop_sum}, "
+                f"slack={slack_sum}"
+            )
             articulations = _articulation_points(nb_local, selected_mask)
             removable = [
                 i for i in candidate - forced - articulations
@@ -4756,6 +5121,9 @@ def repair_connectivity_free_selection(
                     ),
                 )
             candidate.remove(dropped)
+            selected_mask[dropped] = False
+            pop_sum -= int(P_g[dropped])
+            slack_sum -= int(slack[dropped])
 
     fallback_set = {int(i) for i in fallback}
     best = fallback_set if _valid(fallback_set) else set()
@@ -4817,6 +5185,10 @@ def repair_connectivity_free_selection(
         component = pending.pop(position)
         current.update(component)
         current.update(path)
+        _log_progress(
+            f"attached component ({len(component)} node(s) via {len(path)}-node "
+            f"path), pending={len(pending)}, current size={len(current)}"
+        )
 
         if int(P_g[sorted(current)].sum()) < pop_thresh:
             continue
@@ -4862,20 +5234,25 @@ def solve_asu_graph_cut_only(
         Sequence[Tuple[Sequence[int], Sequence[int]]]
     ] = None,
     initial_components: Optional[Sequence[Sequence[int]]] = None,
+    stall_rounds: Optional[int] = 5,
 ) -> Optional["CpsatResult"]:
     """
     Standalone ASU solver that enforces connectivity purely through iterative
     lazy vertex-separator cuts -- no exact flow-based connectivity phase at
     all. Unlike the cut pre-pass inside `solve_one_asu_cpsat`, there is no
-    round cap and no stall-based early exit: each round either adds boundary
-    cuts for whatever components are disconnected from the root, or (once a
-    connected candidate is found) tightens the objective floor to strictly
-    require a better one next round. The loop only stops when the model goes
-    INFEASIBLE (the current incumbent is then provably optimal) or when
-    `time_limit` is exhausted. Intended to be run against a connectivity-free
-    relaxation's selection/bound/cuts as a completely separate experiment from
-    the other warm-start and solve paths -- it does not touch or get called
-    by any of them.
+    round cap: each round either adds boundary cuts for whatever components
+    are disconnected from the root, or (once a connected candidate is found)
+    tightens the objective floor to strictly require a better one next round.
+    The loop stops when the model goes INFEASIBLE (the current incumbent is
+    then provably optimal), when `time_limit` is exhausted, or -- unless
+    `stall_rounds` is `None` -- once `stall_rounds` consecutive DISCONNECTED
+    rounds pass without the cut components shrinking (the smallest
+    disconnected-component count seen since the last incumbent improvement).
+    A stall only ends the search early; whatever `best_connected` incumbent
+    was already found is still returned. Intended to be run against a
+    connectivity-free relaxation's selection/bound/cuts as a completely
+    separate experiment from the other warm-start and solve paths -- it does
+    not touch or get called by any of them.
     """
     N = len(nb_local)
     if N == 0:
@@ -4996,6 +5373,8 @@ def solve_asu_graph_cut_only(
     cut_round = 0
     status_name = "FEASIBLE"
     pending_expand: List[set] = initial_pending
+    best_num_components: Optional[int] = None
+    stall_count = 0
 
     def _set_expand_hint(nodes: set) -> None:
         hint = model.Proto().solution_hint
@@ -5080,6 +5459,8 @@ def solve_asu_graph_cut_only(
             best_connected = selected
             best_obj = int(round(solver.ObjectiveValue()))
             pending_expand = []
+            best_num_components = None
+            stall_count = 0
             if log:
                 print(
                     f"  [graph-cut] round {cut_round}: CONNECTED, unemp={best_obj}, "
@@ -5103,7 +5484,7 @@ def solve_asu_graph_cut_only(
         repair_fallback = best_connected if best_connected is not None else sorted(forced_set)
         repaired = repair_connectivity_free_selection(
             selected, repair_fallback, nb_local, u_g, E_g, P_g, tau, pop_thresh, root_local,
-            forced_selected=sorted(forced_set), max_nodes=max_nodes,
+            forced_selected=sorted(forced_set), max_nodes=max_nodes, log=log,
         )
         if component_ok(repaired, u_g, E_g, P_g, tau, pop_thresh, nb_local) and (
             max_nodes is None or len(repaired) <= int(max_nodes)
@@ -5149,6 +5530,11 @@ def solve_asu_graph_cut_only(
         # to absorb, and most likely for a CP-SAT-guided swap to succeed.
         # Ties (equal tract count) break toward the smallest unemployment.
         pending_expand = sorted(components, key=_component_key)
+        if best_num_components is None or num_components < best_num_components:
+            best_num_components = num_components
+            stall_count = 0
+        else:
+            stall_count += 1
         if log:
             best_text = str(best_obj) if best_obj >= 0 else "none"
             print(
@@ -5158,6 +5544,14 @@ def solve_asu_graph_cut_only(
                 flush=True,
             )
         cut_round += 1
+        if stall_rounds is not None and stall_count >= stall_rounds:
+            if log:
+                print(
+                    f"  [graph-cut] stalled: component count hasn't improved in "
+                    f"{stall_count} round(s); stopping early",
+                    flush=True,
+                )
+            break
 
     if log:
         elapsed = time.monotonic() - start_time
@@ -5353,7 +5747,7 @@ def _prepare_window_hint(
                             fallback,
                             nb_local, u_g, E_g, P_g, tau, pop_thresh, root_local,
                             forced_selected=root_component,
-                            max_nodes=max_nodes,
+                            max_nodes=max_nodes, log=verbose,
                         )
                         if verbose:
                             print(
@@ -5736,6 +6130,11 @@ def build_many_asus_cpsat(
     standalone_expansion_time_limit: float = 30.0,
     final_asu_polish_time_limit: Optional[float] = None,
     use_flow_first_search: bool = False,
+    use_tract_capacity_search: bool = False,
+    use_flow_capacity_hybrid_search: bool = False,
+    use_capacity_sweep: bool = False,
+    capacity_sweep_time_limit: float = 30.0,
+    incumbent_stall_seconds: Optional[float] = None,
 ) -> Dict[str, np.ndarray]:
     """
     Build ASUs in batches of up to `parallel_asus` disjoint candidate windows, solved
@@ -5800,11 +6199,28 @@ def build_many_asus_cpsat(
     current batch -- the flag is consumed on detection -- so the (partial)
     incumbent is committed as its ASU and the loop continues on to build the
     next ASU window normally.
+
+    When `use_capacity_sweep` is True, a final pass (after the main loop and
+    any combine phase) tries to salvage brand-new standalone ASUs from tracts
+    still left in `remaining` -- restricted entirely to the remaining-tract
+    subgraph (never touching already-committed tracts, since a leftover tract
+    that could improve an existing ASU would already have been captured by
+    that ASU's own solves). Each round picks the remaining tract with the
+    highest UR-surplus (`den*u - num*E`) as root, grows a window purely from
+    other remaining tracts, and solves it with CP-SAT; it stops once no
+    remaining tract has positive surplus left. `capacity_sweep_time_limit`
+    bounds each individual CP-SAT solve in this pass.
     """
-    if use_tract_first_search and use_flow_first_search:
-        raise ValueError("tract-first and flow-first search are mutually exclusive")
-    if use_flow_first_search and use_arborescence:
-        raise ValueError("flow-first search requires an integer flow formulation")
+    custom_modes = [
+        bool(use_tract_first_search),
+        bool(use_flow_first_search),
+        bool(use_tract_capacity_search),
+        bool(use_flow_capacity_hybrid_search),
+    ]
+    if sum(custom_modes) > 1:
+        raise ValueError("custom fixed-search workers are mutually exclusive")
+    if (use_flow_first_search or use_flow_capacity_hybrid_search) and use_arborescence:
+        raise ValueError("flow-first and hybrid search require an integer flow formulation")
 
     def _round_to_int64(col: pd.Series, name: str) -> np.ndarray:
         # BLS/ACS counts should already be whole numbers; round explicitly
@@ -5831,6 +6247,17 @@ def build_many_asus_cpsat(
     tried = np.zeros(n, dtype=bool)
     asu_id = np.full(n, -1, dtype=int)
     num, den = as_fraction_tau(tau)
+
+    if verbose:
+        print(
+            "[igraph] articulation-point acceleration: "
+            + (
+                "ENABLED (C-backed via python-igraph)"
+                if _ig is not None
+                else "DISABLED (pure-Python fallback; pip install python-igraph for a speedup)"
+            ),
+            flush=True,
+        )
 
     batch_size = max(1, int(parallel_asus))
     k = 0
@@ -6146,6 +6573,9 @@ def build_many_asus_cpsat(
                         configure_subsolvers=configure_subsolvers,
                         use_tract_first_search=use_tract_first_search,
                         use_flow_first_search=use_flow_first_search,
+                        use_tract_capacity_search=use_tract_capacity_search,
+                        use_flow_capacity_hybrid_search=use_flow_capacity_hybrid_search,
+                        incumbent_stall_seconds=incumbent_stall_seconds,
                         use_flow_count_envelope=use_flow_count_envelope,
                         use_small_root_separators=use_small_root_separators,
                         root_separator_max_size=root_separator_max_size,
@@ -6309,6 +6739,9 @@ def build_many_asus_cpsat(
                 configure_subsolvers=configure_subsolvers,
                 use_tract_first_search=use_tract_first_search,
                 use_flow_first_search=use_flow_first_search,
+                use_tract_capacity_search=use_tract_capacity_search,
+                use_flow_capacity_hybrid_search=use_flow_capacity_hybrid_search,
+                incumbent_stall_seconds=incumbent_stall_seconds,
                 use_flow_count_envelope=use_flow_count_envelope,
                 use_small_root_separators=use_small_root_separators,
                 root_separator_max_size=root_separator_max_size,
@@ -6450,6 +6883,9 @@ def build_many_asus_cpsat(
                 configure_subsolvers=configure_subsolvers,
                 use_tract_first_search=use_tract_first_search,
                 use_flow_first_search=use_flow_first_search,
+                use_tract_capacity_search=use_tract_capacity_search,
+                use_flow_capacity_hybrid_search=use_flow_capacity_hybrid_search,
+                incumbent_stall_seconds=incumbent_stall_seconds,
                 use_flow_count_envelope=use_flow_count_envelope,
                 use_small_root_separators=use_small_root_separators,
                 root_separator_max_size=root_separator_max_size,
@@ -6739,6 +7175,9 @@ def build_many_asus_cpsat(
                     configure_subsolvers=configure_subsolvers,
                     use_tract_first_search=use_tract_first_search,
                     use_flow_first_search=use_flow_first_search,
+                    use_tract_capacity_search=use_tract_capacity_search,
+                    use_flow_capacity_hybrid_search=use_flow_capacity_hybrid_search,
+                    incumbent_stall_seconds=incumbent_stall_seconds,
                     use_flow_count_envelope=use_flow_count_envelope,
                     use_small_root_separators=use_small_root_separators,
                     root_separator_max_size=root_separator_max_size,
@@ -6783,6 +7222,175 @@ def build_many_asus_cpsat(
                         f"pop={sP2}, UR={URv2:.3f}%, unemp={su2} (status={status2})",
                         flush=True,
                     )
+
+    # ---- Capacity sweep: build standalone ASUs from purely-leftover tracts ----
+    # The main loop above already seeds new ASUs from remaining tracts whose own
+    # unemployment rate clears tau, and stops once none do. Any leftover tract
+    # that could usefully join an EXISTING ASU would already have been captured
+    # by that ASU's own window/combine solves above, so this pass never looks
+    # at already-committed tracts at all -- windows are grown strictly within
+    # the remaining-tract subgraph. It only tries to salvage brand-new
+    # standalone ASUs from what's left, picking the remaining tract with the
+    # highest UR-surplus (q_i = den*u_i - num*E_i, the same exact-integer
+    # quantity used for the UR constraint) as root each round, and stops once
+    # no remaining tract has positive surplus left.
+    if use_capacity_sweep and k < max_asus and not _stop_requested(stop_flag_path):
+        q_surplus_all = den * u.astype(np.int64) - num * E.astype(np.int64)
+        swept_tried = np.zeros(n, dtype=bool)
+        sweep_round = 0
+        while k < max_asus:
+            if _stop_requested(stop_flag_path):
+                if verbose:
+                    print("[SWEEP] Stop flag detected; halting capacity sweep.", flush=True)
+                break
+
+            cand_idx = np.where(remaining & ~swept_tried)[0]
+            if cand_idx.size == 0:
+                break
+            q_cand = q_surplus_all[cand_idx]
+            best_pos = int(np.argmax(q_cand))
+            if q_cand[best_pos] <= 0:
+                break
+            root_global = int(cand_idx[best_pos])
+
+            allowed_idx = np.where(remaining)[0]
+            r = int(r_start)
+            sub = bfs_ball(nb, root_global, r, allowed_idx)
+            while P[sub].sum() < min_pop_margin * pop_thresh and r < r_max and len(sub) < hard_cap_nodes:
+                r += r_step
+                sub = bfs_ball(nb, root_global, r, allowed_idx)
+            if len(sub) > hard_cap_nodes:
+                while len(sub) > hard_cap_nodes and r > 1:
+                    r -= 1
+                    sub = bfs_ball(nb, root_global, r, allowed_idx)
+                if len(sub) > hard_cap_nodes:
+                    sub = sub[:hard_cap_nodes]
+
+            local_index = {g: i for i, g in enumerate(sub)}
+            nb_local = [sorted(local_index[h] for h in nb[g] if h in local_index) for g in sub]
+            u_g, E_g, P_g = u[sub], E[sub], P[sub]
+            root_local = local_index[root_global]
+
+            if not can_hit_tau(u_g, E_g, P_g, nb_local, tau, pop_thresh):
+                swept_tried[root_global] = True
+                if verbose:
+                    print(f"  [SWEEP] seed={root_global}: quick screen fails; skipping", flush=True)
+                continue
+
+            sweep_round += 1
+            if "geoid" in df.columns:
+                stable_values = [str(df.iloc[int(g)]["geoid"]) for g in sub]
+            else:
+                stable_values = [str(int(g)).zfill(12) for g in sub]
+            stable_order = sorted(range(len(sub)), key=lambda i: (stable_values[i], i))
+            tie_break_rank = [0] * len(sub)
+            for rank, local_i in enumerate(stable_order):
+                tie_break_rank[local_i] = rank
+
+            if verbose:
+                print(
+                    f"\n[SWEEP round={sweep_round}] seed={root_global} "
+                    f"(q_surplus={int(q_cand[best_pos])}): window r={r}, "
+                    f"nodes={len(sub)}, pop={int(P_g.sum())}",
+                    flush=True,
+                )
+
+            info = _prepare_window_hint(
+                nb_local, u_g, E_g, P_g, tau, pop_thresh, root_local,
+                verbose=verbose, max_nodes=max_nodes_per_asu,
+                use_connectivity_free_repair=use_connectivity_free_repair,
+                connectivity_free_time_limit=connectivity_free_time_limit,
+                harvest_connectivity_free_asus=False,
+                use_graph_cut_repair=use_graph_cut_repair,
+                graph_cut_repair_time_limit=graph_cut_repair_time_limit,
+                workers=workers,
+            )
+            hint_local = info["hint_improved"] if info["hint_valid"] else None
+            hint_obj_local = info["hint_obj_val"] if info["hint_valid"] else None
+            if (
+                max_nodes_per_asu is not None
+                and hint_local is not None
+                and len(hint_local) > max_nodes_per_asu
+            ):
+                hint_local, hint_obj_local = None, None
+
+            result = solve_one_asu_cpsat(
+                nb_local=nb_local, u_g=u_g, E_g=E_g, P_g=P_g,
+                tau=tau, pop_thresh=pop_thresh, root_local=root_local,
+                time_limit=capacity_sweep_time_limit, workers=workers, rel_gap=rel_gap, log=verbose,
+                hint=hint_local, hint_obj=hint_obj_local,
+                forced_selected=info["root_component"],
+                deterministic_ties=deterministic_ties,
+                tie_break_rank=tie_break_rank,
+                objective_shaving=objective_shaving,
+                use_root_articulation_implications=use_root_articulation_implications,
+                use_signed_flow=use_signed_flow,
+                use_arborescence=use_arborescence,
+                configure_subsolvers=configure_subsolvers,
+                use_tract_first_search=use_tract_first_search,
+                use_flow_first_search=use_flow_first_search,
+                use_tract_capacity_search=use_tract_capacity_search,
+                use_flow_capacity_hybrid_search=use_flow_capacity_hybrid_search,
+                incumbent_stall_seconds=incumbent_stall_seconds,
+                use_flow_count_envelope=use_flow_count_envelope,
+                use_small_root_separators=use_small_root_separators,
+                root_separator_max_size=root_separator_max_size,
+                root_separator_clause_limit=root_separator_clause_limit,
+                root_separator_target_limit=root_separator_target_limit,
+                use_separator_cardinality_bounds=use_separator_cardinality_bounds,
+                solution_pool_size=solution_pool_size,
+                use_bridge_edge_bounds=use_bridge_edge_bounds,
+                use_articulation_edge_bounds=use_articulation_edge_bounds,
+                use_distance_flow_bounds=use_distance_flow_bounds,
+                use_global_capacity_cardinality_bound=use_global_capacity_cardinality_bound,
+                use_bridge_subtree_pruning=use_bridge_subtree_pruning,
+                max_nodes=max_nodes_per_asu,
+                stop_flag_path=stop_flag_path,
+                skip_flag_path=skip_flag_path,
+            )
+
+            if result is not None:
+                S_local = result.sel_idx_local
+            elif hint_local is not None and (
+                max_nodes_per_asu is None or len(hint_local) <= max_nodes_per_asu
+            ):
+                S_local = hint_local
+            else:
+                S_local = None
+
+            S_global = (
+                sorted(np.array(sub, dtype=int)[np.array(S_local, dtype=int)].tolist())
+                if S_local is not None else None
+            )
+            if S_global is None or not component_ok(S_global, u, E, P, tau, pop_thresh, nb) or (
+                max_nodes_per_asu is not None and len(S_global) > max_nodes_per_asu
+            ):
+                swept_tried[root_global] = True
+                if verbose:
+                    print(f"  [SWEEP] seed={root_global}: no feasible standalone ASU found; skipping", flush=True)
+                continue
+
+            allowed_idx = np.where(remaining)[0]
+            S_final = improve_by_trades(S_global, u, E, P, nb, tau, pop_thresh, allowed_idx,
+                                         max_iter=200, max_size=max_nodes_per_asu)
+            if not component_ok(S_final, u, E, P, tau, pop_thresh, nb):
+                S_final = S_global
+
+            k += 1
+            asu_id[S_final] = k
+            remaining[S_final] = False
+            if verbose:
+                su, sE, sP = int(u[S_final].sum()), int(E[S_final].sum()), int(P[S_final].sum())
+                ur_value = 100.0 * ur_of(su, sE)
+                status_txt = result.status if result is not None else "GREEDY FALLBACK"
+                print(
+                    f"  [OK] ASU {k} (sweep): tracts={len(S_final)}, pop={sP}, "
+                    f"UR={ur_value:.3f}%, unemp={su} (status={status_txt})",
+                    flush=True,
+                )
+
+        if verbose and sweep_round:
+            print(f"\n[SWEEP] finished: {sweep_round} window(s) tried, {k} total ASU(s) so far", flush=True)
 
     polish_time_limit = (
         standalone_expansion_time_limit
@@ -6910,6 +7518,9 @@ def build_many_asus_cpsat(
             configure_subsolvers=configure_subsolvers,
             use_tract_first_search=use_tract_first_search,
             use_flow_first_search=use_flow_first_search,
+            use_tract_capacity_search=use_tract_capacity_search,
+            use_flow_capacity_hybrid_search=use_flow_capacity_hybrid_search,
+            incumbent_stall_seconds=incumbent_stall_seconds,
             use_flow_count_envelope=use_flow_count_envelope,
             use_small_root_separators=use_small_root_separators,
             root_separator_max_size=root_separator_max_size,
@@ -7134,6 +7745,22 @@ def main():
         ),
     )
     ap.add_argument(
+        "--use-tract-capacity-search",
+        action="store_true",
+        help=(
+            "Enable an experimental partial fixed-search worker that branches "
+            "nonnegative tract UR-surplus first, then rejects negative surplus"
+        ),
+    )
+    ap.add_argument(
+        "--use-flow-capacity-hybrid-search",
+        action="store_true",
+        help=(
+            "Enable an experimental hybrid worker: flow-first prefix, "
+            "tract-capacity prefixes, then far-from-root magnitude minimization"
+        ),
+    )
+    ap.add_argument(
         "--no-flow-count-envelope",
         action="store_true",
         help="Disable dynamic signed-flow bounds based on selected-node count",
@@ -7274,6 +7901,32 @@ def main():
             "(defaults to --time-limit when omitted)"
         ),
     )
+    ap.add_argument(
+        "--use-capacity-sweep",
+        action="store_true",
+        help=(
+            "After the main loop (and combine phase, if any), repeatedly seed a "
+            "brand-new standalone ASU from the remaining tract with the highest "
+            "UR-surplus, restricted to a window built only from other remaining "
+            "tracts, until no remaining tract has positive surplus left"
+        ),
+    )
+    ap.add_argument(
+        "--capacity-sweep-time-limit",
+        type=float,
+        default=30.0,
+        help="CP-SAT seconds per standalone ASU solve during the capacity sweep pass",
+    )
+    ap.add_argument(
+        "--incumbent-stall-seconds",
+        type=float,
+        default=None,
+        help=(
+            "Finish each CP-SAT solve early, keeping its current incumbent, once "
+            "this many seconds pass with no incumbent improvement (default: "
+            "disabled)"
+        ),
+    )
     ap.add_argument("--output", default=None, help="Output CSV path (default: <stem>_with_asu.csv)")
     ap.add_argument(
         "--stop-file",
@@ -7290,8 +7943,21 @@ def main():
     )
     ap.add_argument("--verbose", action="store_true", help="Verbose CP-SAT logs")
     args = ap.parse_args()
-    if args.use_tract_first_search and args.use_flow_first_search:
-        ap.error("--use-tract-first-search and --use-flow-first-search are mutually exclusive")
+    custom_modes = [
+        ("--use-tract-first-search", args.use_tract_first_search),
+        ("--use-flow-first-search", args.use_flow_first_search),
+        ("--use-tract-capacity-search", args.use_tract_capacity_search),
+        (
+            "--use-flow-capacity-hybrid-search",
+            args.use_flow_capacity_hybrid_search,
+        ),
+    ]
+    enabled_modes = [name for name, enabled in custom_modes if enabled]
+    if len(enabled_modes) > 1:
+        ap.error(
+            "Custom fixed-search workers are mutually exclusive: "
+            + ", ".join(enabled_modes)
+        )
 
     # Load input table
     inp = args.input
@@ -7366,6 +8032,8 @@ def main():
         use_root_articulation_implications=args.use_root_articulation_implications,
         use_tract_first_search=args.use_tract_first_search,
         use_flow_first_search=args.use_flow_first_search,
+        use_tract_capacity_search=args.use_tract_capacity_search,
+        use_flow_capacity_hybrid_search=args.use_flow_capacity_hybrid_search,
         use_flow_count_envelope=not args.no_flow_count_envelope,
         use_small_root_separators=not args.no_small_root_separators,
         root_separator_max_size=args.root_separator_max_size,
@@ -7388,6 +8056,9 @@ def main():
         max_nodes_per_asu=args.max_nodes_per_asu,
         combine_capped_asus=not args.no_combine_capped_asus,
         combine_time_limit=args.combine_time_limit,
+        use_capacity_sweep=args.use_capacity_sweep,
+        capacity_sweep_time_limit=args.capacity_sweep_time_limit,
+        incumbent_stall_seconds=args.incumbent_stall_seconds,
         stop_flag_path=args.stop_file,
         skip_flag_path=args.skip_file,
     )

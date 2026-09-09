@@ -24,17 +24,31 @@ build_asu(
   use_bridge_edge_bounds = FALSE,
   use_articulation_edge_bounds = FALSE,
   use_distance_flow_bounds = FALSE,
+  use_distance_flow_count_envelope = FALSE,
+  use_direct_endpoint_gating = FALSE,
+  use_capacity_radius_pruning = FALSE,
+  use_capacity_cover_cuts = FALSE,
+  use_lobe_capacity_cardinality_bounds = FALSE,
+  use_bisection_max_selected = FALSE,
   use_connectivity_free_repair = FALSE,
   connectivity_free_time_limit = 10,
   harvest_connectivity_free_asus = FALSE,
   standalone_expansion_time_limit = 30,
+  use_buffer_asu_merge = FALSE,
+  buffer_asu_merge_time_limit = NA_real_,
   final_asu_polish_time_limit = NA_real_,
   max_nodes_per_asu = NA_integer_,
+  exact_nodes_per_asu = NA_integer_,
   combine_capped_asus = TRUE,
   combine_time_limit = NA_integer_,
+  use_capacity_sweep = FALSE,
+  capacity_sweep_time_limit = 30,
+  incumbent_stall_seconds = NA_real_,
   verbose = interactive(),
   parallel_asus = 1L,
-  use_flow_first_search = FALSE
+  use_flow_first_search = FALSE,
+  use_tract_capacity_search = FALSE,
+  use_flow_capacity_hybrid_search = FALSE
 )
 }
 \arguments{
@@ -60,11 +74,6 @@ subsolver portfolio instead of the ASU-specific portfolio}
 \item{use_tract_first_search}{logical; enable the experimental
 incumbent-boundary worker, trying safe exclusions before frontier
 additions, within the ASU-specific portfolio}
-
-\item{use_flow_first_search}{logical; enable the experimental flow-first
-worker, choosing the widest flow domain, breaking ties by incident tract
-unemployment rate and count, and selecting the minimum value. Requires
-\code{configure_subsolvers = TRUE} and cannot be combined with tract-first search}
 
 \item{use_flow_count_envelope}{logical; dynamically bound signed-flow values
 by the number of selected nodes}
@@ -96,6 +105,49 @@ Sound but unproven on real data -- opt-in, default FALSE}
 Sound on cycles (any connected selection admits a rooted spanning-tree
 flow within these caps) but unproven on real data -- opt-in, default FALSE}
 
+\item{use_distance_flow_count_envelope}{logical; same distance-from-root
+fact as \code{use_distance_flow_bounds}, but expressed against the live
+\code{selected_count} model variable (as \code{use_flow_count_envelope} already
+does with the uniform bound) instead of the static \code{max_selected}
+constant, so the bound keeps tightening as CP-SAT narrows
+\code{selected_count} anywhere during the main solve. Sound but unproven on
+real data -- opt-in, default FALSE}
+
+\item{use_direct_endpoint_gating}{logical; add explicit \verb{L*x <= f <= U*x}
+linear rows per signed flow endpoint, alongside the existing reified
+zero-flow constraints, to expose the same bound directly to the LP
+relaxation. Sound but unproven on real data -- opt-in, default FALSE}
+
+\item{use_capacity_radius_pruning}{logical; vertex-weighted-Dijkstra
+generalization of the bridge-subtree fix: hard-fixes any tract whose
+cheapest root path already consumes more UR-surplus budget than the
+whole window can supply. Sound but unproven on real data -- opt-in,
+default FALSE}
+
+\item{use_capacity_cover_cuts}{logical; disaggregated generalization of
+the bridge-subtree/capacity-radius fixes into genuine size-2/3 knapsack
+cover cuts (\verb{sum(x_i for i in cover) <= |cover| - 1}) over the same
+UR-surplus budget, instead of only fixing individual tracts to 0.
+Sound (each cover is provably minimal and jointly infeasible under the
+same best-case budget argument) but unproven on real data -- opt-in,
+default FALSE}
+
+\item{use_lobe_capacity_cardinality_bounds}{logical; generalizes the
+window-wide capacity cardinality bound into one cut per root-separating
+articulation lobe, so the LP can no longer concentrate fractional
+below-threshold weight inside a single component the way one pooled
+cut allows. Reuses the same global budget as the pooled bound (sound
+disaggregation), but real-data solve-time benefit is unproven -- opt-in,
+default FALSE}
+
+\item{use_bisection_max_selected}{logical; tighten the connectivity-free
+max-selected-tracts bound via a feasibility bisection on cardinality
+("does any selection of size >= K satisfy pop/UR?") instead of relying
+solely on one Maximize call, taking the tighter of the two. Sound (a
+query only lowers the bound on a proven CP-SAT INFEASIBLE result; a
+timeout leaves it unchanged) but real-data benefit is unproven --
+opt-in, default FALSE}
+
 \item{use_connectivity_free_repair}{logical; solve the unemployment objective
 subject to population and UR requirements without connectivity, repair the
 selected components, and use the result only when it is a better valid hint}
@@ -113,18 +165,44 @@ territory. The current ASU is a hint and objective floor, so tracts may be
 replaced. Touching expanded ASUs are merged and expansion is rerun until
 stable; zero commits standalone components without initial expansion}
 
+\item{use_buffer_asu_merge}{logical; after the touching-ASU combine phase
+(independent of \code{max_nodes_per_asu}/\code{combine_capped_asus} and
+\code{harvest_connectivity_free_asus}), also group and pool ASUs that touch
+directly or share a common "buffer" ASU neighbor (at most one other ASU
+apart) -- including that buffer -- into one CP-SAT combine solve per
+group, mirroring the touching-ASU combine phase's window-expansion and
+fallback-to-original-tracts behavior. Repeats to a fixed point since a
+merge can create fresh touches/shared buffers}
+
+\item{buffer_asu_merge_time_limit}{optional seconds; CP-SAT time limit for
+each buffer-ASU-merge combine solve (\code{NA_real_} falls back to
+\code{combine_time_limit}, then \code{time_limit}, the default)}
+
 \item{final_asu_polish_time_limit}{optional seconds for each final sequential
-CP-SAT solve over one committed ASU plus every currently unassigned tract.
-Current tracts are a hint and objective floor rather than forced membership;
-dropped tracts become available to later ASUs. New touching ASUs are merged
-transitively and the polish repeats until no new merge occurs. \code{NA_real_}
-uses \code{standalone_expansion_time_limit}, and zero disables the final polish}
+CP-SAT solve over one committed ASU plus every currently unassigned tract,
+plus any other ASU's tract reachable through at most one unassigned tract
+(so a thin unassigned sliver between two ASUs no longer hides a
+worthwhile neighboring tract). A donor ASU is never left below
+\code{pop_thresh} or disconnected by such a steal -- the polish is rejected
+and the seed retained if it would be. Current tracts are a hint and
+objective floor rather than forced membership; dropped tracts become
+available to later ASUs. New touching ASUs are merged transitively and
+the polish repeats until no new merge occurs. \code{NA_real_} uses
+\code{standalone_expansion_time_limit}, and zero disables the final polish}
 
 \item{max_nodes_per_asu}{optional integer cap on the number of tracts per
 ASU (\code{NA_integer_} disables the cap, the default). When set, ASUs are
 built up to this size, then touching capped ASUs are combined and
 re-solved (uncapped) via CP-SAT in a final improvement pass -- see
 \code{combine_capped_asus}}
+
+\item{exact_nodes_per_asu}{optional integer; when set, forces every ASU
+built during the main loop to select exactly this many tracts instead of
+at most \code{max_nodes_per_asu} (\code{NA_integer_} disables it, the default;
+takes precedence over \code{max_nodes_per_asu} when both are set). Intended
+for the legacy single-ASU-at-a-time build to test whether fixing the
+tract count speeds up the search; the combine and buffer-merge phases are
+force-disabled whenever it is set}
 
 \item{combine_capped_asus}{logical; when \code{max_nodes_per_asu} is set,
 combine touching capped ASUs and improve them via an uncapped CP-SAT
@@ -135,15 +213,52 @@ re-solve after the main build loop finishes. Ignored if
 specifically for the uncapped combine/re-solve pass (\code{NA_integer_} uses
 \code{time_limit}, the default)}
 
+\item{use_capacity_sweep}{logical; after the main loop and combine phase,
+repeatedly seed a brand-new standalone ASU from the remaining tract with
+the highest UR-surplus, building its window strictly from other
+remaining tracts (never touching already-committed ASUs), until no
+remaining tract has positive surplus left. Salvages leftover tracts that
+the main loop's own seed selection can never reach on its own (e.g. an
+isolated tract that already meets the UR/population thresholds by
+itself but has no remaining neighbor)}
+
+\item{capacity_sweep_time_limit}{seconds allowed for each standalone CP-SAT
+solve during the capacity sweep pass}
+
+\item{incumbent_stall_seconds}{optional seconds; finish each CP-SAT solve
+early, keeping its current incumbent, once this many seconds pass with
+no incumbent improvement. \code{NA_real_} (the default) disables this
+early-finish check}
+
 \item{verbose}{logical; print CP-SAT logs}
 
 \item{parallel_asus}{maximum number of ASU windows or standalone expansions
 solved concurrently. Use \code{1} (the default) to solve ASUs sequentially;
 the configured \code{workers} are then available to each solve}
+
+\item{use_flow_first_search}{logical; enable the experimental flow-first
+worker, choosing the widest flow domain, breaking ties by incident tract
+unemployment rate and count, and selecting the minimum value. Requires
+\code{configure_subsolvers = TRUE} and cannot be combined with another custom
+fixed-search worker}
+
+\item{use_tract_capacity_search}{logical; enable the experimental
+tract-capacity worker, selecting nonnegative exact unemployment-rate
+capacity from highest to lowest, then rejecting negative capacity from
+lowest to highest. Requires \code{configure_subsolvers = TRUE} and cannot be
+combined with another custom fixed-search worker}
+
+\item{use_flow_capacity_hybrid_search}{logical; enable the experimental
+hybrid worker: minimize a flow-first prefix, apply tract-capacity
+branching, then minimize remaining tract and absolute-flow variables from
+farthest to nearest root distance. Requires \code{configure_subsolvers = TRUE},
+an integer-flow formulation, and cannot be combined with another custom
+fixed-search worker}
 }
 \value{
 df with added \code{asu_id} column (integer; -1 means unassigned)
 }
 \description{
-Build ASUs using OR-Tools CP-SAT (Python) from an R data frame
+Requires the managed Python environment created by
+\code{setup_asu_python()}, including OR-Tools \code{>= 9.15}.
 }
