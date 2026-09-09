@@ -9,15 +9,20 @@ asu_use_python <- function(required = FALSE) {
     return(FALSE)
   }
 
-  envs <- tryCatch(
-    reticulate::conda_list(conda = conda_bin)$name,
-    error = function(e) character()
+  envs_df <- tryCatch(
+    reticulate::conda_list(conda = conda_bin),
+    error = function(e) NULL
   )
-  if (!("asu-cpsat" %in% envs)) {
+  env_row <- envs_df[envs_df$name == "asu-cpsat", ]
+  if (is.null(envs_df) || nrow(env_row) == 0) {
     if (required) stop("Python environment 'asu-cpsat' was not found. Run ASUbuildR::setup_asu_python() first.")
     return(FALSE)
   }
 
+  # Force this interpreter via RETICULATE_PYTHON so a project-local .venv/renv
+  # (auto-detected by reticulate) cannot silently override use_condaenv(),
+  # even when use_condaenv() is called with required = TRUE.
+  Sys.setenv(RETICULATE_PYTHON = env_row$python[1])
   reticulate::use_condaenv("asu-cpsat", conda = conda_bin, required = required)
   TRUE
 }

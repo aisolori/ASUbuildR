@@ -47,8 +47,13 @@ env_name <- "asu-cpsat"
 
 # Try to activate the conda env and check for OR-Tools, but never abort knitting
 try({
-  envs <- reticulate::conda_list()$name
-  if (env_name %in% envs) {
+  envs_df <- reticulate::conda_list()
+  if (env_name %in% envs_df$name) {
+    # Force this interpreter via RETICULATE_PYTHON so a project-local .venv/renv
+    # (auto-detected by reticulate) cannot silently override use_condaenv(),
+    # even when use_condaenv() is called with required = TRUE.
+    py_path <- envs_df$python[envs_df$name == env_name][1]
+    Sys.setenv(RETICULATE_PYTHON = py_path)
     reticulate::use_condaenv(env_name, required = FALSE)
 
     if (reticulate::py_module_available("ortools")) {
