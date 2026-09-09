@@ -720,13 +720,12 @@ _ASU_FULL_SUBSOLVER_PATTERN = (
     "asu_probe_standard",
     "lb_tree_search",
     "quick_restart",
-    "probing",
+    "quick_restart_no_lp",
 
     "pseudo_costs",
     "reduced_costs",
     "core_max_lp",
 
-    "quick_restart_no_lp",
 
     "core",
     "asu_probe_very_deep",
@@ -1434,6 +1433,7 @@ def solve_one_asu_cpsat(
     initial_connectivity_cuts: Optional[
         Sequence[Tuple[Sequence[int], Sequence[int]]]
     ] = None,
+    initial_components: Optional[Sequence[Sequence[int]]] = None,
     use_flow_first_search: bool = False,
 ) -> Optional[CpsatResult]:
     """
@@ -1527,6 +1527,21 @@ def solve_one_asu_cpsat(
     forced_set.add(root_local)
     for i in forced_set:
         model.Add(x[i] == 1)
+
+    # Seed the cut-pass phase from the caller's own smallest-first component
+    # breakdown instead of a pre-built full hint: starting from the biggest
+    # available incumbent locks the objective floor to that incumbent's size,
+    # which forecloses smaller connected candidates that would leave tracts
+    # free for other ASUs to form elsewhere.
+    initial_pending: List[set] = []
+    for component_orig in (initial_components or []):
+        component_c = {
+            int(node_map_c[int(v)]) for v in component_orig
+            if 0 <= int(v) < len(node_map_c)
+        } - forced_set
+        if component_c:
+            initial_pending.append(component_c)
+    initial_pending.sort(key=lambda c: (len(c), int(u_g[list(c)].sum())))
 
     # Valid for ANY connected subgraph: every selected non-root node must have at
     # least one selected neighbor (it can't be reached from root otherwise). Free
@@ -1703,22 +1718,34 @@ def solve_one_asu_cpsat(
                     flush=True,
                 )
 
-    # Warm-start with the connected reverse-prune solution.
-    if hint is not None:
-        hint_set = set(hint)
-        for i in range(N):
-            model.AddHint(x[i], 1 if i in hint_set else 0)
+    # Warm-start / floor: when a smallest-first component breakdown is given,
+    # start the cut-pass phase with NO incumbent and NO objective floor at all,
+    # so it is free to explore genuinely small, differently-shaped connected
+    # candidates. The known-good hint is still applied as a floor later, right
+    # before the exact flow phase, so the final committed answer never
+    # regresses below it -- only the cut-pass exploration is unshackled.
+    defer_hint_floor = bool(initial_pending)
+    if defer_hint_floor:
+        best_connected = None
+        best_obj = -1
+        lower_bound = -1
+    else:
+        # Warm-start with the connected reverse-prune solution.
+        if hint is not None:
+            hint_set = set(hint)
+            for i in range(N):
+                model.AddHint(x[i], 1 if i in hint_set else 0)
 
-    # Lower bound: reject solutions worse than the reverse-prune warm start.
-    if hint_obj is not None and hint_obj > 0:
-        model.Add(obj_expr >= hint_obj)
+        # Lower bound: reject solutions worse than the reverse-prune warm start.
+        if hint_obj is not None and hint_obj > 0:
+            model.Add(obj_expr >= hint_obj)
 
-    # Solver params
-    best_connected = sorted(hint) if hint and component_ok(
-        hint, u_g, E_g, P_g, tau, pop_thresh, nb_local
-    ) else None
-    best_obj = int(u_g[best_connected].sum()) if best_connected else -1
-    lower_bound = hint_obj if (hint_obj is not None and hint_obj > 0) else -1
+        best_connected = sorted(hint) if hint and component_ok(
+            hint, u_g, E_g, P_g, tau, pop_thresh, nb_local
+        ) else None
+        best_obj = int(u_g[best_connected].sum()) if best_connected else -1
+        lower_bound = hint_obj if (hint_obj is not None and hint_obj > 0) else -1
+
     start_time = time.monotonic()
     cut_round = 0
     # NOTE: a tight objective/bound in the cut-only (disconnected) relaxation does
@@ -1737,16 +1764,46 @@ def solve_one_asu_cpsat(
     # boundary constraints these cuts add evidently still prune the flow
     # phase's search space usefully even when they never converge to a single
     # connected component. See SKILL.md.
-    cut_time_budget = 0.0  # cut pre-pass disabled
+    cut_time_budget = min(60.0, max(2.0, float(time_limit) * 0.15))
     stall_rounds = 0
     prev_num_components: Optional[int] = None
     first_components: Optional[int] = None
 
-    while cut_round < 15:
+    def _component_key(component: set) -> Tuple[int, int]:
+        # Smallest tract count first; ties broken by smallest unemployment.
+        return (len(component), int(u_g[list(component)].sum()))
+
+    def _set_expand_hint(nodes: set) -> None:
+        hint_proto = model.Proto().solution_hint
+        hint_proto.vars.clear()
+        hint_proto.values.clear()
+        for i in range(N):
+            model.AddHint(x[i], 1 if i in nodes else 0)
+
+    # Populated once a round goes DISCONNECTED; nudges each following round
+    # toward absorbing the smallest still-disconnected component first,
+    # instead of leaving CP-SAT to re-solve the cuts unguided every round.
+    # Pre-seeded from the caller's own smallest-first breakdown, if given, so
+    # round 0 already targets the smallest component instead of the full hint.
+    pending_expand: List[set] = list(initial_pending)
+
+    while cut_round < 100:
         elapsed = time.monotonic() - start_time
         remaining_for_cuts = cut_time_budget - elapsed
         if remaining_for_cuts <= 0:
             break
+
+        if pending_expand:
+            expand_component = pending_expand.pop(0)
+            expand_base = set(best_connected) if best_connected is not None else set(forced_set)
+            _set_expand_hint(expand_base | expand_component)
+            if log:
+                print(
+                    f"  [cut-pass] round {cut_round}: expand attempt, "
+                    f"smallest pending component size={len(expand_component)}, "
+                    f"{len(pending_expand)} more pending",
+                    flush=True,
+                )
 
         solver = cp_model.CpSolver()
         solver.parameters.num_search_workers = max(1, int(workers))
@@ -1777,6 +1834,12 @@ def solve_one_asu_cpsat(
                 if best_obj > lower_bound:
                     model.Add(obj_expr >= best_obj)
                     lower_bound = best_obj
+            if log:
+                print(
+                    f"  [cut-pass] round {cut_round}: CONNECTED, unemp={objective} "
+                    f"(best so far={best_obj}), elapsed={time.monotonic() - start_time:.1f}s",
+                    flush=True,
+                )
             if status == cp_model.OPTIMAL and not deterministic_ties:
                 return _to_orig(selected, "OPTIMAL")
             break
@@ -1804,6 +1867,18 @@ def solve_one_asu_cpsat(
             stall_rounds = 0
         prev_num_components = len(components)
 
+        # Try the smallest disconnected component first next round -- cheapest
+        # to absorb, and most likely for a CP-SAT-guided swap to succeed.
+        pending_expand = sorted(components, key=_component_key)
+        if log:
+            best_text = str(best_obj) if best_obj >= 0 else "none"
+            print(
+                f"  [cut-pass] round {cut_round}: DISCONNECTED "
+                f"({len(components)} component(s) cut), best_connected so far={best_text}, "
+                f"elapsed={time.monotonic() - start_time:.1f}s",
+                flush=True,
+            )
+
         for component in components:
             boundary = sorted({
                 w for v in component for w in nb_local[v]
@@ -1818,11 +1893,33 @@ def solve_one_asu_cpsat(
                 for v in component:
                     model.Add(x[v] == 0)
         cut_round += 1
-        if stall_rounds >= 3:
+        if stall_rounds >= 5:
             break
 
-    # Finish with exact connectivity, strengthened by the cuts.
-    flow_source = best_connected
+    # The cut-pass phase was deliberately left unfloored to explore smaller
+    # candidates; now apply the known-good hint as a floor for the exact flow
+    # phase so the final committed answer never regresses below it.
+    if defer_hint_floor and hint_obj is not None and hint_obj > 0 and hint_obj > lower_bound:
+        model.Add(obj_expr >= hint_obj)
+        lower_bound = hint_obj
+
+    # Finish with exact connectivity, strengthened by the cuts. Fall back to
+    # the full hint for the flow phase's own warm-start if cut-pass never
+    # reached a connected candidate of its own.
+    flow_source = best_connected if best_connected is not None else (
+        sorted(hint) if hint and component_ok(
+            hint, u_g, E_g, P_g, tau, pop_thresh, nb_local
+        ) else None
+    )
+    # Cut-pass rounds repeatedly overwrite the model's variable hints with
+    # small, partial expand attempts (see _set_expand_hint); refresh x[] here
+    # so the flow phase starts from a hint consistent with flow_source rather
+    # than whatever tiny leftover component the last cut-pass round tried.
+    if flow_source is not None:
+        model.ClearHints()
+        flow_source_set = set(flow_source)
+        for i in range(N):
+            model.AddHint(x[i], 1 if i in flow_source_set else 0)
     flow_hints = (
         _spanning_tree_flows(flow_source, nb_local, root_local)
         if flow_source is not None else {}
@@ -2528,7 +2625,7 @@ def solve_one_asu_cpsat(
 
             # LNS settings
             params.lns_initial_difficulty = 0.3
-            params.lns_initial_deterministic_limit = .3
+            params.lns_initial_deterministic_limit = .5
             params.solution_pool_size = max(1, int(solution_pool_size))
             params.diversify_lns_params = True
 
@@ -4459,7 +4556,8 @@ def solve_connectivity_free_relaxation(
     time_limit: float = 10.0,
     workers: int = 8,
     objective_floor: Optional[int] = None,
-    max_candidates: int = 8,
+    max_candidates: int = 1,
+    log: bool = False,
 ) -> Optional[ConnectivityFreeResult]:
     """Maximize unemployment subject to ASU economics, ignoring connectivity."""
     N = len(u_g)
@@ -4495,26 +4593,41 @@ def solve_connectivity_free_relaxation(
     solver.parameters.log_search_progress = False
 
     class _RelaxedIncumbentCollector(cp_model.CpSolverSolutionCallback):
-        def __init__(self) -> None:
+        def __init__(self, log_enabled: bool, start_time: float) -> None:
             super().__init__()
             self.archive: List[ConnectivityFreeCandidate] = []
             self.seen: set = set()
+            self._log = log_enabled
+            self._start = start_time
+            self._last_print = 0.0
+            self._best = -1
 
         def on_solution_callback(self) -> None:
             selected_tuple = tuple(i for i in range(N) if self.BooleanValue(x[i]))
             if selected_tuple in self.seen:
                 return
             self.seen.add(selected_tuple)
+            obj = int(sum(int(u_g[i]) for i in selected_tuple))
             self.archive.append(ConnectivityFreeCandidate(
                 selected=list(selected_tuple),
-                objective=int(sum(int(u_g[i]) for i in selected_tuple)),
+                objective=obj,
             ))
             if len(self.archive) > 64:
                 discarded = self.archive.pop(0)
                 self.seen.discard(tuple(discarded.selected))
+            if self._log and obj > self._best:
+                now = time.monotonic()
+                if now - self._last_print >= 2.0:
+                    self._best = obj
+                    self._last_print = now
+                    print(
+                        f"    [connectivity-free] candidate unemp={obj}, "
+                        f"elapsed={now - self._start:.1f}s",
+                        flush=True,
+                    )
 
-    collector = _RelaxedIncumbentCollector()
     started = time.monotonic()
+    collector = _RelaxedIncumbentCollector(log, started)
     status = solver.Solve(model, collector)
     elapsed = time.monotonic() - started
     status_name = solver.StatusName(status)
@@ -4730,6 +4843,337 @@ def repair_connectivity_free_selection(
     return sorted(best)
 
 
+def solve_asu_graph_cut_only(
+    nb_local: List[List[int]],
+    u_g: np.ndarray,
+    E_g: np.ndarray,
+    P_g: np.ndarray,
+    tau: float,
+    pop_thresh: int,
+    root_local: int,
+    time_limit: float,
+    workers: int = 8,
+    log: bool = True,
+    hint: Optional[Sequence[int]] = None,
+    forced_selected: Optional[Sequence[int]] = None,
+    max_nodes: Optional[int] = None,
+    objective_upper_bound: Optional[int] = None,
+    initial_connectivity_cuts: Optional[
+        Sequence[Tuple[Sequence[int], Sequence[int]]]
+    ] = None,
+    initial_components: Optional[Sequence[Sequence[int]]] = None,
+) -> Optional["CpsatResult"]:
+    """
+    Standalone ASU solver that enforces connectivity purely through iterative
+    lazy vertex-separator cuts -- no exact flow-based connectivity phase at
+    all. Unlike the cut pre-pass inside `solve_one_asu_cpsat`, there is no
+    round cap and no stall-based early exit: each round either adds boundary
+    cuts for whatever components are disconnected from the root, or (once a
+    connected candidate is found) tightens the objective floor to strictly
+    require a better one next round. The loop only stops when the model goes
+    INFEASIBLE (the current incumbent is then provably optimal) or when
+    `time_limit` is exhausted. Intended to be run against a connectivity-free
+    relaxation's selection/bound/cuts as a completely separate experiment from
+    the other warm-start and solve paths -- it does not touch or get called
+    by any of them.
+    """
+    N = len(nb_local)
+    if N == 0:
+        return None
+
+    nb_c, u_c, E_c, P_c, expand_c, node_map_c = contract_high_ur_nodes(nb_local, u_g, E_g, P_g, tau)
+    nb_local_orig, u_g_orig, root_local_orig = nb_local, u_g, root_local
+    nb_local, u_g, E_g, P_g = nb_c, u_c, E_c, P_c
+    N = len(nb_local)
+    root_local = int(node_map_c[root_local_orig])
+
+    def _to_orig(sel: Optional[List[int]], status: str) -> Optional["CpsatResult"]:
+        if not sel:
+            return None
+        orig = sorted({v for ri in sel for v in expand_c[ri]})
+        return CpsatResult(orig, root_local_orig, int(u_g_orig[orig].sum()), status)
+
+    forced_set = {int(node_map_c[int(v)]) for v in (forced_selected or [])}
+    forced_set.add(root_local)
+
+    # Seed round 0 with the caller's own smallest-first component ordering
+    # (from its "best fixed candidate") instead of letting the first free
+    # solve default to whatever biggest blob maximizes the objective.
+    initial_pending: List[set] = []
+    for component_orig in (initial_components or []):
+        component_c = {
+            int(node_map_c[int(v)]) for v in component_orig
+            if 0 <= int(v) < len(node_map_c)
+        } - forced_set
+        if component_c:
+            initial_pending.append(component_c)
+
+    def _component_key(component: set) -> Tuple[int, int]:
+        # Smallest tract count first; ties broken by smallest unemployment.
+        return (len(component), int(u_g[list(component)].sum()))
+
+    initial_pending.sort(key=_component_key)
+
+    hint_c: Optional[List[int]] = None
+    if hint is not None:
+        candidate_hint = sorted({
+            int(node_map_c[int(v)]) for v in hint if 0 <= int(v) < len(node_map_c)
+        })
+        if (
+            forced_set.issubset(candidate_hint)
+            and (max_nodes is None or len(candidate_hint) <= int(max_nodes))
+            and component_ok(candidate_hint, u_g, E_g, P_g, tau, pop_thresh, nb_local)
+        ):
+            hint_c = candidate_hint
+
+    model = cp_model.CpModel()
+    x = [model.NewBoolVar(f"x_{i}") for i in range(N)]
+    for i in forced_set:
+        model.Add(x[i] == 1)
+
+    for v in range(N):
+        if v == root_local:
+            continue
+        if nb_local[v]:
+            model.Add(x[v] <= sum(x[w] for w in nb_local[v]))
+        else:
+            model.Add(x[v] == 0)
+
+    seen_seeded_cuts: set = set()
+    for component_orig, boundary_orig in (initial_connectivity_cuts or []):
+        component_c = {
+            int(node_map_c[int(node)])
+            for node in component_orig
+            if 0 <= int(node) < len(node_map_c)
+        }
+        if not component_c or root_local in component_c:
+            continue
+        boundary_c = {
+            int(node_map_c[int(node)])
+            for node in boundary_orig
+            if 0 <= int(node) < len(node_map_c)
+        }
+        boundary_tuple = tuple(sorted(boundary_c))
+        for node in sorted(component_c):
+            if node in boundary_c:
+                continue
+            cut_key = (node, boundary_tuple)
+            if cut_key in seen_seeded_cuts:
+                continue
+            seen_seeded_cuts.add(cut_key)
+            if boundary_tuple:
+                model.AddBoolOr([x[node].Not()] + [x[boundary] for boundary in boundary_tuple])
+            else:
+                model.Add(x[node] == 0)
+
+    num, den = as_fraction_tau(tau)
+    pop_expr = sum(int(P_g[i]) * x[i] for i in range(N))
+    model.Add(pop_expr >= int(pop_thresh))
+    if max_nodes is not None:
+        size_c = [len(grp) for grp in expand_c]
+        model.Add(sum(size_c[i] * x[i] for i in range(N)) <= int(max_nodes))
+    lhs = sum(int(den) * int(u_g[i]) * x[i] for i in range(N)) \
+        - sum(int(num) * int(E_g[i]) * x[i] for i in range(N))
+    model.Add(lhs >= 0)
+
+    obj_expr = sum(int(u_g[i]) * x[i] for i in range(N))
+    model.Maximize(obj_expr)
+
+    if objective_upper_bound is not None:
+        model.Add(obj_expr <= int(objective_upper_bound))
+
+    if hint_c is not None:
+        hint_set = set(hint_c)
+        for i in range(N):
+            model.AddHint(x[i], 1 if i in hint_set else 0)
+
+    best_connected: Optional[List[int]] = hint_c
+    best_obj = int(u_g[best_connected].sum()) if best_connected else -1
+    if best_obj >= 0:
+        model.Add(obj_expr >= best_obj)
+
+    start_time = time.monotonic()
+    cut_round = 0
+    status_name = "FEASIBLE"
+    pending_expand: List[set] = initial_pending
+
+    def _set_expand_hint(nodes: set) -> None:
+        hint = model.Proto().solution_hint
+        hint.vars.clear()
+        hint.values.clear()
+        for i in range(N):
+            model.AddHint(x[i], 1 if i in nodes else 0)
+
+    class _GraphCutProgress(cp_model.CpSolverSolutionCallback):
+        def __init__(self, log_enabled: bool, round_no: int, start: float) -> None:
+            super().__init__()
+            self._log = log_enabled
+            self._round = round_no
+            self._start = start
+            self._last_print = 0.0
+            self._best = -1
+
+        def on_solution_callback(self) -> None:
+            if not self._log:
+                return
+            obj = int(round(self.ObjectiveValue()))
+            if obj <= self._best:
+                return
+            now = time.monotonic()
+            if now - self._last_print < 2.0:
+                return
+            self._best = obj
+            self._last_print = now
+            print(
+                f"    [graph-cut] round {self._round}: candidate unemp={obj}, "
+                f"elapsed={now - self._start:.1f}s",
+                flush=True,
+            )
+
+    while True:
+        remaining = float(time_limit) - (time.monotonic() - start_time)
+        if remaining <= 0:
+            break
+
+        if pending_expand:
+            # Nudge the search toward absorbing the smallest still-disconnected
+            # component -- a hint only, so tracts can still be swapped freely.
+            expand_component = pending_expand.pop(0)
+            expand_base = set(best_connected) if best_connected is not None else set(forced_set)
+            _set_expand_hint(expand_base | expand_component)
+            if log:
+                print(
+                    f"  [graph-cut] round {cut_round}: expand attempt, "
+                    f"smallest pending component size={len(expand_component)}, "
+                    f"{len(pending_expand)} more pending",
+                    flush=True,
+                )
+
+        solver = cp_model.CpSolver()
+        solver.parameters.num_search_workers = max(1, int(workers))
+        solver.parameters.max_time_in_seconds = remaining
+        solver.parameters.log_search_progress = False
+        solver.parameters.cp_model_presolve = True
+        solver.parameters.linearization_level = 2
+
+        progress = _GraphCutProgress(log, cut_round, start_time)
+        status = solver.Solve(model, progress)
+        if status == cp_model.INFEASIBLE:
+            # The last objective floor bump can't be beaten -- best_connected is optimal.
+            status_name = "OPTIMAL"
+            break
+        if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            break
+
+        selected = [i for i in range(N) if solver.BooleanValue(x[i])]
+        selected_set = set(selected)
+        root_component = {root_local}
+        stack = [root_local]
+        while stack:
+            v = stack.pop()
+            for w in nb_local[v]:
+                if w in selected_set and w not in root_component:
+                    root_component.add(w)
+                    stack.append(w)
+
+        if len(root_component) == len(selected):
+            best_connected = selected
+            best_obj = int(round(solver.ObjectiveValue()))
+            pending_expand = []
+            if log:
+                print(
+                    f"  [graph-cut] round {cut_round}: CONNECTED, unemp={best_obj}, "
+                    f"elapsed={time.monotonic() - start_time:.1f}s",
+                    flush=True,
+                )
+            if status == cp_model.OPTIMAL:
+                status_name = "OPTIMAL"
+                break
+            # Force next round to beat this incumbent or prove it's optimal.
+            model.Add(obj_expr >= best_obj + 1)
+            cut_round += 1
+            continue
+
+        unseen = selected_set - root_component
+
+        # A disconnected result can't be the answer, but its components can
+        # often be corridor-connected into a real (if suboptimal) feasible
+        # ASU right now -- reuse the same repair used elsewhere, and treat it
+        # like a connected round if it beats the current incumbent.
+        repair_fallback = best_connected if best_connected is not None else sorted(forced_set)
+        repaired = repair_connectivity_free_selection(
+            selected, repair_fallback, nb_local, u_g, E_g, P_g, tau, pop_thresh, root_local,
+            forced_selected=sorted(forced_set), max_nodes=max_nodes,
+        )
+        if component_ok(repaired, u_g, E_g, P_g, tau, pop_thresh, nb_local) and (
+            max_nodes is None or len(repaired) <= int(max_nodes)
+        ):
+            repaired_obj = int(u_g[repaired].sum())
+            if repaired_obj > best_obj:
+                best_connected = repaired
+                best_obj = repaired_obj
+                if log:
+                    print(
+                        f"  [graph-cut] round {cut_round}: repaired disconnected "
+                        f"candidate -> CONNECTED unemp={best_obj}, "
+                        f"elapsed={time.monotonic() - start_time:.1f}s",
+                        flush=True,
+                    )
+                model.Add(obj_expr >= best_obj + 1)
+
+        components: List[set] = []
+        while unseen:
+            seed = unseen.pop()
+            component = {seed}
+            stack = [seed]
+            while stack:
+                v = stack.pop()
+                for w in nb_local[v]:
+                    if w in unseen:
+                        unseen.remove(w)
+                        component.add(w)
+                        stack.append(w)
+            components.append(component)
+            boundary = sorted({
+                w for v in component for w in nb_local[v]
+                if w not in component
+            })
+            if boundary:
+                for v in component:
+                    model.AddBoolOr([x[v].Not()] + [x[w] for w in boundary])
+            else:
+                for v in component:
+                    model.Add(x[v] == 0)
+        num_components = len(components)
+        # Try the smallest disconnected component first next round -- cheapest
+        # to absorb, and most likely for a CP-SAT-guided swap to succeed.
+        # Ties (equal tract count) break toward the smallest unemployment.
+        pending_expand = sorted(components, key=_component_key)
+        if log:
+            best_text = str(best_obj) if best_obj >= 0 else "none"
+            print(
+                f"  [graph-cut] round {cut_round}: DISCONNECTED "
+                f"({num_components} component(s) cut), best_connected so far={best_text}, "
+                f"elapsed={time.monotonic() - start_time:.1f}s",
+                flush=True,
+            )
+        cut_round += 1
+
+    if log:
+        elapsed = time.monotonic() - start_time
+        obj_text = str(best_obj) if best_obj >= 0 else "none"
+        print(
+            f"  graph-cut-only solve: {cut_round} round(s), {elapsed:.1f}s, "
+            f"status={status_name if best_connected is not None else 'INFEASIBLE'}, "
+            f"best unemp={obj_text}",
+            flush=True,
+        )
+
+    if best_connected is None:
+        return None
+    return _to_orig(best_connected, status_name)
+
+
 def _prepare_window_hint(
     nb_local: List[List[int]], u_g: np.ndarray, E_g: np.ndarray, P_g: np.ndarray,
     tau: float, pop_thresh: int, root_local: int, verbose: bool = False,
@@ -4738,6 +5182,8 @@ def _prepare_window_hint(
     connectivity_free_time_limit: float = 10.0,
     workers: int = 8,
     harvest_connectivity_free_asus: bool = False,
+    use_graph_cut_repair: bool = False,
+    graph_cut_repair_time_limit: float = 30.0,
 ) -> Dict:
     """
     Build a warm-start hint using reverse_prune on the original graph, then refine
@@ -4816,8 +5262,9 @@ def _prepare_window_hint(
     connectivity_free_repaired_objective: Optional[int] = None
     connectivity_free_proves_optimal = False
     connectivity_free_standalone_asus: List[List[int]] = []
+    best_fixed_components: List[List[int]] = []
 
-    if use_connectivity_free_repair or harvest_connectivity_free_asus:
+    if use_connectivity_free_repair or harvest_connectivity_free_asus or use_graph_cut_repair:
         objective_floor = None
         if (
             best["hint_valid"]
@@ -4837,6 +5284,7 @@ def _prepare_window_hint(
             time_limit=connectivity_free_time_limit,
             workers=workers,
             objective_floor=objective_floor,
+            log=verbose,
         )
         if relaxed is not None:
             connectivity_free_status = relaxed.status
@@ -4892,7 +5340,14 @@ def _prepare_window_hint(
                         den_cf * u_g.astype(np.int64)
                         - num_cf * E_g.astype(np.int64)
                     )
-                    for relaxed_candidate in relaxed_candidates:
+                    if verbose:
+                        print(
+                            f"  [heuristic] connectivity-free repair "
+                            f"({len(relaxed_candidates)} candidate(s)) ...",
+                            flush=True,
+                        )
+                    for cand_idx, relaxed_candidate in enumerate(relaxed_candidates):
+                        repair_started = time.monotonic()
                         repaired_candidate = repair_connectivity_free_selection(
                             relaxed_candidate.selected,
                             fallback,
@@ -4900,6 +5355,13 @@ def _prepare_window_hint(
                             forced_selected=root_component,
                             max_nodes=max_nodes,
                         )
+                        if verbose:
+                            print(
+                                f"    [connectivity-free-repair] candidate "
+                                f"{cand_idx + 1}/{len(relaxed_candidates)}: "
+                                f"{time.monotonic() - repair_started:.1f}s",
+                                flush=True,
+                            )
                         repaired_valid = component_ok(
                             repaired_candidate,
                             u_g,
@@ -4936,6 +5398,97 @@ def _prepare_window_hint(
                             "hint_obj_val": connectivity_free_repaired_objective,
                         }
                         hint_source = "connectivity_free_repair"
+
+                # Separate experiment: re-optimize via lazy vertex-separator
+                # cuts alone (no flow phase), seeded from this same relaxation.
+                # Independent of repair_connectivity_free_selection above --
+                # does not consume or alter its output. Always runs when
+                # requested, even if harvest_connectivity_free_asus carved off
+                # other independently-feasible components in this same window.
+                best_graph_cut: Optional[List[int]] = None
+                if use_graph_cut_repair:
+                    graph_cut_hint = (
+                        best_repaired if best_repaired is not None
+                        else (best["hint_improved"] if best["hint_valid"] else None)
+                    )
+
+                    # Pick the relaxed candidate ranked best by (fewest
+                    # components, highest unemp, largest smallest-component)
+                    # and seed round 0 with its own components, smallest
+                    # first, instead of letting the first free solve default
+                    # to one big blob.
+                    best_fixed_components: List[List[int]] = []
+                    if relaxed_candidates:
+                        ranked = []
+                        for candidate in relaxed_candidates:
+                            comps = _analyze_connectivity_free_components(
+                                candidate.selected, nb_local, u_g, E_g, P_g, tau,
+                                pop_thresh, root_local, include_connectors=False,
+                            )
+                            non_root_sizes = [
+                                len(c.nodes) for c in comps if not c.contains_root
+                            ]
+                            smallest_non_root = min(non_root_sizes) if non_root_sizes else 0
+                            rank = (len(comps), -candidate.objective, -smallest_non_root)
+                            ranked.append((rank, candidate, comps))
+                        best_rank, best_fixed_candidate, best_comps = min(
+                            ranked, key=lambda item: item[0]
+                        )
+                        best_fixed_components = [
+                            component.nodes for component in best_comps
+                            if not component.contains_root
+                        ]
+                        if verbose:
+                            print(
+                                f"  [heuristic] graph-cut best fixed candidate: "
+                                f"components={best_rank[0]}, "
+                                f"unemp={best_fixed_candidate.objective}, "
+                                f"smallest_component={-best_rank[2]}",
+                                flush=True,
+                            )
+
+                    if verbose:
+                        print(
+                            f"  [heuristic] graph-cut-only solve "
+                            f"({graph_cut_repair_time_limit:.1f}s) ...",
+                            flush=True,
+                        )
+                    graph_cut_result = solve_asu_graph_cut_only(
+                        nb_local, u_g, E_g, P_g, tau, pop_thresh, root_local,
+                        time_limit=graph_cut_repair_time_limit,
+                        workers=workers,
+                        log=verbose,
+                        hint=graph_cut_hint,
+                        forced_selected=root_component,
+                        max_nodes=max_nodes,
+                        objective_upper_bound=connectivity_free_upper_bound,
+                        initial_connectivity_cuts=connectivity_free_cuts,
+                        initial_components=best_fixed_components,
+                    )
+                    if graph_cut_result is not None:
+                        candidate = sorted(graph_cut_result.sel_idx_local)
+                        if component_ok(
+                            candidate, u_g, E_g, P_g, tau, pop_thresh, nb_local
+                        ) and (max_nodes is None or len(candidate) <= int(max_nodes)):
+                            best_graph_cut = candidate
+
+                if best_graph_cut is not None:
+                    num_gc, den_gc = as_fraction_tau(tau)
+                    slack_gc = (
+                        den_gc * u_g.astype(np.int64)
+                        - num_gc * E_g.astype(np.int64)
+                    )
+                    if (
+                        not best["hint_valid"]
+                        or _selection_key(set(best_graph_cut), u_g, slack_gc)
+                        > _selection_key(set(best["hint_improved"]), u_g, slack_gc)
+                    ):
+                        best = {
+                            "hint_improved": best_graph_cut,
+                            "hint_valid": True,
+                            "hint_obj_val": int(u_g[best_graph_cut].sum()),
+                        }
+                        hint_source = "graph_cut_repair"
 
             if verbose:
                 bound_text = (
@@ -5050,6 +5603,7 @@ def _prepare_window_hint(
         "connectivity_free_repaired_objective": connectivity_free_repaired_objective,
         "connectivity_free_proves_optimal": connectivity_free_proves_optimal,
         "connectivity_free_standalone_asus": connectivity_free_standalone_asus,
+        "best_fixed_components": best_fixed_components,
     }
 
 
@@ -5171,6 +5725,8 @@ def build_many_asus_cpsat(
     use_bridge_subtree_pruning: bool = False,
     use_connectivity_free_repair: bool = False,
     connectivity_free_time_limit: float = 10.0,
+    use_graph_cut_repair: bool = False,
+    graph_cut_repair_time_limit: float = 30.0,
     max_nodes_per_asu: Optional[int] = None,
     combine_capped_asus: bool = True,
     combine_time_limit: Optional[int] = None,
@@ -5410,6 +5966,8 @@ def build_many_asus_cpsat(
                 use_connectivity_free_repair=use_connectivity_free_repair,
                 connectivity_free_time_limit=connectivity_free_time_limit,
                 harvest_connectivity_free_asus=harvest_connectivity_free_asus,
+                use_graph_cut_repair=use_graph_cut_repair,
+                graph_cut_repair_time_limit=graph_cut_repair_time_limit,
                 workers=max(1, int(workers) // len(windows)),
             )
             w.update(info)
@@ -5881,6 +6439,7 @@ def build_many_asus_cpsat(
                 hint=hint_local, hint_obj=hint_obj_local,
                 objective_upper_bound=w.get("connectivity_free_upper_bound"),
                 initial_connectivity_cuts=w.get("connectivity_free_cuts"),
+                initial_components=w.get("best_fixed_components"),
                 forced_selected=w["root_component"],
                 deterministic_ties=deterministic_ties,
                 tie_break_rank=w["tie_break_rank"],
@@ -6649,6 +7208,21 @@ def main():
         help="Time limit in seconds for the connectivity-free hint relaxation",
     )
     ap.add_argument(
+        "--use-graph-cut-repair",
+        action="store_true",
+        help=(
+            "Re-optimize the connectivity-free relaxation using lazy "
+            "vertex-separator cuts only (no flow phase, no round cap); "
+            "independent of --use-connectivity-free-repair"
+        ),
+    )
+    ap.add_argument(
+        "--graph-cut-repair-time-limit",
+        type=float,
+        default=30.0,
+        help="Time limit in seconds for the graph-cut-only re-optimization",
+    )
+    ap.add_argument(
         "--harvest-connectivity-free-asus",
         action="store_true",
         help=(
@@ -6736,6 +7310,11 @@ def main():
     if "geoid" in df.columns:
         df["geoid"] = df["geoid"].astype(str).str.replace(r"^14000US", "", regex=True)
 
+    # Newer extracts rename the population column for the vintage year (e.g.
+    # tract_pop2025); accept it as a drop-in for tract_pop2024.
+    if "tract_pop2024" not in df.columns and "tract_pop2025" in df.columns:
+        df = df.rename(columns={"tract_pop2025": "tract_pop2024"})
+
     required = ["tract_ASU_unemp", "tract_ASU_emp", "tract_pop2024"]
     for col in required:
         if col not in df.columns:
@@ -6801,6 +7380,8 @@ def main():
         use_bridge_subtree_pruning=args.use_bridge_subtree_pruning,
         use_connectivity_free_repair=args.use_connectivity_free_repair,
         connectivity_free_time_limit=args.connectivity_free_time_limit,
+        use_graph_cut_repair=args.use_graph_cut_repair,
+        graph_cut_repair_time_limit=args.graph_cut_repair_time_limit,
         harvest_connectivity_free_asus=args.harvest_connectivity_free_asus,
         standalone_expansion_time_limit=args.standalone_expansion_time_limit,
         final_asu_polish_time_limit=args.final_asu_polish_time_limit,
