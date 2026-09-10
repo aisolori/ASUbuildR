@@ -1195,7 +1195,7 @@ kwargs = dict(
     tau=%s, pop_thresh=%d, max_asus=%d,
     time_limit=%d, workers=%d, parallel_asus=%d, verbose=True,
     configure_subsolvers=True,
-    use_signed_flow=True,
+    use_signed_flow=False,
     use_arborescence=False,
     use_root_articulation_implications=True,
     use_tract_first_search=False,

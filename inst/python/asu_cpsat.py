@@ -1037,26 +1037,27 @@ def _asu_flow_capacity_hybrid_groups(
 _ASU_FULL_SUBSOLVER_PATTERN = (
     "portfolio_max_lp",
     "portfolio_max_lp",
-    "asu_probe_fast",
-    "asu_probe_standard",
-    "lb_tree_search",
-    "quick_restart",
-
-    "asu_probe_deep",
+    "portfolio_no_lp",
     "asu_probe_mega_deep",
+    "lb_tree_search",
+    
+    "probing_no_lp",
     "quick_restart_no_lp",
-    "default_lp",
+    "quick_restart",
+    "asu_probe_deep",
+    "no_lp",
+    
     "pseudo_costs",
     "reduced_costs",
     "core_max_lp",
-
-    "core",
-    "asu_probe_very_deep",
     "variables_shaving",
     "variables_shaving_no_lp",
+    
     "variables_shaving_max_lp",
     "objective_lb_search_max_lp", 
-    "objective_lb_search_no_lp"
+    "objective_lb_search_no_lp",
+    "variables_shaving_no_lp",
+    "max_lp",
 
 )
 def _asu_full_subsolvers(
@@ -1072,7 +1073,7 @@ def _asu_full_subsolvers(
     if workers < 6:
         return []
 
-    full_budget = max(6, min(18, round(workers *.3)))
+    full_budget = max(6, min(20, round(workers *.5)))
     full_subsolvers: List[str] = list(_ASU_FULL_SUBSOLVER_PATTERN[:full_budget])
     custom_modes = [
         bool(use_tract_first_search),
@@ -1179,7 +1180,7 @@ def _configure_asu_probe_variants(
         # gap_integral 9339.88 vs 9485.54). Kept at the CP-SAT default.
         "probing_num_combinations_limit": 20_000,
 
-        #"linearization_level": 2,
+        #"linearization_level": 0,
         "add_lp_constraints_lazily": False,
         "max_cut_rounds_at_level_zero": 4,
     }
