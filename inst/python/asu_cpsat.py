@@ -1050,12 +1050,13 @@ _ASU_FULL_SUBSOLVER_PATTERN = (
     "reduced_costs",
     "core_max_lp",
 
-
     "core",
     "asu_probe_very_deep",
     "variables_shaving",
     "variables_shaving_no_lp",
     "variables_shaving_max_lp",
+    "objective_lb_search_max_lp", 
+    "objective_lb_search_no_lp"
 
 )
 def _asu_full_subsolvers(
@@ -1071,7 +1072,7 @@ def _asu_full_subsolvers(
     if workers < 6:
         return []
 
-    full_budget = max(6, min(16, round(workers *.3)))
+    full_budget = max(6, min(18, round(workers *.3)))
     full_subsolvers: List[str] = list(_ASU_FULL_SUBSOLVER_PATTERN[:full_budget])
     custom_modes = [
         bool(use_tract_first_search),
@@ -7939,6 +7940,170 @@ def build_many_asus_cpsat(
                     "transitive touching group(s); rerunning final polish",
                     flush=True,
                 )
+
+    # ---- Single-ASU full-visibility takeover pass ----
+    # After polish/merge settles, let the single biggest (by unemployment
+    # captured) committed ASU re-solve against every tract in the state --
+    # including tracts already claimed by OTHER ASUs, not just unassigned
+    # ones. Any donor ASU that loses tracts is re-checked with component_ok;
+    # one that no longer holds up (disconnected / below tau or pop_thresh) is
+    # dropped entirely (all its tracts, not just the taken ones, become
+    # unassigned) rather than repaired. The whole takeover is accepted only
+    # if it strictly increases total unemployment captured across all
+    # surviving ASUs; otherwise every assignment is left untouched.
+    if polish_time_limit > 0 and not _stop_requested(stop_flag_path):
+        committed_ids_takeover = np.unique(asu_id[asu_id > 0]).astype(int).tolist()
+        if committed_ids_takeover:
+            big_asu_id = max(
+                committed_ids_takeover,
+                key=lambda asu_number: (
+                    int(u[np.where(asu_id == asu_number)[0]].sum()),
+                    asu_number,
+                ),
+            )
+            current_global = np.where(asu_id == big_asu_id)[0].astype(int).tolist()
+            total_before = int(u[np.where(asu_id > 0)[0]].sum())
+            if component_ok(current_global, u, E, P, tau, pop_thresh, nb):
+                current_objective = int(u[current_global].sum())
+                root_local = max(
+                    current_global,
+                    key=lambda node: (
+                        u[node] / max(u[node] + E[node], 1e-12),
+                        P[node],
+                        -node,
+                    ),
+                )
+                if "geoid" in df.columns:
+                    stable_values = [str(g) for g in df["geoid"].tolist()]
+                else:
+                    stable_values = [str(node).zfill(12) for node in range(n)]
+                stable_order = sorted(
+                    range(n), key=lambda node: (stable_values[node], node)
+                )
+                takeover_tie_rank = [0] * n
+                for rank, node in enumerate(stable_order):
+                    takeover_tie_rank[node] = rank
+
+                if verbose:
+                    print(
+                        f"\n[SINGLE-ASU TAKEOVER] ASU {big_asu_id} "
+                        f"(unemp={current_objective}, tracts={len(current_global)}) "
+                        f"now sees all {n} tracts ({polish_time_limit:.1f}s)",
+                        flush=True,
+                    )
+
+                result = solve_one_asu_cpsat(
+                    nb_local=nb,
+                    u_g=u,
+                    E_g=E,
+                    P_g=P,
+                    tau=tau,
+                    pop_thresh=pop_thresh,
+                    root_local=root_local,
+                    time_limit=polish_time_limit,
+                    workers=workers,
+                    rel_gap=rel_gap,
+                    log=verbose,
+                    hint=current_global,
+                    hint_obj=current_objective,
+                    deterministic_ties=deterministic_ties,
+                    tie_break_rank=takeover_tie_rank,
+                    objective_shaving=objective_shaving,
+                    use_root_articulation_implications=use_root_articulation_implications,
+                    use_signed_flow=use_signed_flow,
+                    use_arborescence=use_arborescence,
+                    configure_subsolvers=configure_subsolvers,
+                    use_tract_first_search=use_tract_first_search,
+                    use_flow_first_search=use_flow_first_search,
+                    use_tract_capacity_search=use_tract_capacity_search,
+                    use_flow_capacity_hybrid_search=use_flow_capacity_hybrid_search,
+                    incumbent_stall_seconds=incumbent_stall_seconds,
+                    use_flow_count_envelope=use_flow_count_envelope,
+                    use_small_root_separators=use_small_root_separators,
+                    root_separator_max_size=root_separator_max_size,
+                    root_separator_clause_limit=root_separator_clause_limit,
+                    root_separator_target_limit=root_separator_target_limit,
+                    use_separator_cardinality_bounds=use_separator_cardinality_bounds,
+                    solution_pool_size=solution_pool_size,
+                    use_bridge_edge_bounds=use_bridge_edge_bounds,
+                    use_articulation_edge_bounds=use_articulation_edge_bounds,
+                    use_distance_flow_bounds=use_distance_flow_bounds,
+                    use_global_capacity_cardinality_bound=use_global_capacity_cardinality_bound,
+                    use_bridge_subtree_pruning=use_bridge_subtree_pruning,
+                    max_nodes=None,
+                    stop_flag_path=stop_flag_path,
+                    skip_flag_path=skip_flag_path,
+                )
+
+                if result is None:
+                    if verbose:
+                        print(
+                            "  [SINGLE-ASU TAKEOVER] no replacement found",
+                            flush=True,
+                        )
+                else:
+                    new_global = sorted(set(int(i) for i in result.sel_idx_local))
+                    new_objective = int(u[new_global].sum())
+                    if new_objective >= current_objective and component_ok(
+                        new_global, u, E, P, tau, pop_thresh, nb
+                    ):
+                        new_set = set(new_global)
+                        current_set = set(current_global)
+                        added = new_set - current_set
+
+                        donor_ids = sorted(
+                            {
+                                int(asu_id[node])
+                                for node in added
+                                if asu_id[node] > 0 and asu_id[node] != big_asu_id
+                            }
+                        )
+
+                        trial_asu_id = asu_id.copy()
+                        trial_asu_id[list(current_set)] = -1
+                        dropped_donor_ids: List[int] = []
+                        for donor_id in donor_ids:
+                            donor_global = np.where(asu_id == donor_id)[0].astype(int).tolist()
+                            donor_remaining = sorted(set(donor_global) - added)
+                            trial_asu_id[donor_global] = -1
+                            if donor_remaining and component_ok(
+                                donor_remaining, u, E, P, tau, pop_thresh, nb
+                            ):
+                                trial_asu_id[donor_remaining] = donor_id
+                            else:
+                                dropped_donor_ids.append(donor_id)
+                        trial_asu_id[new_global] = big_asu_id
+
+                        total_after = int(u[np.where(trial_asu_id > 0)[0]].sum())
+                        if total_after > total_before:
+                            asu_id = trial_asu_id
+                            remaining = asu_id < 0
+                            if verbose:
+                                print(
+                                    f"  [OK] SINGLE-ASU TAKEOVER accepted: ASU "
+                                    f"{big_asu_id} tracts={len(new_global)} "
+                                    f"(+{len(added)}), unemp={new_objective}, "
+                                    f"total unemployment {total_before} -> "
+                                    f"{total_after}"
+                                    + (
+                                        f"; dropped donor ASU(s): {dropped_donor_ids}"
+                                        if dropped_donor_ids else ""
+                                    ),
+                                    flush=True,
+                                )
+                        elif verbose:
+                            print(
+                                "  [SINGLE-ASU TAKEOVER] rejected: total "
+                                f"unemployment would not increase "
+                                f"({total_before} -> {total_after})",
+                                flush=True,
+                            )
+                    elif verbose:
+                        print(
+                            "  [SINGLE-ASU TAKEOVER] rejected: invalid or "
+                            "non-improving replacement for the biggest ASU",
+                            flush=True,
+                        )
 
     n_asu_final = int(np.unique(asu_id[asu_id > 0]).size)
 

@@ -1221,7 +1221,7 @@ kwargs = dict(
     use_graph_cut_repair=True,
     graph_cut_repair_time_limit=300,
     standalone_expansion_time_limit=1800,
-    incumbent_stall_seconds=600,
+    incumbent_stall_seconds=300,
     stop_flag_path=r'%s',
     skip_flag_path=r'%s'
 )
