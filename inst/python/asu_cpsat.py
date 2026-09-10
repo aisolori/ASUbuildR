@@ -119,9 +119,8 @@ def _partition_standalone_expansion_territories(
     """Assign reachable allowed tracts to the nearest standalone ASU seed.
 
     Ties (equal graph distance to two or more seeds) go to the unit with the
-    least unemployment already captured in its own seed, so a tract on the
-    boundary between two standalone ASUs helps grow the weaker one first;
-    `unit_index` is only the final, fully-deterministic tiebreaker.
+    most unemployment already captured in its own seed; `unit_index` is only
+    the final, fully-deterministic tiebreaker.
     """
     n = len(nb)
     allowed_mask = np.asarray(allowed, dtype=bool)
@@ -131,7 +130,8 @@ def _partition_standalone_expansion_territories(
     if u is None:
         unit_priority = [0] * len(standalone_units)
     else:
-        unit_priority = [int(u[np.array(nodes, dtype=int)].sum()) for nodes in standalone_units]
+        # Negated so a lower tuple value (min-heap win) means more unemployment.
+        unit_priority = [-int(u[np.array(nodes, dtype=int)].sum()) for nodes in standalone_units]
 
     owner = np.full(n, -1, dtype=int)
     distance = np.full(n, np.iinfo(np.int32).max, dtype=np.int64)
