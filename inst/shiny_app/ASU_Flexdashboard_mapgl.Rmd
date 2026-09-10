@@ -1218,6 +1218,7 @@ kwargs = dict(
     use_connectivity_free_repair=True,
     connectivity_free_time_limit=60.0,
     harvest_connectivity_free_asus=True,
+    harvest_all_connectivity_free_components=True,
     use_graph_cut_repair=True,
     graph_cut_repair_time_limit=300,
     standalone_expansion_time_limit=1800,

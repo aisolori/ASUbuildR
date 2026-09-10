@@ -33,6 +33,7 @@ build_asu(
   use_connectivity_free_repair = FALSE,
   connectivity_free_time_limit = 10,
   harvest_connectivity_free_asus = FALSE,
+  harvest_all_connectivity_free_components = FALSE,
   standalone_expansion_time_limit = 30,
   use_buffer_asu_merge = FALSE,
   buffer_asu_merge_time_limit = NA_real_,
@@ -41,9 +42,6 @@ build_asu(
   exact_nodes_per_asu = NA_integer_,
   combine_capped_asus = TRUE,
   combine_time_limit = NA_integer_,
-  use_capacity_sweep = FALSE,
-  capacity_sweep_time_limit = 30,
-  incumbent_stall_seconds = NA_real_,
   verbose = interactive(),
   parallel_asus = 1L,
   use_flow_first_search = FALSE,
@@ -159,6 +157,14 @@ relaxation in each ASU window}
 component that independently meets the population and UR requirements as a
 separate ASU, instead of connecting all valid components to one root}
 
+\item{harvest_all_connectivity_free_components}{logical; when
+\code{harvest_connectivity_free_asus} is TRUE, seed the territory
+partition/expansion step with every relaxed component instead of only the
+ones already independently valid. Expanded units that still fail
+population/UR/connectivity are released rather than committed, so
+correctness is unaffected, but this is unproven for real-data solve speed
+(default FALSE)}
+
 \item{standalone_expansion_time_limit}{seconds allowed for each exact CP-SAT
 expansion of a standalone relaxed component within its assigned disjoint
 territory. The current ASU is a hint and objective floor, so tracts may be
@@ -212,23 +218,6 @@ re-solve after the main build loop finishes. Ignored if
 \item{combine_time_limit}{optional seconds; CP-SAT time limit used
 specifically for the uncapped combine/re-solve pass (\code{NA_integer_} uses
 \code{time_limit}, the default)}
-
-\item{use_capacity_sweep}{logical; after the main loop and combine phase,
-repeatedly seed a brand-new standalone ASU from the remaining tract with
-the highest UR-surplus, building its window strictly from other
-remaining tracts (never touching already-committed ASUs), until no
-remaining tract has positive surplus left. Salvages leftover tracts that
-the main loop's own seed selection can never reach on its own (e.g. an
-isolated tract that already meets the UR/population thresholds by
-itself but has no remaining neighbor)}
-
-\item{capacity_sweep_time_limit}{seconds allowed for each standalone CP-SAT
-solve during the capacity sweep pass}
-
-\item{incumbent_stall_seconds}{optional seconds; finish each CP-SAT solve
-early, keeping its current incumbent, once this many seconds pass with
-no incumbent improvement. \code{NA_real_} (the default) disables this
-early-finish check}
 
 \item{verbose}{logical; print CP-SAT logs}
 

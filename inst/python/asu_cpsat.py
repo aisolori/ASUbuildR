@@ -39,7 +39,7 @@ import threading
 import time
 from dataclasses import dataclass
 from fractions import Fraction
-from typing import List, Optional, Dict, Sequence, Tuple
+from typing import List, Optional, Dict, Sequence, Tuple, Set
 
 import numpy as np
 import pandas as pd
@@ -1771,6 +1771,7 @@ def solve_one_asu_cpsat(
     use_global_capacity_cardinality_bound: bool = False,
     use_bridge_subtree_pruning: bool = False,
     max_nodes: Optional[int] = None,
+    exact_nodes: Optional[int] = None,
     stop_flag_path: Optional[str] = None,
     skip_flag_path: Optional[str] = None,
     objective_upper_bound: Optional[int] = None,
@@ -1794,6 +1795,12 @@ def solve_one_asu_cpsat(
     solution may select (`sum(x) <= max_nodes`), counted before UR-cluster
     contraction so it reflects real tract counts. Optional; `None` (default)
     leaves ASU size unconstrained.
+
+    `exact_nodes`, when given, replaces that cap with an equality constraint
+    (`sum(x) == exact_nodes`, same original-graph tract counting) and takes
+    precedence over `max_nodes` if both are set. Intended for experimenting
+    with whether fixing the selected tract count speeds up a single ASU solve;
+    infeasible if no valid ASU of exactly that size exists in this window.
 
     `objective_upper_bound` and `initial_connectivity_cuts` may be supplied by
     a connectivity-free solve over this same window. The former is valid because
@@ -2067,9 +2074,13 @@ def solve_one_asu_cpsat(
     pop_expr = sum(int(P_g[i]) * x[i] for i in range(N))
     model.Add(pop_expr >= int(pop_thresh))
 
-    # Optional hard cap on total selected tracts, counted in original-graph units
-    # (each contracted node may represent multiple original tracts).
-    if max_nodes is not None:
+    # Optional hard cap (or, with `exact_nodes`, exact target) on total selected
+    # tracts, counted in original-graph units (each contracted node may
+    # represent multiple original tracts).
+    if exact_nodes is not None:
+        size_c = [len(grp) for grp in expand_c]
+        model.Add(sum(size_c[i] * x[i] for i in range(N)) == int(exact_nodes))
+    elif max_nodes is not None:
         size_c = [len(grp) for grp in expand_c]
         model.Add(sum(size_c[i] * x[i] for i in range(N)) <= int(max_nodes))
 
@@ -5806,6 +5817,7 @@ def _prepare_window_hint(
     connectivity_free_time_limit: float = 10.0,
     workers: int = 8,
     harvest_connectivity_free_asus: bool = False,
+    harvest_all_connectivity_free_components: bool = False,
     use_graph_cut_repair: bool = False,
     graph_cut_repair_time_limit: float = 30.0,
 ) -> Dict:
@@ -5815,6 +5827,13 @@ def _prepare_window_hint(
     Contraction is retained only to derive root_component and cluster_groups.
     `max_nodes`, when given, keeps the refined hint's greedy-add phase from
     growing past that many tracts (swaps still keep size constant).
+
+    `harvest_all_connectivity_free_components`, when True alongside
+    `harvest_connectivity_free_asus`, seeds the standalone-expansion territory
+    partition with every relaxed component, not only the ones that already
+    independently satisfy population/UR on their own -- see the caller for the
+    validity gate required before committing an expanded, previously-infeasible
+    seed as an ASU.
     """
     nb_r, u_r, E_r, P_r, expand_r, node_map_r = contract_high_ur_nodes(nb_local, u_g, E_g, P_g, tau)
     root_r = int(node_map_r[root_local])
@@ -5947,11 +5966,18 @@ def _prepare_window_hint(
                 ]
                 connectivity_free_candidate_count = len(relaxed_candidates)
                 if harvest_connectivity_free_asus:
+                    eligible_components = (
+                        connectivity_free_components
+                        if harvest_all_connectivity_free_components
+                        else [
+                            component for component in connectivity_free_components
+                            if component.independently_feasible
+                        ]
+                    )
                     connectivity_free_standalone_asus = [
                         component.nodes
-                        for component in connectivity_free_components
-                        if component.independently_feasible
-                        and (
+                        for component in eligible_components
+                        if (
                             max_nodes is None
                             or len(component.nodes) <= int(max_nodes)
                         )
@@ -6366,11 +6392,13 @@ def build_many_asus_cpsat(
     use_graph_cut_repair: bool = False,
     graph_cut_repair_time_limit: float = 30.0,
     max_nodes_per_asu: Optional[int] = None,
+    exact_nodes_per_asu: Optional[int] = None,
     combine_capped_asus: bool = True,
     combine_time_limit: Optional[int] = None,
     stop_flag_path: Optional[str] = None,
     skip_flag_path: Optional[str] = None,
     harvest_connectivity_free_asus: bool = False,
+    harvest_all_connectivity_free_components: bool = False,
     standalone_expansion_time_limit: float = 30.0,
     final_asu_polish_time_limit: Optional[float] = None,
     use_flow_first_search: bool = False,
@@ -6382,9 +6410,10 @@ def build_many_asus_cpsat(
 ) -> Dict[str, np.ndarray]:
     """
     Build ASUs in batches of up to `parallel_asus` disjoint candidate windows, solved
-    concurrently. The same limit caps concurrent standalone-component expansion
-    solves; `parallel_asus=1` runs every ASU solve sequentially. Two ASUs built in
-    the same batch that end up touching (share a
+    concurrently; `parallel_asus=1` runs every full-window ASU solve sequentially.
+    Concurrent standalone-component harvest-expansion solves are capped separately,
+    by component count and worker budget, independent of `parallel_asus`. Two ASUs
+    built in the same batch that end up touching (share a
     queen-contiguity edge) are merged into one: the mediant inequality guarantees
     that combining two groups whose UR is each >= tau keeps the combined UR >= tau
     (the combined ratio is a weighted average of the two, so it can't fall below
@@ -6433,6 +6462,29 @@ def build_many_asus_cpsat(
     reaches a finite merge/polish fixed point. The polish uses
     `final_asu_polish_time_limit` seconds per ASU, or the standalone expansion time
     limit when that option is `None`.
+
+    `exact_nodes_per_asu`, when given, fixes every per-ASU CP-SAT solve (the
+    main window solve and, if enabled, the standalone-expansion closure) to
+    select exactly that many original-graph tracts instead of leaving size
+    unconstrained or merely capped, as an experiment to see whether fixing the
+    tract count speeds up solves. It takes precedence over `max_nodes_per_asu`.
+    Because growing or merging an ASU afterward would break that exact-size
+    invariant, the touching-ASU combine phase, the final ASU polish pass, and
+    the capacity-sweep phase are all skipped entirely whenever
+    `exact_nodes_per_asu` is set; the uncapped-window rescue path is
+    unaffected, so a window that cannot hit the exact target still falls back
+    to an unconstrained solve rather than failing outright.
+
+    `harvest_all_connectivity_free_components`, when True alongside
+    `harvest_connectivity_free_asus`, seeds the territory partition/expansion
+    step above with *every* relaxed component, not only the ones that already
+    independently satisfy population/UR on their own. This trades a much
+    finer up-front graph partition (every relaxed island gets its own bounded
+    CP-SAT expansion window) for weaker seeds that may fail to expand into a
+    valid ASU; any expanded unit that does not pass the same population/UR/
+    connectivity check used everywhere else is not committed -- its tracts are
+    released back to the remaining pool for the normal ball-growing loop to
+    pick up instead. Ignored when `harvest_connectivity_free_asus` is False.
 
     `stop_flag_path`, when given, names a file that a running solve polls; once
     it exists, each in-flight window's CP-SAT solve halts via `stop_search()`
@@ -6505,6 +6557,14 @@ def build_many_asus_cpsat(
 
     batch_size = max(1, int(parallel_asus))
     k = 0
+    # `harvest_all_connectivity_free_components` seeds that fail territory
+    # expansion get their tracts released back to `remaining` so the normal
+    # ball-growing loop can retry them -- but since `remaining`/`tried` end up
+    # bit-for-bit identical to before the attempt, the *same* component would
+    # otherwise be re-harvested and re-fail forever with zero progress. Once a
+    # seed's tracts have been through a failed harvest+expand cycle, never
+    # re-admit that exact tract set as a standalone seed again this build.
+    poisoned_seeds: Set[Tuple[int, ...]] = set()
     while k < max_asus:
         if _stop_requested(stop_flag_path):
             if verbose:
@@ -6565,6 +6625,15 @@ def build_many_asus_cpsat(
                 break
             s = int(s)
             if tried[s] or reserved[s] or not remaining[s]:
+                continue
+            if not comp_qualifies[comp_id[s]]:
+                # s's entire graph-reachable component (within `remaining`) can't
+                # hit tau/pop_thresh even taken as a whole -- no window rooted
+                # here can ever succeed, so skip before paying for a (possibly
+                # full-graph-sized) window build, harvest, or CP-SAT solve.
+                tried[s] = True
+                if verbose:
+                    print(f"  [seed={s}] skip: own component cannot reach tau/pop_thresh", flush=True)
                 continue
             allowed_idx = np.where(remaining & ~reserved)[0]
             if allowed_idx.size == 0:
@@ -6666,6 +6735,7 @@ def build_many_asus_cpsat(
                 use_connectivity_free_repair=use_connectivity_free_repair,
                 connectivity_free_time_limit=connectivity_free_time_limit,
                 harvest_connectivity_free_asus=harvest_connectivity_free_asus,
+                harvest_all_connectivity_free_components=harvest_all_connectivity_free_components,
                 use_graph_cut_repair=use_graph_cut_repair,
                 graph_cut_repair_time_limit=graph_cut_repair_time_limit,
                 workers=max(1, int(workers) // len(windows)),
@@ -6696,7 +6766,14 @@ def build_many_asus_cpsat(
                         np.array(component_local, dtype=int)
                     ].tolist()
                 )
-                if not component_ok(
+                # In the classic (independently-feasible-only) mode this check
+                # never fails -- it's already guaranteed by the caller's filter.
+                # In `harvest_all_connectivity_free_components` mode most raw
+                # components legitimately fail it (that's the point: they still
+                # get a shot at the territory-expansion step below), so it must
+                # NOT gate seed admission there; the expanded result is instead
+                # validated before commit, further down.
+                if not harvest_all_connectivity_free_components and not component_ok(
                     component_global, u, E, P, tau, pop_thresh, nb
                 ):
                     continue
@@ -6704,6 +6781,8 @@ def build_many_asus_cpsat(
                     max_nodes_per_asu is not None
                     and len(component_global) > max_nodes_per_asu
                 ):
+                    continue
+                if tuple(component_global) in poisoned_seeds:
                     continue
                 standalone_units.append(component_global)
 
@@ -6732,9 +6811,13 @@ def build_many_asus_cpsat(
                     territory_sources, nb, remaining, u=u
                 )
                 territories = all_territories[:len(round_seeds)]
+                # Disjoint-territory harvest solves are independent of
+                # `parallel_asus`/`batch_size` (that knob limits concurrent
+                # *full* ASU windows, a much heavier workload) -- cap only by
+                # how many components there are and total worker budget, or
+                # this silently serializes harvesting whenever parallel_asus=1.
                 expansion_parallelism = min(
                     len(round_seeds),
-                    batch_size,
                     max(1, int(workers)),
                 )
                 expansion_workers = max(
@@ -6862,6 +6945,7 @@ def build_many_asus_cpsat(
                         use_global_capacity_cardinality_bound=use_global_capacity_cardinality_bound,
                         use_bridge_subtree_pruning=use_bridge_subtree_pruning,
                         max_nodes=max_nodes_per_asu,
+                        exact_nodes=exact_nodes_per_asu,
                         stop_flag_path=stop_flag_path,
                         skip_flag_path=skip_flag_path,
                     )
@@ -6948,9 +7032,33 @@ def build_many_asus_cpsat(
                     )
                 active_units = merged_units
 
+            committed_any = False
             for seed_nodes, nodes, status in zip(
                 commit_seeds, active_units, final_statuses
             ):
+                # Only ever fails in `harvest_all_connectivity_free_components`
+                # mode: a weak seed (independently infeasible) whose territory
+                # expansion still could not reach population/UR/connectivity.
+                # Release its tracts instead of committing a broken ASU; the
+                # normal ball-growing loop gets another shot at them below --
+                # but only if this harvest round is falling through (see the
+                # `committed_any` check after this loop): if every unit here
+                # is skipped, `continue`-ing the outer loop would just re-derive
+                # the identical stuck window (same top remaining seed, same
+                # weak islands) forever without ever trying the real solve.
+                if not component_ok(nodes, u, E, P, tau, pop_thresh, nb):
+                    remaining[nodes] = True
+                    tried[nodes] = False
+                    poisoned_seeds.add(tuple(sorted(seed_nodes)))
+                    if verbose:
+                        print(
+                            f"  [SKIP] weak seed (seed={len(seed_nodes)} tract(s)) "
+                            f"could not expand into a valid ASU (status={status}); "
+                            "tracts released back to remaining pool",
+                            flush=True,
+                        )
+                    continue
+                committed_any = True
                 k += 1
                 asu_id[nodes] = k
                 remaining[nodes] = False
@@ -6972,7 +7080,14 @@ def build_many_asus_cpsat(
                         f"status={status}",
                         flush=True,
                     )
-            continue
+            # If nothing was committed this round, every harvested unit was a
+            # dead end and the remaining pool is unchanged -- fall through to
+            # the normal per-window CP-SAT solve below instead of restarting
+            # the outer loop, which would just rebuild this identical window
+            # (same top remaining seed under full_graph_window) and re-harvest
+            # the same doomed islands again, looping forever.
+            if committed_any:
+                continue
 
         # Under a per-ASU cap, a window can fail for structural reasons that are
         # a property of the (unchanged) remaining graph, not of which seed
@@ -7112,6 +7227,12 @@ def build_many_asus_cpsat(
                 and len(hint_local) > max_nodes_per_asu
             ):
                 hint_local, hint_obj_local = None, None
+            if (
+                exact_nodes_per_asu is not None
+                and hint_local is not None
+                and len(hint_local) != exact_nodes_per_asu
+            ):
+                hint_local, hint_obj_local = None, None
             if w.get("connectivity_free_infeasible", False):
                 if verbose:
                     print(
@@ -7172,6 +7293,7 @@ def build_many_asus_cpsat(
                 use_global_capacity_cardinality_bound=use_global_capacity_cardinality_bound,
                 use_bridge_subtree_pruning=use_bridge_subtree_pruning,
                 max_nodes=max_nodes_per_asu,
+                exact_nodes=exact_nodes_per_asu,
                 stop_flag_path=stop_flag_path,
                 skip_flag_path=skip_flag_path,
                 # cluster_groups intentionally NOT passed here: tying high-UR
@@ -7192,6 +7314,7 @@ def build_many_asus_cpsat(
 
         # ---- Refine each window's result within its own reserved territory ----
         candidates: List[List[int]] = []
+        stop_no_progress = False
         for w, sol in zip(windows, sols):
             if sol is None:
                 fallback_ok = w["hint_valid"] and (
@@ -7213,6 +7336,22 @@ def build_many_asus_cpsat(
                               f"solving this ASU uncapped instead", flush=True)
                     _commit_uncapped_window(w, "capped solve infeasible")
                     continue
+                elif full_graph_window:
+                    # Under full_graph_window every remaining seed shares this
+                    # exact same window (nb_local/u_g/E_g/P_g unchanged), so
+                    # marking just this seed tried and looping back to try the
+                    # next-highest-UR seed would re-pay the full cut-pass +
+                    # exact-solve cost against an identical graph, only with a
+                    # different forced root -- with no cheap way to predict
+                    # which root (if any) would succeed. Stop instead of
+                    # exhaustively retrying every remaining high-UR tract.
+                    tried[w["seed"]] = True
+                    if verbose:
+                        print(f"  [seed={w['seed']}] uncapped solve found no solution; "
+                              f"full_graph_window is on so further seeds would retry "
+                              f"the identical window -- stopping ASU creation.", flush=True)
+                    stop_no_progress = True
+                    continue
                 else:
                     tried[w["seed"]] = True
                     continue
@@ -7231,6 +7370,9 @@ def build_many_asus_cpsat(
             if not component_ok(S_refined, u, E, P, tau, pop_thresh, nb):
                 S_refined = S_global
             candidates.append(S_refined)
+
+        if stop_no_progress:
+            break
 
         if not candidates:
             continue
@@ -7309,11 +7451,16 @@ def build_many_asus_cpsat(
                 break
 
     # ---- Combine touching ASUs across batches, then expand again via CP-SAT ----
-    combine_capped = max_nodes_per_asu is not None and combine_capped_asus
+    combine_capped = (
+        max_nodes_per_asu is not None
+        and combine_capped_asus
+        and exact_nodes_per_asu is None
+    )
     combine_harvested = (
         harvest_connectivity_free_asus
         and merge_adjacent
         and max_nodes_per_asu is None
+        and exact_nodes_per_asu is None
     )
     if (combine_capped or combine_harvested) and k > 1:
         if combine_capped:
@@ -7507,7 +7654,7 @@ def build_many_asus_cpsat(
     # highest UR-surplus (q_i = den*u_i - num*E_i, the same exact-integer
     # quantity used for the UR constraint) as root each round, and stops once
     # no remaining tract has positive surplus left.
-    if use_capacity_sweep and k < max_asus and not _stop_requested(stop_flag_path):
+    if use_capacity_sweep and exact_nodes_per_asu is None and k < max_asus and not _stop_requested(stop_flag_path):
         q_surplus_all = den * u.astype(np.int64) - num * E.astype(np.int64)
         swept_tried = np.zeros(n, dtype=bool)
         sweep_round = 0
@@ -7674,6 +7821,7 @@ def build_many_asus_cpsat(
         harvest_connectivity_free_asus
         and polish_time_limit > 0
         and not _stop_requested(stop_flag_path)
+        and exact_nodes_per_asu is None
     )
     polish_max_nodes = None if combine_capped else max_nodes_per_asu
 
@@ -8295,6 +8443,16 @@ def main():
         ),
     )
     ap.add_argument(
+        "--harvest-all-connectivity-free-components",
+        action="store_true",
+        help=(
+            "With --harvest-connectivity-free-asus, seed the territory "
+            "partition/expansion step with every relaxed component, not only "
+            "the ones already independently valid; expanded units that still "
+            "fail population/UR/connectivity are released, not committed"
+        ),
+    )
+    ap.add_argument(
         "--standalone-expansion-time-limit",
         type=float,
         default=30.0,
@@ -8319,6 +8477,17 @@ def main():
         help=(
             "Optional hard cap on tracts per ASU during the main build loop; "
             "carves many small non-overlapping clusters instead of fewer large ones"
+        ),
+    )
+    ap.add_argument(
+        "--exact-nodes-per-asu",
+        type=int,
+        default=None,
+        help=(
+            "Fix every per-ASU CP-SAT solve to exactly this many tracts "
+            "instead of leaving size unconstrained or merely capped (takes "
+            "precedence over --max-nodes-per-asu); disables the combine, "
+            "final-polish, and capacity-sweep phases"
         ),
     )
     ap.add_argument(
@@ -8488,9 +8657,11 @@ def main():
         use_graph_cut_repair=args.use_graph_cut_repair,
         graph_cut_repair_time_limit=args.graph_cut_repair_time_limit,
         harvest_connectivity_free_asus=args.harvest_connectivity_free_asus,
+        harvest_all_connectivity_free_components=args.harvest_all_connectivity_free_components,
         standalone_expansion_time_limit=args.standalone_expansion_time_limit,
         final_asu_polish_time_limit=args.final_asu_polish_time_limit,
         max_nodes_per_asu=args.max_nodes_per_asu,
+        exact_nodes_per_asu=args.exact_nodes_per_asu,
         combine_capped_asus=not args.no_combine_capped_asus,
         combine_time_limit=args.combine_time_limit,
         use_capacity_sweep=args.use_capacity_sweep,
