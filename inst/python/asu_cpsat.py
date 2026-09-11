@@ -2414,7 +2414,7 @@ def solve_one_asu_cpsat(
         if len(targets) < _DYNAMIC_TARGETS_PER_COMPONENT:
             ranked = sorted(
                 component,
-                key=lambda node: (-int(u_g[node]), -int(q_surplus[node]), int(node)),
+                key=lambda node: (-int(q_surplus[node]),-int(u_g[node]), int(node)),
             )
             for node in ranked:
                 node_i = int(node)
@@ -8170,11 +8170,18 @@ def build_many_asus_cpsat(
                 )
             return True
 
-        sub = sorted(
-            set(current_global)
-            | set(np.where(remaining)[0].astype(int).tolist())
+        root_global = max(
+            current_global,
+            key=lambda node: (
+                u[node] / max(u[node] + E[node], 1e-12),
+                P[node],
+                -node,
+            ),
         )
-        if len(sub) == len(current_global):
+
+        current_set = set(current_global)
+        allowed_set = current_set | set(np.where(remaining)[0].astype(int).tolist())
+        if len(allowed_set) == len(current_set):
             if verbose:
                 print(
                     f"  [FINAL POLISH round={polish_round} "
@@ -8183,6 +8190,21 @@ def build_many_asus_cpsat(
                     flush=True,
                 )
             return True
+
+        # Restrict polish to tracts reachable from this ASU root.
+        reachable = {root_global}
+        queue = [root_global]
+        head = 0
+        while head < len(queue):
+            node = queue[head]
+            head += 1
+            for neighbor in nb[node]:
+                if neighbor in allowed_set and neighbor not in reachable:
+                    reachable.add(neighbor)
+                    queue.append(neighbor)
+
+        sub = sorted(reachable)
+        filtered_unreachable = len(allowed_set) - len(sub)
 
         local_index = {
             global_node: local_node
@@ -8200,14 +8222,7 @@ def build_many_asus_cpsat(
         current_local = sorted(
             local_index[node] for node in current_global
         )
-        root_local = max(
-            current_local,
-            key=lambda node: (
-                u_g[node] / max(u_g[node] + E_g[node], 1e-12),
-                P_g[node],
-                -node,
-            ),
-        )
+        root_local = int(local_index[root_global])
         if "geoid" in df.columns:
             stable_values = [
                 str(df.iloc[global_node]["geoid"])
@@ -8231,6 +8246,7 @@ def build_many_asus_cpsat(
                 f"{polish_position}/{polish_count}] >>> ASU {asu_number}: "
                 f"seed={len(current_global)}, window={len(sub)}, "
                 f"unassigned={len(sub) - len(current_global)}, "
+                f"filtered_unreachable={filtered_unreachable}, "
                 f"unemp_floor={current_objective}",
                 flush=True,
             )
@@ -8336,7 +8352,7 @@ def build_many_asus_cpsat(
             polish_ids = np.unique(asu_id[asu_id > 0]).astype(int).tolist()
             polish_ids.sort(
                 key=lambda asu_number: (
-                    -int(u[np.where(asu_id == asu_number)[0]].sum()),
+                    int(u[np.where(asu_id == asu_number)[0]].sum()),
                     asu_number,
                 )
             )
