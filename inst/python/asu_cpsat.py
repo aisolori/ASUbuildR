@@ -6641,8 +6641,8 @@ def _prepare_window_hint(
                 if use_graph_cut_repair and not run_graph_cut_repair and verbose:
                     print(
                         "  [heuristic] graph-cut-only solve skipped: "
-                        f"{len(connectivity_free_standalone_asus)} standalone ASU(s) "
-                        "already harvested",
+                        f"{len(connectivity_free_standalone_asus)} candidate seed(s) "
+                        "selected for harvest expansion",
                         flush=True,
                     )
                 if run_graph_cut_repair:
@@ -6759,7 +6759,7 @@ def _prepare_window_hint(
                     )
                     print(
                         f"      harvest: {len(connectivity_free_standalone_asus)} "
-                        f"independently valid ASU(s), unemp={standalone_unemployed}; "
+                        f"candidate seed(s), unemp={standalone_unemployed}; "
                         "corridor repair skipped",
                         flush=True,
                     )
@@ -7474,8 +7474,9 @@ def build_many_asus_cpsat(
             protected_units = standalone_units[slots:]
             if verbose:
                 print(
-                    f"\n[HARVEST] expanding {len(active_units)} independently valid "
-                    "relaxed component(s) in disjoint CP-SAT territories",
+                    f"\n[HARVEST] expanding {len(active_units)} candidate seed(s) "
+                    f"({sum(component_ok(nodes, u, E, P, tau, pop_thresh, nb) for nodes in active_units)} "
+                    "independently valid ASU(s)) in disjoint CP-SAT territories",
                     flush=True,
                 )
 
@@ -7519,6 +7520,9 @@ def build_many_asus_cpsat(
                 def _expand_standalone(unit_index: int) -> Tuple[List[int], str]:
                     seed_global = round_seeds[unit_index]
                     territory_global = territories[unit_index]
+                    seed_feasible = component_ok(
+                        seed_global, u, E, P, tau, pop_thresh, nb
+                    )
                     if (
                         float(standalone_expansion_time_limit) <= 0
                         or len(territory_global) <= len(seed_global)
@@ -7597,8 +7601,8 @@ def build_many_asus_cpsat(
                         workers=expansion_workers,
                         rel_gap=rel_gap,
                         log=verbose,
-                        hint=seed_local,
-                        hint_obj=seed_objective,
+                        hint=seed_local if seed_feasible else None,
+                        hint_obj=seed_objective if seed_feasible else None,
                         incumbent_report_callback=_incumbent_preview(
                             ("expansion", unit_index), territory_global, seed_local
                         ),
@@ -7633,15 +7637,14 @@ def build_many_asus_cpsat(
                         skip_flag_path=skip_flag_path,
                     )
                     if result is None:
-                        return seed_global, "SEED FALLBACK"
+                        return seed_global, "SEED FALLBACK: NO SOLUTION"
 
                     expanded_global = sorted(
                         territory_global[local_node]
                         for local_node in result.sel_idx_local
                     )
                     expanded_valid = (
-                        int(u[expanded_global].sum()) >= seed_objective
-                        and component_ok(
+                        component_ok(
                             expanded_global, u, E, P, tau, pop_thresh, nb
                         )
                         and (
@@ -7650,7 +7653,12 @@ def build_many_asus_cpsat(
                         )
                     )
                     if not expanded_valid:
-                        return seed_global, "SEED FALLBACK"
+                        return seed_global, "SEED FALLBACK: INVALID RESULT"
+                    # Only a feasible seed provides a meaningful objective
+                    # floor. Repairing an infeasible seed may require dropping
+                    # unemployment to satisfy the rate/population constraints.
+                    if seed_feasible and int(u[expanded_global].sum()) < seed_objective:
+                        return seed_global, "SEED FALLBACK: OBJECTIVE REGRESSION"
                     return expanded_global, result.status
 
                 if len(round_seeds) > 1:
@@ -7666,8 +7674,28 @@ def build_many_asus_cpsat(
                 else:
                     expanded_results = [_expand_standalone(0)]
 
-                expanded_units = [nodes for nodes, _ in expanded_results]
                 _clear_incumbent_previews()
+                # Filter before merging: a failed seed is not an ASU and must
+                # not invalidate unrelated valid merges (or join those groups).
+                valid_seeds, valid_results = [], []
+                for seed_nodes, (nodes, status) in zip(round_seeds, expanded_results):
+                    if not component_ok(nodes, u, E, P, tau, pop_thresh, nb):
+                        remaining[nodes] = True
+                        tried[nodes] = False
+                        poisoned_seeds.add(tuple(sorted(seed_nodes)))
+                        if verbose:
+                            print(
+                                f"  [SKIP] candidate seed (seed={len(seed_nodes)} tract(s)) "
+                                f"has no valid expansion (status={status}); "
+                                "excluded before merging, tracts released to remaining pool",
+                                flush=True,
+                            )
+                        continue
+                    valid_seeds.append(seed_nodes)
+                    valid_results.append((nodes, status))
+                round_seeds = valid_seeds
+                expanded_results = valid_results
+                expanded_units = [nodes for nodes, _ in expanded_results]
                 expansion_statuses = [status for _, status in expanded_results]
                 should_merge = (
                     merge_adjacent
