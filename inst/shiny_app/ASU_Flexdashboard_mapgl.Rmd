@@ -793,6 +793,15 @@ shiny::conditionalPanel(
   condition = "input.asu_algo === 'cpsat'",
   shiny::tagList(
     shiny::hr(style = "margin: 0.8rem 0;"),
+    shiny::radioButtons(
+      "cpsat_strategy",
+      "CP-SAT strategy",
+      choices = c(
+        "Partitioning strategy (potential multiple ASUs)" = "partition",
+        "Legacy single-ASU solve" = "single"
+      ),
+      selected = "partition"
+    ),
     shiny::numericInput("cpsat_tau",       "UR threshold (τ)",          value = 0.0645, min = 0, max = 1, step = 0.0001),
     shiny::numericInput("cpsat_pop",       "Population threshold",      value = 10000,  min = 0, step = 100),
     shiny::numericInput("cpsat_max",       "Max ASUs",                  value = 30,     min = 1, step = 1),
@@ -1015,11 +1024,14 @@ if (identical(algo_choice, "cpsat")) {
     tlimit   <- if (is.null(input$cpsat_timelimit)) 1200   else as.integer(input$cpsat_timelimit)
     workers  <- if (is.null(input$cpsat_workers))   max(1L, parallel::detectCores()-5L) else as.integer(input$cpsat_workers)
     parallel_asus <- if (is.null(input$cpsat_parallel_asus)) 1L else max(1L, as.integer(input$cpsat_parallel_asus))
+    cpsat_strategy <- if (is.null(input$cpsat_strategy) || identical(input$cpsat_strategy, "")) "partition" else as.character(input$cpsat_strategy)
+    use_partitioning <- identical(cpsat_strategy, "partition")
     rel_gap  <- if (!is.null(input$cpsat_relgap) && !is.na(input$cpsat_relgap)) as.numeric(input$cpsat_relgap) else NA_real_
     max_nodes_enabled <- isTRUE(input$cpsat_enable_max_nodes)
     max_nodes_per_asu <- if (max_nodes_enabled && !is.null(input$cpsat_max_nodes) && !is.na(input$cpsat_max_nodes)) as.integer(input$cpsat_max_nodes) else NA_integer_
     combine_timelimit <- if (max_nodes_enabled && !is.null(input$cpsat_combine_timelimit) && !is.na(input$cpsat_combine_timelimit)) as.integer(input$cpsat_combine_timelimit) else NA_integer_
-    append_cpsat_log(sprintf("[run] params: tau=%.6f pop=%d max=%d limit=%ds workers=%d concurrent_asus=%d rel_gap=%s max_nodes_per_asu=%s combine_time_limit=%s",
+    append_cpsat_log(sprintf("[run] params: strategy=%s tau=%.6f pop=%d max=%d limit=%ds workers=%d concurrent_asus=%d rel_gap=%s max_nodes_per_asu=%s combine_time_limit=%s",
+           if (use_partitioning) "partition" else "single",
                  tau, pop_thr, max_asus, tlimit, workers, parallel_asus,
                              if (is.na(rel_gap)) "None" else as.character(rel_gap),
                              if (is.na(max_nodes_per_asu)) "None" else as.character(max_nodes_per_asu),
@@ -1195,7 +1207,7 @@ kwargs = dict(
     tau=%s, pop_thresh=%d, max_asus=%d,
     time_limit=%d, workers=%d, parallel_asus=%d, verbose=True,
     configure_subsolvers=True,
-    use_signed_flow=False,
+    use_signed_flow=True,
     use_arborescence=False,
     use_root_articulation_implications=True,
     use_tract_first_search=False,
@@ -1217,8 +1229,8 @@ kwargs = dict(
     use_bridge_subtree_pruning=True,
     use_connectivity_free_repair=True,
     connectivity_free_time_limit=60.0,
-    harvest_connectivity_free_asus=True,
-    harvest_all_connectivity_free_components=True,
+    harvest_connectivity_free_asus=%s,
+    harvest_all_connectivity_free_components=%s,
     use_graph_cut_repair=True,
     graph_cut_repair_time_limit=300,
     standalone_expansion_time_limit=1800,
@@ -1237,6 +1249,7 @@ COMBINE_TL = %s
 if COMBINE_TL is not None and not (isinstance(COMBINE_TL, float) and math.isnan(COMBINE_TL)):
     kwargs['combine_time_limit'] = int(COMBINE_TL)
 print('[runner] window scope: all remaining tracts', flush=True)
+print('[runner] strategy: ' + ('partition' if kwargs['harvest_connectivity_free_asus'] else 'single'), flush=True)
 print('[runner] fixed-search mode: flow-capacity-hybrid', flush=True)
 print('[runner] launching CP-SAT…', flush=True)
 res = build_many_asus_cpsat(**kwargs)
@@ -1250,6 +1263,8 @@ print('[runner] OK', flush=True)
 ",
       py_mod_path, df_csv, nb_json,
       format(tau, scientific = FALSE), pop_thr, max_asus, tlimit, workers, parallel_asus,
+  if (use_partitioning) "True" else "False",
+  if (use_partitioning) "True" else "False",
       stop_file, skip_file,
       if (is.na(rel_gap)) "None" else as.character(rel_gap),
       if (is.na(max_nodes_per_asu)) "None" else as.character(max_nodes_per_asu),

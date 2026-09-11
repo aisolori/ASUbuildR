@@ -1038,20 +1038,22 @@ _ASU_FULL_SUBSOLVER_PATTERN = (
     "portfolio_max_lp",
     "portfolio_max_lp",
     "portfolio_no_lp",
-    "asu_probe_mega_deep",
-    "lb_tree_search",
-    
-    "probing_no_lp",
-    "quick_restart_no_lp",
-    "quick_restart",
     "asu_probe_deep",
-    "no_lp",
+    "lb_tree_search",
+
+    "variables_shaving_no_lp",
+    "quick_restart_no_lp",
+    "probing_no_lp",
+    "quick_restart",
+    "asu_probe_mega_deep",
     
+
+    "no_lp",
     "pseudo_costs",
     "reduced_costs",
     "core_max_lp",
     "variables_shaving",
-    "variables_shaving_no_lp",
+    
     
     "variables_shaving_max_lp",
     "objective_lb_search_max_lp", 
