@@ -696,6 +696,177 @@ def _bounded_root_vertex_separator(
     return _bounded_root_vertex_separator_python(nb_local, root_local, target, max_size)
 
 
+def _minimum_root_vertex_separator_igraph(
+    nb_local: List[List[int]],
+    root_local: int,
+    target: int,
+    protected_nodes: Optional[Set[int]] = None,
+    max_size: Optional[int] = None,
+) -> Optional[Tuple[int, ...]]:
+    """Return a minimum root-target vertex separator, optionally avoiding protected nodes."""
+    if target == root_local:
+        return None
+    graph, n_nodes = _get_igraph_separator_graph(nb_local)
+    cutoff = int(max_size) + 1 if max_size is not None else n_nodes + 1
+    num_internal = n_nodes
+    capacity = [1] * num_internal + [cutoff] * (graph.ecount() - num_internal)
+
+    blocked = {int(root_local), int(target)}
+    if protected_nodes:
+        blocked.update(int(node) for node in protected_nodes if 0 <= int(node) < n_nodes)
+    for node in blocked:
+        capacity[node] = cutoff
+
+    source = 2 * root_local + 1
+    sink = 2 * target
+    cut = graph.mincut(source=source, target=sink, capacity=capacity)
+    flow = int(round(cut.value))
+    if flow <= 0:
+        return None
+    if max_size is not None and flow > int(max_size):
+        return None
+
+    source_side = set(cut.partition[0] if source in cut.partition[0] else cut.partition[1])
+    separator = tuple(
+        sorted(
+            node for node in range(n_nodes)
+            if node not in (root_local, target)
+            and (2 * node) in source_side
+            and (2 * node + 1) not in source_side
+        )
+    )
+    if not separator:
+        return None
+    if protected_nodes and any(node in protected_nodes for node in separator):
+        return None
+    return separator
+
+
+def _minimum_root_vertex_separator_python(
+    nb_local: List[List[int]],
+    root_local: int,
+    target: int,
+    protected_nodes: Optional[Set[int]] = None,
+    max_size: Optional[int] = None,
+) -> Optional[Tuple[int, ...]]:
+    """Pure-Python minimum root-target separator with optional protected nodes."""
+    n_nodes = len(nb_local)
+    if target == root_local:
+        return None
+
+    cutoff = int(max_size) + 1 if max_size is not None else n_nodes + 1
+    residual: List[Dict[int, int]] = [dict() for _ in range(2 * n_nodes)]
+
+    def _add_arc(start: int, end: int, capacity: int) -> None:
+        residual[start][end] = residual[start].get(end, 0) + capacity
+        residual[end].setdefault(start, 0)
+
+    blocked = {int(root_local), int(target)}
+    if protected_nodes:
+        blocked.update(int(node) for node in protected_nodes if 0 <= int(node) < n_nodes)
+
+    for node in range(n_nodes):
+        capacity = cutoff if node in blocked else 1
+        _add_arc(2 * node, 2 * node + 1, capacity)
+
+    undirected_edges = {
+        (min(node, neighbor), max(node, neighbor))
+        for node, neighbors in enumerate(nb_local)
+        for neighbor in neighbors
+        if node != neighbor
+    }
+    for left, right in undirected_edges:
+        _add_arc(2 * left + 1, 2 * right, cutoff)
+        _add_arc(2 * right + 1, 2 * left, cutoff)
+
+    source = 2 * root_local + 1
+    sink = 2 * target
+    flow = 0
+    while flow < cutoff:
+        parent = [-1] * (2 * n_nodes)
+        parent[source] = source
+        queue = [source]
+        head = 0
+        while head < len(queue) and parent[sink] < 0:
+            node = queue[head]
+            head += 1
+            for neighbor, capacity in residual[node].items():
+                if capacity > 0 and parent[neighbor] < 0:
+                    parent[neighbor] = node
+                    queue.append(neighbor)
+                    if neighbor == sink:
+                        break
+        if parent[sink] < 0:
+            break
+
+        amount = cutoff - flow
+        node = sink
+        while node != source:
+            previous = parent[node]
+            amount = min(amount, residual[previous][node])
+            node = previous
+        node = sink
+        while node != source:
+            previous = parent[node]
+            residual[previous][node] -= amount
+            residual[node][previous] = residual[node].get(previous, 0) + amount
+            node = previous
+        flow += amount
+
+    if flow <= 0:
+        return None
+    if max_size is not None and flow > int(max_size):
+        return None
+
+    reachable = {source}
+    queue = [source]
+    head = 0
+    while head < len(queue):
+        node = queue[head]
+        head += 1
+        for neighbor, capacity in residual[node].items():
+            if capacity > 0 and neighbor not in reachable:
+                reachable.add(neighbor)
+                queue.append(neighbor)
+
+    separator = tuple(
+        node for node in range(n_nodes)
+        if node not in (root_local, target)
+        and 2 * node in reachable
+        and 2 * node + 1 not in reachable
+    )
+    if not separator:
+        return None
+    if protected_nodes and any(node in protected_nodes for node in separator):
+        return None
+    return separator
+
+
+def _minimum_root_vertex_separator(
+    nb_local: List[List[int]],
+    root_local: int,
+    target: int,
+    protected_nodes: Optional[Set[int]] = None,
+    max_size: Optional[int] = None,
+) -> Optional[Tuple[int, ...]]:
+    """Dispatch to igraph or Python minimum separator implementation."""
+    if _ig is not None:
+        return _minimum_root_vertex_separator_igraph(
+            nb_local,
+            root_local,
+            target,
+            protected_nodes=protected_nodes,
+            max_size=max_size,
+        )
+    return _minimum_root_vertex_separator_python(
+        nb_local,
+        root_local,
+        target,
+        protected_nodes=protected_nodes,
+        max_size=max_size,
+    )
+
+
 def _small_root_separator_implications(
     nb_local: List[List[int]],
     root_local: int,
@@ -1037,29 +1208,21 @@ def _asu_flow_capacity_hybrid_groups(
 _ASU_FULL_SUBSOLVER_PATTERN = (
     "portfolio_max_lp",
     "portfolio_max_lp",
-    "portfolio_no_lp",
-    "asu_probe_deep",
+    "objective_shaving_max_lp",
     "lb_tree_search",
-
-    "variables_shaving_no_lp",
+    "objective_lb_search_max_lp",
+    
+    "asu_flow_capacity_hybrid",
     "quick_restart_no_lp",
-    "probing_no_lp",
-    "quick_restart",
-    "asu_probe_mega_deep",
-    
-
-    "no_lp",
+    "asu_probe_fast",
     "pseudo_costs",
-    "reduced_costs",
-    "core_max_lp",
+    "portfolio_max_lp",
+    
     "variables_shaving",
-    
-    
-    "variables_shaving_max_lp",
-    "objective_lb_search_max_lp", 
-    "objective_lb_search_no_lp",
-    "variables_shaving_no_lp",
-    "max_lp",
+    "objective_shaving_max_lp",
+    "portfolio_max_lp",
+    "reduced_costs",
+    "max_lp"
 
 )
 def _asu_full_subsolvers(
@@ -1075,7 +1238,7 @@ def _asu_full_subsolvers(
     if workers < 6:
         return []
 
-    full_budget = max(6, min(20, round(workers *.5)))
+    full_budget = max(6, min(20, round(workers *.6)))
     full_subsolvers: List[str] = list(_ASU_FULL_SUBSOLVER_PATTERN[:full_budget])
     custom_modes = [
         bool(use_tract_first_search),
@@ -1184,7 +1347,7 @@ def _configure_asu_probe_variants(
 
         #"linearization_level": 0,
         "add_lp_constraints_lazily": False,
-        "max_cut_rounds_at_level_zero": 4,
+        "max_cut_rounds_at_level_zero": 10,
     }
 
     
@@ -2160,10 +2323,34 @@ def solve_one_asu_cpsat(
     # boundary constraints these cuts add evidently still prune the flow
     # phase's search space usefully even when they never converge to a single
     # connected component. See SKILL.md.
-    cut_time_budget = min(60.0, max(2.0, float(time_limit) * 0.15))
+    cut_time_budget = min(60, max(2.0, float(time_limit) * 0.15))
     stall_rounds = 0
     prev_num_components: Optional[int] = None
     first_components: Optional[int] = None
+    prev_detached_unemp: Optional[int] = None
+    separator_pool: Dict[int, List[frozenset]] = {}
+    for target, separator in separator_implications:
+        seed_set = frozenset(
+            int(node) for node in separator
+            if int(node) != int(root_local) and int(node) != int(target)
+        )
+        if seed_set:
+            separator_pool.setdefault(int(target), []).append(seed_set)
+    separator_attempts = 0
+    separator_accepted = 0
+    separator_duplicates = 0
+    separator_pool_superseded = 0
+    separator_literals = 0
+    separator_clause_literals = 0
+    separator_sizes: List[int] = []
+    fallback_components = 0
+    fallback_clauses = 0
+    fallback_literals = 0
+    old_boundary_clauses_equivalent = 0
+    old_boundary_literals_equivalent = 0
+    _DYNAMIC_SEPARATOR_MAX = 16
+    _DYNAMIC_TARGETS_PER_COMPONENT = 3
+    root_distances = _root_graph_distances(nb_local, root_local)
 
     def _component_key(component: set) -> Tuple[int, int]:
         # Smallest tract count first; ties broken by smallest unemployment.
@@ -2175,6 +2362,67 @@ def solve_one_asu_cpsat(
         hint_proto.values.clear()
         for i in range(N):
             model.AddHint(x[i], 1 if i in nodes else 0)
+
+    def _register_separator(target: int, separator: Sequence[int]) -> Optional[Tuple[int, ...]]:
+        nonlocal separator_attempts
+        nonlocal separator_accepted
+        nonlocal separator_duplicates
+        nonlocal separator_pool_superseded
+        nonlocal separator_literals
+        nonlocal separator_clause_literals
+        nonlocal separator_sizes
+
+        separator_attempts += 1
+        candidate = frozenset(
+            int(node) for node in separator
+            if int(node) != int(root_local) and int(node) != int(target)
+        )
+        if not candidate:
+            return None
+
+        existing = separator_pool.setdefault(int(target), [])
+        for prior in existing:
+            if prior == candidate:
+                separator_duplicates += 1
+                return None
+            if prior.issubset(candidate):
+                separator_pool_superseded += 1
+                return None
+
+        reduced = [prior for prior in existing if not candidate.issubset(prior)]
+        separator_pool[int(target)] = reduced + [candidate]
+        separator_accepted += 1
+        separator_literals += len(candidate)
+        separator_clause_literals += len(candidate) + 1
+        separator_sizes.append(len(candidate))
+        return tuple(sorted(candidate))
+
+    def _pick_component_targets(component: set) -> List[int]:
+        u_target = max(
+            component,
+            key=lambda node: (int(u_g[node]), -int(node)),
+        )
+        q_target = max(
+            component,
+            key=lambda node: (int(q_surplus[node]), int(u_g[node]), -int(node)),
+        )
+        far_target = max(
+            component,
+            key=lambda node: (int(root_distances[node]), int(u_g[node]), -int(node)),
+        )
+        targets = list(dict.fromkeys([int(u_target), int(q_target), int(far_target)]))
+        if len(targets) < _DYNAMIC_TARGETS_PER_COMPONENT:
+            ranked = sorted(
+                component,
+                key=lambda node: (-int(u_g[node]), -int(q_surplus[node]), int(node)),
+            )
+            for node in ranked:
+                node_i = int(node)
+                if node_i not in targets:
+                    targets.append(node_i)
+                if len(targets) >= _DYNAMIC_TARGETS_PER_COMPONENT:
+                    break
+        return targets
 
     # Populated once a round goes DISCONNECTED; nudges each following round
     # toward absorbing the smallest still-disconnected component first,
@@ -2261,11 +2509,7 @@ def solve_one_asu_cpsat(
 
         if first_components is None:
             first_components = len(components)
-        if prev_num_components is not None and len(components) >= prev_num_components:
-            stall_rounds += 1
-        else:
-            stall_rounds = 0
-        prev_num_components = len(components)
+        detached_unemp = sum(int(u_g[list(component)].sum()) for component in components)
 
         # Try the smallest disconnected component first next round -- cheapest
         # to absorb, and most likely for a CP-SAT-guided swap to succeed.
@@ -2275,26 +2519,97 @@ def solve_one_asu_cpsat(
             print(
                 f"  [cut-pass] round {cut_round}: DISCONNECTED "
                 f"({len(components)} component(s) cut), best_connected so far={best_text}, "
-                f"elapsed={time.monotonic() - start_time:.1f}s",
+                f"detached_unemp={detached_unemp}, elapsed={time.monotonic() - start_time:.1f}s",
                 flush=True,
             )
 
+        round_separator_accepted = 0
         for component in components:
+            dynamic_added = 0
+            targets = _pick_component_targets(component)
             boundary = sorted({
                 w for v in component for w in nb_local[v]
                 if w not in component
             })
+            old_boundary_clauses_equivalent += len(component)
+            old_boundary_literals_equivalent += len(component) * (len(boundary) + 1)
+
+            for target in targets:
+                separator = _minimum_root_vertex_separator(
+                    nb_local,
+                    root_local,
+                    int(target),
+                    protected_nodes=selected_set,
+                    max_size=_DYNAMIC_SEPARATOR_MAX,
+                )
+                if separator is None:
+                    continue
+                kept = _register_separator(int(target), separator)
+                if not kept:
+                    continue
+                model.AddBoolOr([x[int(target)].Not()] + [x[s] for s in kept])
+                dynamic_added += 1
+                round_separator_accepted += 1
+
+            if dynamic_added > 0:
+                continue
+            fallback_components += 1
             if boundary:
-                # BoolOr lives in the SAT core (unit propagation) and is also
-                # auto-linearized into the LP at linearization_level=2.
-                for v in component:
-                    model.AddBoolOr([x[v].Not()] + [x[w] for w in boundary])
+                # Fallback when dynamic separation yields no useful cut.
+                for target in targets:
+                    model.AddBoolOr([x[int(target)].Not()] + [x[w] for w in boundary])
+                    fallback_clauses += 1
+                    fallback_literals += len(boundary) + 1
             else:
-                for v in component:
-                    model.Add(x[v] == 0)
+                for target in targets:
+                    model.Add(x[int(target)] == 0)
+                    fallback_clauses += 1
+                    fallback_literals += 1
+
+        if (
+            prev_num_components is not None
+            and round_separator_accepted == 0
+            and len(components) >= prev_num_components
+            and prev_detached_unemp is not None
+            and detached_unemp >= prev_detached_unemp
+        ):
+            stall_rounds += 1
+        else:
+            stall_rounds = 0
+        prev_num_components = len(components)
+        prev_detached_unemp = detached_unemp
+
         cut_round += 1
         if stall_rounds >= 3:
             break
+
+    if log and separator_attempts > 0:
+        avg_literals = separator_literals / max(1, separator_accepted)
+        size_min = min(separator_sizes) if separator_sizes else 0
+        size_median = float(np.median(separator_sizes)) if separator_sizes else 0.0
+        size_p90 = float(np.percentile(separator_sizes, 90)) if separator_sizes else 0.0
+        size_max = max(separator_sizes) if separator_sizes else 0
+        boundary_clauses_avoided = max(0, old_boundary_clauses_equivalent - fallback_clauses)
+        boundary_literals_avoided = max(0, old_boundary_literals_equivalent - fallback_literals)
+        separator_to_old_boundary_ratio = (
+            separator_clause_literals / old_boundary_literals_equivalent
+            if old_boundary_literals_equivalent > 0 else 0.0
+        )
+        print(
+            f"  [cut-pass] dynamic separators: attempts={separator_attempts}, "
+            f"accepted={separator_accepted}, duplicates={separator_duplicates}, "
+            f"pool_superseded={separator_pool_superseded}, avg_size={avg_literals:.2f}, "
+            f"size(min/med/p90/max)=({size_min}/{size_median:.1f}/{size_p90:.1f}/{size_max}), "
+            f"dynamic_clause_literals={separator_clause_literals}, "
+            f"fallback_components={fallback_components}, fallback_clauses={fallback_clauses}, "
+            f"fallback_literals={fallback_literals}, "
+            f"old_boundary_equivalent_clauses={old_boundary_clauses_equivalent}, "
+            f"old_boundary_equivalent_literals={old_boundary_literals_equivalent}, "
+            f"boundary_clauses_avoided={boundary_clauses_avoided}, "
+            f"boundary_literals_avoided={boundary_literals_avoided}, "
+            f"separator_to_old_boundary_literal_ratio={separator_to_old_boundary_ratio:.3f}",
+            flush=True,
+        )
 
     # The cut-pass phase was deliberately left unfloored to explore smaller
     # candidates; now apply the known-good hint as a floor for the exact flow
@@ -2973,7 +3288,7 @@ def solve_one_asu_cpsat(
                     linearization_level=2,
                     root_lp_iterations=25_000,
                     add_lp_constraints_lazily=False,
-                    max_cut_rounds_at_level_zero=4,
+                    max_cut_rounds_at_level_zero=10,
                 )
 
             if flow_capacity_hybrid_enabled:
@@ -2984,7 +3299,7 @@ def solve_one_asu_cpsat(
                     linearization_level=2,
                     root_lp_iterations=25_000,
                     add_lp_constraints_lazily=False,
-                    max_cut_rounds_at_level_zero=4,
+                    max_cut_rounds_at_level_zero=10,
                 )
 
             if tract_first_enabled:
@@ -3120,7 +3435,7 @@ def solve_one_asu_cpsat(
 
             # LNS settings
             params.lns_initial_difficulty = 0.3
-            params.lns_initial_deterministic_limit = .5
+            params.lns_initial_deterministic_limit = .3
             params.solution_pool_size = max(1, int(solution_pool_size))
             params.diversify_lns_params = True
 
