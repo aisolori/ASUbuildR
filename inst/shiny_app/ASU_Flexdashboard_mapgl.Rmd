@@ -37,6 +37,94 @@ table.dataTable td {
 }
 </style>
 
+<script>
+(function registerAsuTooltipState() {
+  if (!window.Shiny || !window.HTMLWidgets) {
+    window.setTimeout(registerAsuTooltipState, 50);
+    return;
+  }
+  if (window._asuTooltipStateHandlerInstalled) return;
+  window._asuTooltipStateHandlerInstalled = true;
+  window._asuTooltipState = window._asuTooltipState || {};
+  window._asuTooltipInstallTimers = window._asuTooltipInstallTimers || {};
+
+  function escapeHtml(value) {
+    return String(value == null ? "" : value)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#039;");
+  }
+
+  function formatNumber(value, digits) {
+    var number = Number(value);
+    return Number.isFinite(number)
+      ? number.toLocaleString(undefined, { maximumFractionDigits: digits })
+      : "";
+  }
+
+  function installTooltip(mapId) {
+    var widget = window.HTMLWidgets.find("#" + mapId);
+    var map = widget && widget.getMap ? widget.getMap() : null;
+    if (!map || !map.getLayer || !map.getLayer("basemap")) {
+      return false;
+    }
+    if (map._asuDynamicTooltipInstalled) return true;
+    map._asuDynamicTooltipInstalled = true;
+
+    var popup = new maplibregl.Popup({
+      closeButton: false,
+      closeOnClick: false,
+      maxWidth: "400px"
+    });
+    map.on("mousemove", "basemap", function(e) {
+      if (!e.features || !e.features.length) return;
+      var props = e.features[0].properties || {};
+      var geoid = String(props.GEOID == null ? "" : props.GEOID);
+      var state = window._asuTooltipState[mapId] || {};
+      var asunum = Object.prototype.hasOwnProperty.call(state, geoid)
+        ? state[geoid]
+        : (props.asunum == null ? 0 : props.asunum);
+      var html =
+        "<strong>ASU Number: </strong>" + escapeHtml(asunum) + "<br>" +
+        "<strong>Tract GEOID: </strong>" + escapeHtml(geoid) + "<br>" +
+        "<strong>Tract Population: </strong>" + formatNumber(props.tract_pop_cur, 0) + "<br>" +
+        "<strong>Tract Labor Force: </strong>" + formatNumber(props.tract_ASU_clf, 0) + "<br>" +
+        "<strong>Tract Unemployment Rate: </strong>" + formatNumber(props.tract_ASU_urate, 2) + "%<br>" +
+        "<strong>Tract Unemployment: </strong>" + formatNumber(props.tract_ASU_unemp, 0) + "<br>";
+      map.getCanvas().style.cursor = "pointer";
+      popup.setLngLat(e.lngLat).setHTML(html).addTo(map);
+    });
+    map.on("mouseleave", "basemap", function() {
+      map.getCanvas().style.cursor = "";
+      popup.remove();
+    });
+    return true;
+  }
+
+  function ensureTooltip(mapId) {
+    if (installTooltip(mapId) || window._asuTooltipInstallTimers[mapId]) return;
+    window._asuTooltipInstallTimers[mapId] = window.setInterval(function() {
+      if (installTooltip(mapId)) {
+        window.clearInterval(window._asuTooltipInstallTimers[mapId]);
+        delete window._asuTooltipInstallTimers[mapId];
+      }
+    }, 500);
+  }
+
+  window.Shiny.addCustomMessageHandler("asu-tooltip-state", function(message) {
+    var mapId = message.id;
+    var state = window._asuTooltipState[mapId] ||
+      (window._asuTooltipState[mapId] = {});
+    (message.updates || []).forEach(function(update) {
+      state[String(update.geoid)] = update.asunum;
+    });
+    ensureTooltip(mapId);
+  });
+})();
+</script>
+
 ```{r python_preamble, include=FALSE}
 library(reticulate)
 library(processx)
@@ -206,15 +294,26 @@ cpsat_run_dir    <- shiny::reactiveVal(NULL)
 cpsat_df_csv     <- shiny::reactiveVal(NULL)
 cpsat_nb_json    <- shiny::reactiveVal(NULL)
 cpsat_out_json   <- shiny::reactiveVal(NULL)
+cpsat_progress_json <- shiny::reactiveVal(NULL)
 cpsat_log_file   <- shiny::reactiveVal(NULL)
 cpsat_log_saved  <- shiny::reactiveVal(NULL)
 cpsat_stop_file  <- shiny::reactiveVal(NULL)
 cpsat_stop_requested <- shiny::reactiveVal(FALSE)
 cpsat_skip_file  <- shiny::reactiveVal(NULL)
 cpsat_running <- shiny::reactiveVal(FALSE)
+cpsat_stage_text <- shiny::reactiveVal("idle")
 
 append_cpsat_log <- function(...) {
-  line <- paste0(format(Sys.time(), "%H:%M:%S "), paste0(..., collapse = ""))
+  raw <- paste0(..., collapse = "")
+  lines <- strsplit(raw, "\n", fixed = TRUE)[[1]]
+  stage_lines <- grep("\\[STAGE\\]", lines, value = TRUE)
+  if (length(stage_lines) > 0) {
+    latest_stage <- stage_lines[length(stage_lines)]
+    latest_stage <- sub("^.*\\[STAGE\\]\\s*", "", latest_stage)
+    cpsat_stage_text(trimws(latest_stage))
+  }
+
+  line <- paste0(format(Sys.time(), "%H:%M:%S "), raw)
   old  <- cpsat_log_buf()
   new  <- if (nzchar(old)) paste(old, line, sep = "\n") else line
   if (nchar(new) > 12000) new <- substr(new, nchar(new) - 11999, nchar(new))
@@ -226,6 +325,8 @@ append_cpsat_log <- function(...) {
 # keep log output live even if hidden
 output$cpsat_log_tail <- shiny::renderText(cpsat_log_buf())
 shiny::outputOptions(output, "cpsat_log_tail", suspendWhenHidden = FALSE)
+output$cpsat_stage <- shiny::renderText(cpsat_stage_text())
+shiny::outputOptions(output, "cpsat_stage", suspendWhenHidden = FALSE)
 output$show_cpsat_log_flag <- shiny::renderText({
   if (isTRUE(cpsat_running())) "true" else "false"
 })
@@ -477,6 +578,44 @@ tract_tooltip <- function() {
   )
 }
 
+# Keep dynamic ASU values in a small browser-side lookup used by both map
+# tooltips. Only GEOIDs whose assignment changed are sent to the browser.
+asu_tooltip_assignments <- shiny::reactiveVal(
+  stats::setNames(integer(0), character(0))
+)
+
+push_asu_tooltip_updates <- function(data) {
+  if (is.null(data) || nrow(data) == 0 ||
+      !all(c("GEOID", "asunum") %in% names(data))) return(invisible(FALSE))
+
+  geoids <- as.character(data$GEOID)
+  values <- suppressWarnings(as.integer(data$asunum))
+  values[is.na(values) | values < 0L] <- 0L
+  current <- stats::setNames(values, geoids)
+  previous <- asu_tooltip_assignments()
+  old_values <- unname(previous[geoids])
+  changed <- is.na(old_values) | old_values != values
+
+  if (any(changed)) {
+    changed_idx <- which(changed)
+    updates <- lapply(changed_idx, function(i) {
+      list(geoid = geoids[i], asunum = unname(values[i]))
+    })
+    for (map_id in c("initial_map", "edit_map")) {
+      session$sendCustomMessage(
+        "asu-tooltip-state",
+        list(id = map_id, updates = updates)
+      )
+    }
+  }
+  asu_tooltip_assignments(current)
+  invisible(TRUE)
+}
+
+shiny::observeEvent(full_data(), {
+  push_asu_tooltip_updates(full_data())
+}, ignoreNULL = TRUE)
+
 # Helper: set filter + visibility on the 'selected' or 'highlighted' overlay layer.
 # In mapgl 0.5.0, set_filter() composes user+base via ["all", ...], so we MUST
 # NOT set an initial filter on these layers. Use visibility="none" as the off-state
@@ -511,7 +650,7 @@ update_map_efficiently <- function(map_id = "edit_map", paint_only = FALSE) {
   proxy <- mapgl::maplibre_proxy(map_id)
 
   if (!paint_only && !map_uses_pmtiles()) {
-    # set_source refreshes tooltip feature properties; skip for paint-only edits.
+    # Skip source replacement for paint-only edits.
     proxy <- proxy |> mapgl::set_source(layer_id = "basemap", source = data)
   }
 
@@ -549,6 +688,10 @@ update_map_with_data <- function(map_id = "edit_map", new_data = NULL) {
   if (!is.null(new_data)) {
     mapgl::maplibre_proxy(map_id) |>
       mapgl::clear_layer("basemap") |>
+      mapgl::clear_layer("exploring") |>
+      mapgl::clear_layer("exploring_candidate") |>
+      mapgl::clear_layer("exploring_added") |>
+      mapgl::clear_layer("exploring_removed") |>
       mapgl::clear_layer("selected") |>
       mapgl::clear_layer("highlighted") |>
       mapgl::add_fill_layer(
@@ -563,7 +706,39 @@ update_map_with_data <- function(map_id = "edit_map", new_data = NULL) {
         ),
         fill_opacity = 0.5,
         fill_outline_color = "black",
-        tooltip = tract_tooltip()
+        tooltip = NULL
+      ) |>
+      mapgl::add_line_layer(
+        id = "exploring",
+        source = data,
+        line_color = "#000000",
+        line_width = 3,
+        line_opacity = 1,
+        visibility = "none"
+      ) |>
+      mapgl::add_line_layer(
+        id = "exploring_candidate",
+        source = data,
+        line_color = "#FFD54F",
+        line_width = 3,
+        line_opacity = 1,
+        visibility = "none"
+      ) |>
+      mapgl::add_line_layer(
+        id = "exploring_removed",
+        source = data,
+        line_color = "#D32F2F",
+        line_width = 4,
+        line_opacity = 1,
+        visibility = "none"
+      ) |>
+      mapgl::add_line_layer(
+        id = "exploring_added",
+        source = data,
+        line_color = "#2E7D32",
+        line_width = 4,
+        line_opacity = 1,
+        visibility = "none"
       ) |>
       mapgl::add_line_layer(
         id = "selected",
@@ -1014,6 +1189,7 @@ if (identical(algo_choice, "cpsat")) {
   session <- shiny::getDefaultReactiveDomain()
   shiny::withProgress(message = "Running OR-Tools CP-SAT…", value = 0, {
     cpsat_running(TRUE)
+    cpsat_stage_text("initializing run")
     append_cpsat_log("[run] Button clicked (CP-SAT).")
     # ---- 1) Preconditions & parameters --------------------------------
     shiny::req(uploaded_data(), state(), tract_year())
@@ -1119,8 +1295,8 @@ if (identical(algo_choice, "cpsat")) {
     merged_sf$continuous <- nb
     nb_adjacency(list(geoids = merged_sf$GEOID, nb = nb))
 
-    # Pre-simplify geometry inside withProgress so map renders immediately after
-    # the solver finishes (visible to the user as part of the setup phase).
+    # Pre-simplify geometry inside withProgress so the initial map can render
+    # before the solver begins returning assignment snapshots.
     append_cpsat_log("[NB] Simplifying tract geometry...")
     sf::st_geometry(merged_sf) <- sf::st_geometry(merged_sf) |>
       sf::st_make_valid() |>
@@ -1129,6 +1305,23 @@ if (identical(algo_choice, "cpsat")) {
     
     merged_df <- merged_sf |> sf::st_drop_geometry()
     append_cpsat_log(sprintf("[NB] Tracts kept: %d (after join)", nrow(merged_df)))
+
+    clean_sf_columns <- function(x) {
+      g <- sf::st_geometry(x)
+      df <- x |>
+        sf::st_drop_geometry() |>
+        dplyr::select(where(~ !is.list(.)))
+      sf::st_as_sf(df, geometry = g, crs = sf::st_crs(x))
+    }
+
+    # Initialize the stable map source before Python starts. Live progress can
+    # then repaint this existing basemap without replacing its geometry or
+    # rebuilding any layers.
+    initial_sf <- merged_sf |>
+      dplyr::mutate(asunum = 0L) |>
+      dplyr::select(-dplyr::any_of("continuous")) |>
+      clean_sf_columns()
+    full_data(initial_sf)
     
     # Continue with the existing code...
     # Dataframe for Python
@@ -1153,6 +1346,7 @@ if (identical(algo_choice, "cpsat")) {
     df_csv   <- file.path(run_dir, "df.csv")
     nb_json  <- file.path(run_dir, "nb.json")
     out_json <- file.path(run_dir, "out.json")
+    progress_json <- file.path(run_dir, "progress.json")
     runner   <- file.path(run_dir, "runner.py")
     stop_file <- file.path(run_dir, "stop.flag")
     skip_file <- file.path(run_dir, "skip.flag")
@@ -1165,8 +1359,10 @@ if (identical(algo_choice, "cpsat")) {
     cpsat_df_csv(df_csv)
     cpsat_nb_json(nb_json)
     cpsat_out_json(out_json)
+    cpsat_progress_json(progress_json)
     cpsat_log_file(log_file)
     cpsat_log_saved(NULL)
+    unlink(progress_json)
     unlink(stop_file)
     unlink(skip_file)
     cpsat_stop_file(stop_file)
@@ -1238,7 +1434,8 @@ kwargs = dict(
     standalone_expansion_time_limit=1800,
     incumbent_stall_seconds=%d,
     stop_flag_path=r'%s',
-    skip_flag_path=r'%s'
+    skip_flag_path=r'%s',
+    progress_out_path=r'%s'
 )
 REL = %s
 if REL is not None and not (isinstance(REL, float) and math.isnan(REL)):
@@ -1269,6 +1466,7 @@ print('[runner] OK', flush=True)
   if (use_partitioning) "True" else "False",
         incumbent_stall_seconds,
         stop_file, skip_file,
+      progress_json,
       if (is.na(rel_gap)) "None" else as.character(rel_gap),
       if (is.na(max_nodes_per_asu)) "None" else as.character(max_nodes_per_asu),
       if (is.na(combine_timelimit)) "None" else as.character(combine_timelimit),
@@ -1315,6 +1513,73 @@ print('[runner] OK', flush=True)
     cpsat_solver_proc(px)
     append_cpsat_log(sprintf("[run] Python started (pid=%s). Streaming…", px$get_pid()))
 
+    apply_asu_assignments <- function(asu_values, update_reset = FALSE, map_only = FALSE) {
+      asu_id_vals <- suppressWarnings(as.integer(asu_values))
+      if (length(asu_id_vals) != nrow(merged_df) || any(is.na(asu_id_vals))) {
+        return(FALSE)
+      }
+
+      if (isTRUE(map_only)) {
+        color_df <- data.frame(
+          GEOID = as.character(merged_df$GEOID),
+          asunum = ifelse(asu_id_vals < 0L, 0L, as.integer(asu_id_vals))
+        )
+        push_asu_tooltip_updates(color_df)
+        cm <- calculate_tract_colors(color_df)
+        fill_expr <- mapgl::match_expr(
+          column  = "GEOID",
+          values  = cm$values,
+          stops   = cm$stops,
+          default = "#E0E0E0"
+        )
+        for (map_id in c("initial_map", "edit_map")) {
+          try(
+            mapgl::maplibre_proxy(map_id) |>
+              mapgl::set_paint_property("basemap", "fill-color", fill_expr),
+            silent = TRUE
+          )
+        }
+        return(TRUE)
+      }
+
+      live_sf <- merged_sf |>
+        dplyr::mutate(asunum = ifelse(asu_id_vals < 0L, 0L, as.integer(asu_id_vals))) |>
+        dplyr::select(-dplyr::any_of("continuous")) |>
+        clean_sf_columns()
+
+      full_data(live_sf)
+      if (isTRUE(update_reset)) {
+        full_data_reset(live_sf)
+      }
+      asu_summary(
+        live_sf |>
+          sf::st_drop_geometry() |>
+          dplyr::filter(asunum > 0) |>
+          dplyr::group_by(asunum) |>
+          dplyr::summarise(
+            Tracts              = dplyr::n(),
+            Population          = sum(tract_pop_cur,   na.rm = TRUE),
+            `Labor Force`       = sum(tract_ASU_clf,   na.rm = TRUE),
+            Unemployment        = sum(tract_ASU_unemp, na.rm = TRUE),
+            `Unemployment Rate` = round((Unemployment/`Labor Force`)*100, 5),
+            .groups = "drop"
+          )
+      )
+      output$asu <- shiny::renderTable(asu_summary(), digits = 3)
+      update_map_efficiently("initial_map")
+      update_map_efficiently("edit_map")
+      TRUE
+    }
+
+    # The Python builder starts with -1 for every tract. Seed the comparison
+    # with that same state so its INIT snapshot does not trigger a redundant
+    # all-grey repaint. Later phase-only snapshots are skipped the same way.
+    last_progress_asu <- shiny::reactiveVal(rep.int(-1L, nrow(merged_df)))
+    last_exploring_geoids <- shiny::reactiveVal(character(0))
+    last_exploring_candidate_geoids <- shiny::reactiveVal(character(0))
+    last_exploring_added_geoids <- shiny::reactiveVal(character(0))
+    last_exploring_removed_geoids <- shiny::reactiveVal(character(0))
+
     # stream logs and finalize when done
     if (!is.null(session$userData$cpsatObs)) {
       try(session$userData$cpsatObs$destroy(), silent = TRUE)
@@ -1330,7 +1595,98 @@ print('[runner] OK', flush=True)
       if (!inherits(out,"try-error") && length(out)) append_cpsat_log(paste(out, collapse="\n"))
       if (!inherits(err,"try-error") && length(err)) append_cpsat_log(paste(err, collapse="\n"))
 
+      pf <- cpsat_progress_json()
+      if (!is.null(pf) && file.exists(pf)) {
+        progress_payload <- try(jsonlite::fromJSON(pf), silent = TRUE)
+        if (!inherits(progress_payload, "try-error") && !is.null(progress_payload$asu_id)) {
+          progress_asu <- suppressWarnings(as.integer(progress_payload$asu_id))
+          valid_progress <- length(progress_asu) == nrow(merged_df) &&
+            !any(is.na(progress_asu))
+
+          if (valid_progress && !identical(progress_asu, last_progress_asu())) {
+            # The JSON is cheap to read on every tick. The assignment comparison
+            # ensures the expensive paint update runs only when tract membership
+            # or compact ASU numbering actually changed.
+            if (isTRUE(apply_asu_assignments(
+              progress_asu,
+              update_reset = FALSE,
+              map_only = TRUE
+            ))) {
+              last_progress_asu(progress_asu)
+            }
+          }
+
+          overlay_specs <- list(
+            list(
+              payload = "exploring_idx",
+              layer = "exploring",
+              previous = last_exploring_geoids
+            ),
+            list(
+              payload = "exploring_candidate_idx",
+              layer = "exploring_candidate",
+              previous = last_exploring_candidate_geoids
+            ),
+            list(
+              payload = "exploring_added_idx",
+              layer = "exploring_added",
+              previous = last_exploring_added_geoids
+            ),
+            list(
+              payload = "exploring_removed_idx",
+              layer = "exploring_removed",
+              previous = last_exploring_removed_geoids
+            )
+          )
+          for (overlay_spec in overlay_specs) {
+            overlay_idx <- suppressWarnings(as.integer(
+              progress_payload[[overlay_spec$payload]] %||% integer(0)
+            ))
+            overlay_idx <- unique(overlay_idx[
+              !is.na(overlay_idx) & overlay_idx >= 0L &
+                overlay_idx < nrow(merged_df)
+            ])
+            overlay_geoids <- sort(as.character(
+              merged_df$GEOID[overlay_idx + 1L]
+            ))
+            if (!identical(overlay_geoids, overlay_spec$previous())) {
+              for (map_id in c("initial_map", "edit_map")) {
+                try(
+                  apply_overlay_filter(
+                    mapgl::maplibre_proxy(map_id),
+                    overlay_spec$layer,
+                    overlay_geoids
+                  ),
+                  silent = TRUE
+                )
+              }
+              overlay_spec$previous(overlay_geoids)
+            }
+          }
+        }
+      }
+
       if (!px$is_alive()) {
+        for (layer_id in c(
+          "exploring", "exploring_candidate",
+          "exploring_added", "exploring_removed"
+        )) {
+          for (map_id in c("initial_map", "edit_map")) {
+            try(
+              apply_overlay_filter(
+                mapgl::maplibre_proxy(map_id),
+                layer_id,
+                character(0)
+              ),
+              silent = TRUE
+            )
+          }
+        }
+        last_exploring_geoids(character(0))
+        last_exploring_candidate_geoids(character(0))
+        last_exploring_added_geoids(character(0))
+        last_exploring_removed_geoids(character(0))
+
         # drain remaining
         out_all <- try(px$read_all_output_lines(), silent = TRUE)
         err_all <- try(px$read_all_error_lines(),  silent = TRUE)
@@ -1339,49 +1695,17 @@ print('[runner] OK', flush=True)
 
         status <- px$get_exit_status()
         append_cpsat_log(paste0("[run] Exit status: ", status))
+        cpsat_stage_text(if (identical(status, 0L)) "completed" else "failed")
         session$userData$cpsatObs$destroy()
-
-        # ---- 7) Load results -> update map/reactives -------------------
-        clean_sf_columns <- function(x) {
-          g <- sf::st_geometry(x)
-          df <- x |>
-            sf::st_drop_geometry() |>
-            dplyr::select(where(~ !is.list(.)))
-          sf::st_as_sf(df, geometry = g, crs = sf::st_crs(x))
-        }
 
         if (identical(status, 0L) && file.exists(cpsat_out_json())) {
           resj <- jsonlite::fromJSON(cpsat_out_json())
           if (!is.null(resj$asu_id) && length(resj$asu_id) == nrow(merged_df)) {
-            asu_id <- as.integer(resj$asu_id)
-
-            final_sf <- merged_sf |>
-              dplyr::mutate(asunum = ifelse(asu_id < 0L, 0L, as.integer(asu_id))) |>
-              dplyr::select(-dplyr::any_of("continuous")) |>
-              clean_sf_columns()
-            # geometry already simplified in merged_sf (done during withProgress)
-
-            # update reactives used by the rest of the app
-            full_data(final_sf)
-            full_data_reset(final_sf)
-            asu_summary(
-              final_sf |>
-                sf::st_drop_geometry() |>
-                dplyr::filter(asunum > 0) |>
-                dplyr::group_by(asunum) |>
-                dplyr::summarise(
-                  Tracts              = dplyr::n(),
-                  Population          = sum(tract_pop_cur,   na.rm = TRUE),
-                  `Labor Force`       = sum(tract_ASU_clf,   na.rm = TRUE),
-                  Unemployment        = sum(tract_ASU_unemp, na.rm = TRUE),
-                  `Unemployment Rate` = round((Unemployment/`Labor Force`)*100, 5),
-                  .groups = "drop"
-                )
-            )
-            output$asu <- shiny::renderTable(asu_summary(), digits = 3)
-            update_map_efficiently("initial_map")
-            update_map_efficiently("edit_map")
-            append_cpsat_log("[run] Solver finished OK; map/table updated.")
+            if (isTRUE(apply_asu_assignments(resj$asu_id, update_reset = TRUE))) {
+              append_cpsat_log("[run] Solver finished OK; map/table updated.")
+            } else {
+              append_cpsat_log("[run][warn] Output JSON had invalid assignment shape.")
+            }
           } else {
             append_cpsat_log("[run][warn] Output JSON invalid or length mismatch.")
           }
@@ -1399,6 +1723,7 @@ print('[runner] OK', flush=True)
         kf <- cpsat_skip_file()
         if (!is.null(kf)) unlink(kf)
         cpsat_skip_file(NULL)
+        cpsat_progress_json(NULL)
         cpsat_running(FALSE)
       }
     })
@@ -1545,11 +1870,22 @@ output$log_overlay <- shiny::renderUI({
   shiny::absolutePanel(
     id = "cpsat_log_panel",
     top = 80, right = 20, width = 800, height = "70vh", draggable = TRUE,
-    style = "background:#fff; border:1px solid #ddd; box-shadow:0 2px 8px rgba(0,0,0,.15); overflow-y:auto; padding:10px; z-index:1000;",
+    style = paste(
+      "background:#fff; border:1px solid #ddd;",
+      "box-shadow:0 2px 8px rgba(0,0,0,.15);",
+      "overflow:auto; resize:both; min-width:320px; min-height:220px;",
+      "max-width:calc(100vw - 40px); max-height:calc(100vh - 100px);",
+      "padding:10px; z-index:1000;"
+    ),
     shiny::div(
       style = "font-family:monospace; font-size:12px; white-space:pre-wrap;",
-      shiny::strong("CP-SAT log"), shiny::br(), 
-      shiny::verbatimTextOutput("cpsat_log_tail", placeholder = FALSE)
+      shiny::strong("CP-SAT log"), shiny::br(),
+      shiny::verbatimTextOutput("cpsat_log_tail", placeholder = FALSE),
+      shiny::tags$div(
+        style = "margin:8px 0 0 0; padding:6px 8px; background:#f4f7fb; border:1px solid #dbe3ef;",
+        shiny::tags$span(style = "font-weight:700;", "Stage: "),
+        shiny::textOutput("cpsat_stage", inline = TRUE)
+      )
     ),
     shiny::actionButton(
       "stop_solve", if (isTRUE(cpsat_stop_requested())) "Stopping…" else "Stop Solve",
@@ -1571,6 +1907,7 @@ shiny::observeEvent(input$stop_solve, {
   shiny::req(!is.null(sf), isTRUE(cpsat_running()))
   if (!file.exists(sf)) file.create(sf)
   cpsat_stop_requested(TRUE)
+  cpsat_stage_text("stop requested")
   append_cpsat_log("[run] Stop requested by user; waiting for solver to return its current incumbent…")
 })
 
@@ -1580,12 +1917,14 @@ shiny::observeEvent(input$skip_asu, {
   kf <- cpsat_skip_file()
   shiny::req(!is.null(kf), isTRUE(cpsat_running()))
   if (!file.exists(kf)) file.create(kf)
+  cpsat_stage_text("skip current asu requested")
   append_cpsat_log("[run] Skip requested by user; committing current ASU's incumbent and moving to the next one…")
 })
 
 # Add this observer to handle closing the log manually
 shiny::observeEvent(input$close_log, {
   cpsat_running(FALSE)
+  cpsat_stage_text("idle")
 })
 
 output$cpsat_log_link <- shiny::renderUI({
@@ -1677,7 +2016,43 @@ output$initial_map <- mapgl::renderMaplibre({
       ),
       fill_opacity       = 0.5,
       fill_outline_color = "black",
-      tooltip = tract_tooltip()
+      tooltip = NULL
+    ) |>
+    mapgl::add_line_layer(
+      id = "exploring",
+      source = layer_source,
+      source_layer = source_layer,
+      line_color = "#000000",
+      line_width = 3,
+      line_opacity = 1,
+      visibility = "none"
+    ) |>
+    mapgl::add_line_layer(
+      id = "exploring_candidate",
+      source = layer_source,
+      source_layer = source_layer,
+      line_color = "#FFD54F",
+      line_width = 3,
+      line_opacity = 1,
+      visibility = "none"
+    ) |>
+    mapgl::add_line_layer(
+      id = "exploring_removed",
+      source = layer_source,
+      source_layer = source_layer,
+      line_color = "#D32F2F",
+      line_width = 4,
+      line_opacity = 1,
+      visibility = "none"
+    ) |>
+    mapgl::add_line_layer(
+      id = "exploring_added",
+      source = layer_source,
+      source_layer = source_layer,
+      line_color = "#2E7D32",
+      line_width = 4,
+      line_opacity = 1,
+      visibility = "none"
     )
 }) |>
   shiny::bindCache(geoid_set(), cache = "session")
@@ -1796,7 +2171,43 @@ output$edit_map <- mapgl::renderMaplibre({
       ),
       fill_opacity = 0.5,
       fill_outline_color = "black",
-      tooltip = tract_tooltip()
+      tooltip = NULL
+    ) |>
+    mapgl::add_line_layer(
+      id = "exploring",
+      source = layer_source,
+      source_layer = source_layer,
+      line_color = "#000000",
+      line_width = 3,
+      line_opacity = 1,
+      visibility = "none"
+    ) |>
+    mapgl::add_line_layer(
+      id = "exploring_candidate",
+      source = layer_source,
+      source_layer = source_layer,
+      line_color = "#FFD54F",
+      line_width = 3,
+      line_opacity = 1,
+      visibility = "none"
+    ) |>
+    mapgl::add_line_layer(
+      id = "exploring_removed",
+      source = layer_source,
+      source_layer = source_layer,
+      line_color = "#D32F2F",
+      line_width = 4,
+      line_opacity = 1,
+      visibility = "none"
+    ) |>
+    mapgl::add_line_layer(
+      id = "exploring_added",
+      source = layer_source,
+      source_layer = source_layer,
+      line_color = "#2E7D32",
+      line_width = 4,
+      line_opacity = 1,
+      visibility = "none"
     ) |>
     # Pre-add hidden overlay layers; visibility="none" is the off-state so that
     # mapgl 0.5.0's filter-stack (base+user composed via ["all",...]) is not

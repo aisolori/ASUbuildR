@@ -39,7 +39,7 @@ import threading
 import time
 from dataclasses import dataclass
 from fractions import Fraction
-from typing import List, Optional, Dict, Sequence, Tuple, Set
+from typing import Callable, List, Optional, Dict, Sequence, Tuple, Set
 
 import numpy as np
 import pandas as pd
@@ -1216,13 +1216,18 @@ _ASU_FULL_SUBSOLVER_PATTERN = (
     "quick_restart_no_lp",
     "asu_probe_fast",
     "pseudo_costs",
-    "portfolio_max_lp",
-    
+    "asu_probe_deep",
+
     "variables_shaving",
     "objective_shaving_max_lp",
     "portfolio_max_lp",
     "reduced_costs",
-    "max_lp"
+    "max_lp",
+
+    "objective_lb_search",
+    "core_max_lp",
+    "core",
+    "objective_lb_search_no_lp",
 
 )
 def _asu_full_subsolvers(
@@ -1403,12 +1408,24 @@ def _configure_asu_pseudo_costs(params) -> None:
     )
 
 
-def _configure_asu_shared_tree(params, tract_first: bool = False) -> None:
-    """Configure coordinated proof workers around the global objective bound."""
-    params.shared_tree_num_workers = 0
+def _configure_asu_shared_tree(
+    params,
+    workers: int,
+    tract_first: bool = False,
+) -> None:
+    """Configure coordinated shared-tree proof workers."""
+
+    # Use up to 3 workers, while always leaving at least one worker
+    # for the rest of the portfolio.
+    params.shared_tree_num_workers = min(
+        3,
+        max(0, int(workers) - 1),
+    )
+
     params.shared_tree_split_strategy = (
         type(params).SPLIT_STRATEGY_OBJECTIVE_LB
     )
+
     if tract_first:
         _append_asu_subsolver_params(
             params,
@@ -1949,6 +1966,9 @@ def solve_one_asu_cpsat(
     use_tract_capacity_search: bool = False,
     use_flow_capacity_hybrid_search: bool = False,
     incumbent_stall_seconds: Optional[float] = None,
+    objective_no_improve_stop: Optional[int] = None,
+    incumbent_report_callback: Optional[Callable[[List[int], int], None]] = None,
+    incumbent_report_interval_seconds: float = 60.0,
 ) -> Optional[CpsatResult]:
     """
         Connectivity via iterative vertex-separator cuts. Each disconnected incumbent
@@ -1991,6 +2011,16 @@ def solve_one_asu_cpsat(
     learned clauses and hurt performance when it rebuilds the solver --
     this only ever stops the search; it never restarts it. `None` (default)
     disables this early-finish check entirely.
+
+    `objective_no_improve_stop`, when given, stops the search as soon as the
+    solver's best objective upper bound drops to this threshold (or below)
+    while the incumbent is still at or below the same threshold. This is used
+    by late-stage callers that only care whether the solve can strictly beat a
+    known baseline objective.
+
+    `incumbent_report_callback`, when supplied, receives the latest connected
+    local-node selection and objective on a periodic cadence during the main
+    CP-SAT search. Reporting is observational only and never changes the model.
     """
     N = len(nb_local)
     if N == 0:
@@ -2398,6 +2428,16 @@ def solve_one_asu_cpsat(
         return tuple(sorted(candidate))
 
     def _pick_component_targets(component: set) -> List[int]:
+        """
+        Pick target nodes within a component for expansion.
+
+        The selection prioritizes nodes based on unemployment, surplus, and distance
+        from the root, ensuring diverse criteria for choosing targets.
+
+        Returns a list of target node indices, with a length up to
+        _DYNAMIC_TARGETS_PER_COMPONENT.
+        """
+
         u_target = max(
             component,
             key=lambda node: (int(u_g[node]), -int(node)),
@@ -2410,11 +2450,17 @@ def solve_one_asu_cpsat(
             component,
             key=lambda node: (int(root_distances[node]), int(u_g[node]), -int(node)),
         )
-        targets = list(dict.fromkeys([int(u_target), int(q_target), int(far_target)]))
+        targets = list(dict.fromkeys([int(q_target), int(u_target), int(far_target)]))
         if len(targets) < _DYNAMIC_TARGETS_PER_COMPONENT:
             ranked = sorted(
                 component,
-                key=lambda node: (-int(q_surplus[node]),-int(u_g[node]), int(node)),
+                key=lambda node: (
+                    int(q_surplus[node]) <= 0,
+                    -int(q_surplus[node]),
+                    -int(u_g[node]),
+                    -int(root_distances[node]),
+                    int(node),
+                ),
             )
             for node in ranked:
                 node_i = int(node)
@@ -3051,6 +3097,12 @@ def solve_one_asu_cpsat(
     status_name = "UNKNOWN"
     selected: List[int] = []
     objective = -1
+    bound_stop_threshold = (
+        int(objective_no_improve_stop)
+        if objective_no_improve_stop is not None
+        else None
+    )
+    last_reported_incumbent: Optional[Tuple[int, ...]] = None
 
     if objective_shaving and best_connected is not None and rel_gap is None:
         proof_model = model.clone()
@@ -3390,23 +3442,23 @@ def solve_one_asu_cpsat(
             # while permanently occupying 3 of 14 threads. Reverted.
 
             allowed = list(dict.fromkeys(
-                full_subsolvers + [
-                    "rins*",
-                    "lb_relax_lns",
+              full_subsolvers + [
+                "shared_tree",
 
-                    "graph_arc_lns",
-                    "graph_var_lns",
-                    "graph_cst_lns",
-                    "graph_dec_lns", #testing might remove
+                "rins*",
+                "lb_relax_lns",
 
-                    # Diversification / basin escape
-                    "rnd_var_lns",
-                    "rnd_cst_lns",
+                "graph_arc_lns",
+                "graph_var_lns",
+                "graph_cst_lns",
+                "graph_dec_lns",
 
+                "rnd_var_lns",
+                "rnd_cst_lns",
 
-                    "ls*",
+                "ls*"
                 ]
-            ))
+                ))
 
             params.filter_subsolvers.extend(allowed)
 
@@ -3449,6 +3501,7 @@ def solve_one_asu_cpsat(
             _configure_asu_pseudo_costs(params)
             _configure_asu_shared_tree(
                 params,
+                workers=workers,
                 tract_first=tract_first_enabled,
             )
             if configure_subsolvers:
@@ -3585,6 +3638,7 @@ def solve_one_asu_cpsat(
             stalled = threading.Event()
             stopped = threading.Event()
             stop_kind: Optional[str] = None
+            bound_stop_value: Optional[float] = None
             watchdog_start = time.monotonic()
             progress = {
                 "last_incumbent_time": watchdog_start,
@@ -3609,10 +3663,21 @@ def solve_one_asu_cpsat(
                             progress["last_incumbent_time"] = time.monotonic()
 
             def _on_best_bound(bound: float) -> None:
+                nonlocal stop_kind
+                nonlocal bound_stop_value
                 with progress_lock:
                     if bound < progress["best_bound"] - 1e-9:
                         progress["best_bound"] = float(bound)
                         progress["last_bound_time"] = time.monotonic()
+                    if (
+                        bound_stop_threshold is not None
+                        and progress["best_obj"] <= bound_stop_threshold
+                        and bound <= bound_stop_threshold + 1e-9
+                    ):
+                        stop_kind = "bound"
+                        bound_stop_value = float(bound)
+                        stopped.set()
+                        solver.stop_search()
 
             def _stall_watchdog() -> None:
                 # Triggers on incumbent stagnation alone: a bound that keeps
@@ -3653,6 +3718,34 @@ def solve_one_asu_cpsat(
                         solver.stop_search()
                         return
 
+            def _incumbent_reporter() -> None:
+                nonlocal last_reported_incumbent
+                interval = max(1.0, float(incumbent_report_interval_seconds))
+                while not solve_done.is_set():
+                    with progress_lock:
+                        selection = progress["best_selection"]
+                    if selection is not None:
+                        expanded = tuple(sorted({
+                            original_node
+                            for contracted_node in selection
+                            for original_node in expand_c[int(contracted_node)]
+                        }))
+                        if expanded != last_reported_incumbent:
+                            try:
+                                incumbent_report_callback(
+                                    list(expanded),
+                                    int(u_g_orig[list(expanded)].sum()),
+                                )
+                                last_reported_incumbent = expanded
+                            except Exception as exc:
+                                if log:
+                                    print(
+                                        f"  [incumbent] progress callback failed: {exc}",
+                                        flush=True,
+                                    )
+                    if solve_done.wait(interval):
+                        return
+
             callback = _MainSolveCallback()
             solver.best_bound_callback = _on_best_bound
             watchdog = threading.Thread(target=_stall_watchdog, daemon=True)
@@ -3661,6 +3754,13 @@ def solve_one_asu_cpsat(
             if stop_flag_path or skip_flag_path:
                 stop_watchdog = threading.Thread(target=_stop_watchdog, daemon=True)
                 stop_watchdog.start()
+            incumbent_reporter: Optional[threading.Thread] = None
+            if incumbent_report_callback is not None:
+                incumbent_reporter = threading.Thread(
+                    target=_incumbent_reporter,
+                    daemon=True,
+                )
+                incumbent_reporter.start()
             try:
                 main_status = solver.Solve(model, callback)
             finally:
@@ -3668,6 +3768,8 @@ def solve_one_asu_cpsat(
                 watchdog.join()
                 if stop_watchdog is not None:
                     stop_watchdog.join()
+                if incumbent_reporter is not None:
+                    incumbent_reporter.join()
 
             status = main_status
             status_name = solver.StatusName(main_status)
@@ -3695,17 +3797,31 @@ def solve_one_asu_cpsat(
             if stopped.is_set():
                 if best_connected is not None and best_obj >= 0:
                     status = cp_model.FEASIBLE
-                    status_name = "SKIPPED_FEASIBLE" if stop_kind == "skip" else "STOPPED_FEASIBLE"
+                    if stop_kind == "skip":
+                        status_name = "SKIPPED_FEASIBLE"
+                    elif stop_kind == "bound":
+                        status_name = "BOUND_STOPPED_FEASIBLE"
+                    else:
+                        status_name = "STOPPED_FEASIBLE"
                     selected = list(best_connected)
                     objective = best_obj
                 if log:
-                    tag = stop_kind or "stop"
-                    label = "Skip-current-ASU" if tag == "skip" else "Stop"
-                    print(
-                        f"  [{tag}] {label} signal received; returning "
-                        f"current incumbent {best_obj if best_obj >= 0 else 'none'}.",
-                        flush=True,
-                    )
+                    if stop_kind == "bound":
+                        print(
+                            "  [bound] objective upper bound reached the "
+                            f"no-improvement threshold ({bound_stop_value:.1f} <= "
+                            f"{bound_stop_threshold}); returning incumbent "
+                            f"{best_obj if best_obj >= 0 else 'none'}.",
+                            flush=True,
+                        )
+                    else:
+                        tag = stop_kind or "stop"
+                        label = "Skip-current-ASU" if tag == "skip" else "Stop"
+                        print(
+                            f"  [{tag}] {label} signal received; returning "
+                            f"current incumbent {best_obj if best_obj >= 0 else 'none'}.",
+                            flush=True,
+                        )
                 break
 
             if main_status == cp_model.OPTIMAL:
@@ -6724,6 +6840,7 @@ def build_many_asus_cpsat(
     use_flow_capacity_hybrid_search: bool = False,
     use_capacity_sweep: bool = False,
     capacity_sweep_time_limit: float = 30.0,
+    progress_out_path: Optional[str] = None,
     incumbent_stall_seconds: Optional[float] = None,
 ) -> Dict[str, np.ndarray]:
     """
@@ -6814,6 +6931,10 @@ def build_many_asus_cpsat(
     incumbent is committed as its ASU and the loop continues on to build the
     next ASU window normally.
 
+    `progress_out_path`, when given, is updated atomically with JSON snapshots
+    of the current tract assignments as the run proceeds. This can drive live
+    UI updates while CP-SAT is still running.
+
     When `use_capacity_sweep` is True, a final pass (after the main loop and
     any combine phase) tries to salvage brand-new standalone ASUs from tracts
     still left in `remaining` -- restricted entirely to the remaining-tract
@@ -6861,6 +6982,74 @@ def build_many_asus_cpsat(
     tried = np.zeros(n, dtype=bool)
     asu_id = np.full(n, -1, dtype=int)
     num, den = as_fraction_tau(tau)
+
+    def _sequential_asu_ids(values: np.ndarray) -> np.ndarray:
+        """Return a copy whose positive ASU labels are contiguous from 1."""
+        compact = np.asarray(values, dtype=int).copy()
+        positive_ids = np.unique(compact[compact > 0])
+        for sequential_id, original_id in enumerate(positive_ids, start=1):
+            if int(original_id) != sequential_id:
+                compact[compact == original_id] = sequential_id
+        return compact
+
+    progress_write_lock = threading.Lock()
+
+    def _emit_progress(
+        phase: str,
+        exploring_idx: Optional[Sequence[int]] = None,
+        exploring_candidate_idx: Optional[Sequence[int]] = None,
+        exploring_added_idx: Optional[Sequence[int]] = None,
+        exploring_removed_idx: Optional[Sequence[int]] = None,
+    ) -> None:
+        if not progress_out_path:
+            return
+        try:
+            published_asu_id = _sequential_asu_ids(asu_id)
+            active_mask = published_asu_id > 0
+            exploring = sorted({
+                int(node)
+                for node in (exploring_idx or [])
+                if 0 <= int(node) < n
+            })
+            exploring_candidate = sorted({
+                int(node)
+                for node in (exploring_candidate_idx or [])
+                if 0 <= int(node) < n
+            })
+            exploring_added = sorted({
+                int(node)
+                for node in (exploring_added_idx or [])
+                if 0 <= int(node) < n
+            })
+            exploring_removed = sorted({
+                int(node)
+                for node in (exploring_removed_idx or [])
+                if 0 <= int(node) < n
+            })
+            payload = {
+                "phase": str(phase),
+                "n_asu": int(np.unique(published_asu_id[active_mask]).size),
+                "total_unemp": int(u[np.where(active_mask)[0]].sum()),
+                "asu_id": published_asu_id.tolist(),
+                "exploring_idx": exploring,
+                "exploring_candidate_idx": exploring_candidate,
+                "exploring_added_idx": exploring_added,
+                "exploring_removed_idx": exploring_removed,
+                "updated_at": time.time(),
+            }
+            with progress_write_lock:
+                tmp_path = f"{progress_out_path}.tmp"
+                with open(tmp_path, "w", encoding="utf-8") as handle:
+                    json.dump(payload, handle)
+                os.replace(tmp_path, progress_out_path)
+        except Exception as exc:
+            if verbose:
+                print(
+                    f"  [progress] failed to write snapshot: {exc}",
+                    flush=True,
+                )
+
+    _emit_progress("INIT")
 
     if verbose:
         print(
@@ -7381,6 +7570,7 @@ def build_many_asus_cpsat(
                 asu_id[nodes] = k
                 remaining[nodes] = False
                 tried[nodes] = False
+                _emit_progress("HARVEST_EXPAND")
                 if verbose:
                     su = int(u[nodes].sum())
                     sE = int(E[nodes].sum())
@@ -7499,6 +7689,7 @@ def build_many_asus_cpsat(
             asu_id[S_final] = k
             remaining[S_final] = False
             tried[S_final] = False
+            _emit_progress("UNCAPPED_RESCUE")
 
             if verbose:
                 su, sE, sP = int(u[S_final].sum()), int(E[S_final].sum()), int(P[S_final].sum())
@@ -7577,6 +7768,43 @@ def build_many_asus_cpsat(
                     int(hint_obj_local),
                     "RELAXATION_PROVEN_OPTIMAL",
                 )
+
+            incumbent_callback = None
+            if progress_out_path and len(windows) == 1:
+                baseline_local = {int(node) for node in (hint_local or [])}
+
+                def incumbent_callback(
+                    selected_local: List[int],
+                    _objective: int,
+                ) -> None:
+                    selected_local_set = {int(node) for node in selected_local}
+                    candidate_local = {
+                        int(neighbor)
+                        for node in selected_local_set
+                        for neighbor in w["nb_local"][node]
+                        if int(neighbor) not in selected_local_set
+                    }
+
+                    def _to_global(local_nodes: Set[int]) -> List[int]:
+                        return [
+                            int(w["sub"][local_node])
+                            for local_node in sorted(local_nodes)
+                        ]
+
+                    _emit_progress(
+                        "INCUMBENT_PREVIEW",
+                        exploring_idx=_to_global(
+                            selected_local_set & baseline_local
+                        ),
+                        exploring_candidate_idx=_to_global(candidate_local),
+                        exploring_added_idx=_to_global(
+                            selected_local_set - baseline_local
+                        ),
+                        exploring_removed_idx=_to_global(
+                            baseline_local - selected_local_set
+                        ),
+                    )
+
             result = solve_one_asu_cpsat(
                 nb_local=w["nb_local"], u_g=w["u_g"], E_g=w["E_g"], P_g=w["P_g"],
                 tau=tau, pop_thresh=pop_thresh, root_local=w["root_local"],
@@ -7614,6 +7842,8 @@ def build_many_asus_cpsat(
                 exact_nodes=exact_nodes_per_asu,
                 stop_flag_path=stop_flag_path,
                 skip_flag_path=skip_flag_path,
+                incumbent_report_callback=incumbent_callback,
+                incumbent_report_interval_seconds=60.0,
                 # cluster_groups intentionally NOT passed here: tying high-UR
                 # cluster members via equality is provably correct (validated
                 # against brute force) but empirically hurts this time-limited
@@ -7629,6 +7859,12 @@ def build_many_asus_cpsat(
                 sols = list(pool.map(_solve, windows))
         else:
             sols = [_solve(windows[0])]
+
+        # Remove any provisional incumbent overlay before refining or committing
+        # the returned solution. The subsequent commit snapshot paints the final
+        # ASU through the normal assignment path.
+        if progress_out_path and len(windows) == 1:
+            _emit_progress("INCUMBENT_CLEAR")
 
         # ---- Refine each window's result within its own reserved territory ----
         candidates: List[List[int]] = []
@@ -7759,6 +7995,7 @@ def build_many_asus_cpsat(
             asu_id[S_final] = k
             remaining[S_final] = False
             tried[S_final] = False
+            _emit_progress("MAIN_COMMIT")
 
             if verbose:
                 su, sE, sP = int(u[S_final].sum()), int(E[S_final].sum()), int(P[S_final].sum())
@@ -7947,6 +8184,7 @@ def build_many_asus_cpsat(
                 remaining[old_mask] = True
                 asu_id[S_global] = new_id
                 remaining[S_global] = False
+                _emit_progress("COMBINE")
 
                 if verbose:
                     su2, sE2, sP2 = int(u[S_global].sum()), int(E[S_global].sum()), int(P[S_global].sum())
@@ -8117,6 +8355,7 @@ def build_many_asus_cpsat(
             k += 1
             asu_id[S_final] = k
             remaining[S_final] = False
+            _emit_progress("CAPACITY_SWEEP")
             if verbose:
                 su, sE, sP = int(u[S_final].sum()), int(E[S_final].sum()), int(P[S_final].sum())
                 ur_value = 100.0 * ur_of(su, sE)
@@ -8158,6 +8397,17 @@ def build_many_asus_cpsat(
             return False
 
         current_global = np.where(asu_id == asu_number)[0].astype(int).tolist()
+        total_polish_unemp = int(u[np.where(asu_id > 0)[0]].sum())
+        if verbose:
+            print(
+                f"\n[STAGE] FINAL_POLISH round={polish_round} "
+                f"checked={polish_position - 1}/{polish_count} "
+                f"checking_asu={asu_number} "
+                f"position={polish_position}/{polish_count} "
+                f"total_unemp={total_polish_unemp} "
+                f"tracts={len(current_global)}",
+                flush=True,
+            )
         if not component_ok(
             current_global, u, E, P, tau, pop_thresh, nb
         ):
@@ -8334,6 +8584,7 @@ def build_many_asus_cpsat(
         remaining[current_global] = True
         asu_id[polished_global] = asu_number
         remaining[polished_global] = False
+        _emit_progress("FINAL_POLISH")
         if verbose:
             print(
                 f"  [OK] ASU {asu_number} polished: "
@@ -8350,17 +8601,24 @@ def build_many_asus_cpsat(
         while True:
             polish_round += 1
             polish_ids = np.unique(asu_id[asu_id > 0]).astype(int).tolist()
+            total_polish_unemp = int(u[np.where(asu_id > 0)[0]].sum())
             polish_ids.sort(
                 key=lambda asu_number: (
-                    int(u[np.where(asu_id == asu_number)[0]].sum()),
+                    -int(np.sum(asu_id == asu_number)),
                     asu_number,
                 )
             )
             if verbose and polish_ids:
                 print(
+                    f"\n[STAGE] FINAL_POLISH round={polish_round} "
+                    f"asus={len(polish_ids)} total_unemp={total_polish_unemp}",
+                    flush=True,
+                )
+                print(
                     f"\n[FINAL POLISH] round {polish_round}: "
                     f"{len(polish_ids)} ASU(s), each seeing all currently "
-                    f"unassigned tracts ({polish_time_limit:.1f}s each)",
+                    f"unassigned tracts ({polish_time_limit:.1f}s each); "
+                    f"total unemployment currently captured={total_polish_unemp}",
                     flush=True,
                 )
 
@@ -8414,6 +8672,7 @@ def build_many_asus_cpsat(
             for merged_id, nodes in merged_assignments:
                 asu_id[nodes] = merged_id
                 remaining[nodes] = False
+            _emit_progress("FINAL_POLISH_MERGE")
 
             if verbose:
                 print(
@@ -8468,9 +8727,16 @@ def build_many_asus_cpsat(
 
                 if verbose:
                     print(
+                        f"\n[STAGE] SINGLE_ASU_TAKEOVER asu={big_asu_id} "
+                        f"total_unemp={total_before} "
+                        f"asu_unemp={current_objective}",
+                        flush=True,
+                    )
+                    print(
                         f"\n[SINGLE-ASU TAKEOVER] ASU {big_asu_id} "
                         f"(unemp={current_objective}, tracts={len(current_global)}) "
-                        f"now sees all {n} tracts ({polish_time_limit:.1f}s)",
+                        f"now sees all {n} tracts ({polish_time_limit:.1f}s); "
+                        f"current total captured={total_before}",
                         flush=True,
                     )
 
@@ -8515,6 +8781,7 @@ def build_many_asus_cpsat(
                     max_nodes=None,
                     stop_flag_path=stop_flag_path,
                     skip_flag_path=skip_flag_path,
+                    objective_no_improve_stop=current_objective,
                 )
 
                 if result is None:
@@ -8526,7 +8793,18 @@ def build_many_asus_cpsat(
                 else:
                     new_global = sorted(set(int(i) for i in result.sel_idx_local))
                     new_objective = int(u[new_global].sum())
-                    if new_objective >= current_objective and component_ok(
+                    bound_stopped_no_gain = (
+                        result.status == "BOUND_STOPPED_FEASIBLE"
+                        and new_objective <= current_objective
+                    )
+                    if bound_stopped_no_gain:
+                        if verbose:
+                            print(
+                                "  [SINGLE-ASU TAKEOVER] early stop: objective "
+                                "upper bound cannot beat current ASU unemployment",
+                                flush=True,
+                            )
+                    elif new_objective >= current_objective and component_ok(
                         new_global, u, E, P, tau, pop_thresh, nb
                     ):
                         new_set = set(new_global)
@@ -8560,6 +8838,7 @@ def build_many_asus_cpsat(
                         if total_after > total_before:
                             asu_id = trial_asu_id
                             remaining = asu_id < 0
+                            _emit_progress("SINGLE_ASU_TAKEOVER")
                             if verbose:
                                 print(
                                     f"  [OK] SINGLE-ASU TAKEOVER accepted: ASU "
@@ -8587,6 +8866,10 @@ def build_many_asus_cpsat(
                             flush=True,
                         )
 
+    # Merge operations deliberately retain the smallest member ID internally,
+    # which can leave gaps. Compact once all solver bookkeeping is finished so
+    # the returned result guarantees ASU IDs 1..n with no missing labels.
+    asu_id = _sequential_asu_ids(asu_id)
     n_asu_final = int(np.unique(asu_id[asu_id > 0]).size)
 
     # Final summary if stopped due to no high-UR tracts
@@ -8595,6 +8878,8 @@ def build_many_asus_cpsat(
         if rem_idx_final.size > 0:
             max_ur_remaining = UR[rem_idx_final].max() * 100
             print(f"\nStopped after {n_asu_final} ASUs. Max UR among {rem_idx_final.size} remaining tracts: {max_ur_remaining:.3f}%", flush=True)
+
+    _emit_progress("DONE")
 
     return {"asu_id": asu_id.tolist(), "n_asu": n_asu_final}
 
