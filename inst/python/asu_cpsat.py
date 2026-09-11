@@ -30,6 +30,7 @@ Examples:
 from __future__ import annotations
 
 import argparse
+from bisect import bisect_right
 import concurrent.futures
 import heapq
 import json
@@ -1830,6 +1831,113 @@ def _capacity_budget(q_surplus: np.ndarray, forced_set: set, N: int) -> int:
     )
 
 
+def _surplus_knapsack_bounds(
+    q_surplus: np.ndarray,
+    forced_set: set,
+    N: int,
+    budget_global: Optional[int] = None,
+) -> Tuple[Optional[int], List[int], int]:
+    """Exact cardinality bounds for the rate-only selection relaxation.
+
+    Forced nodes and every optional node with non-negative UR surplus are free
+    (or beneficial) to include. Among optional negative-surplus nodes, taking
+    the least-negative values first maximizes how many fit in the available
+    surplus. This is the exact maximum selected-node count after relaxing
+    population, connectivity, and the objective.
+
+    Returns (max_selected, negative_idx, max_negative). max_selected is None
+    when even all optional non-negative surplus cannot offset the forced nodes;
+    in that case the rate row itself makes the model infeasible.
+    """
+    optional_idx = [i for i in range(N) if i not in forced_set]
+    negative_idx = sorted(
+        (i for i in optional_idx if q_surplus[i] < 0),
+        key=lambda i: q_surplus[i],
+        reverse=True,  # cheapest (closest to 0) consumer first
+    )
+    running = (
+        _capacity_budget(q_surplus, forced_set, N)
+        if budget_global is None
+        else int(budget_global)
+    )
+    if running < 0:
+        return None, negative_idx, 0
+
+    max_negative = 0
+    for i in negative_idx:
+        running += int(q_surplus[i])
+        if running < 0:
+            break
+        max_negative += 1
+
+    # All nodes except optional negative-surplus nodes are included, followed
+    # by the maximum affordable prefix of those negative-surplus nodes.
+    max_selected = N - len(negative_idx) + max_negative
+    return int(max_selected), negative_idx, max_negative
+
+
+def _profitable_closure_edges(nb, u, q):
+    """Implications neighbor -> profitable node on the contracted graph."""
+    return [
+        (int(neighbor), node)
+        for node in range(len(nb))
+        if int(q[node]) >= 0 and int(u[node]) > 0
+        for neighbor in nb[node]
+        if int(neighbor) != node
+    ]
+
+
+def _lagrangian_conditional_bounds(u, q, forced):
+    """Floor of min_lambda B_{forced union {i}}(lambda), using exact rationals.
+
+    Nonnegative unemployment is required. Dropping connectivity/population
+    gives a valid upper bound. Prefix sums over u/(-q) breakpoints permit each
+    conditional minimum to be found by binary search, without another solve.
+    -1 denotes an infeasible conditional rate row (nonnegative objectives).
+    """
+    u, q = list(map(int, u)), list(map(int, q))
+    if any(value < 0 for value in u):
+        raise ValueError("Lagrangian bounds require nonnegative unemployment")
+    forced = set(forced)
+    events = sorted(
+        (Fraction(u[i], -q[i]), i)
+        for i in range(len(u)) if i not in forced and q[i] < 0
+    )
+    breaks = sorted({Fraction(0)} | {value for value, _ in events})
+    event_points = [value for value, _ in events]
+    prefix_u, prefix_q = [0], [0]
+    for _, i in events:
+        prefix_u.append(prefix_u[-1] + u[i])
+        prefix_q.append(prefix_q[-1] + q[i])
+    total_u, total_q = sum(u), sum(q)
+
+    def value_slope(lam, i):
+        removed = bisect_right(event_points, lam)
+        intercept = total_u - prefix_u[removed]
+        slope = total_q - prefix_q[removed]
+        # Force i back in after its coefficient would otherwise be omitted.
+        if i not in forced and q[i] < 0 and lam * (-q[i]) >= u[i]:
+            intercept += u[i]
+            slope += q[i]
+        return intercept + lam * slope, slope
+
+    bounds = []
+    for i in range(len(u)):
+        if value_slope(breaks[-1], i)[1] < 0:
+            bounds.append(-1)
+            continue
+        lo, hi = 0, len(breaks) - 1
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if value_slope(breaks[mid], i)[1] >= 0:
+                hi = mid
+            else:
+                lo = mid + 1
+        value, _ = value_slope(breaks[lo], i)
+        bounds.append(value.numerator // value.denominator)
+    return bounds
+
+
 def _bridge_subtree_zero_fix(
     nb_local: List[List[int]],
     root_local: int,
@@ -1969,6 +2077,8 @@ def solve_one_asu_cpsat(
     objective_no_improve_stop: Optional[int] = None,
     incumbent_report_callback: Optional[Callable[[List[int], int], None]] = None,
     incumbent_report_interval_seconds: float = 60.0,
+    use_profitable_component_closure: bool = True,
+    use_lagrangian_variable_fixing: bool = True,
 ) -> Optional[CpsatResult]:
     """
         Connectivity via iterative vertex-separator cuts. Each disconnected incumbent
@@ -1987,6 +2097,12 @@ def solve_one_asu_cpsat(
     precedence over `max_nodes` if both are set. Intended for experimenting
     with whether fixing the selected tract count speeds up a single ASU solve;
     infeasible if no valid ASU of exactly that size exists in this window.
+
+    `use_profitable_component_closure` adds neighbor-to-profitable-component
+    implications. `use_lagrangian_variable_fixing` excludes nodes whose exact
+    rate-relaxed conditional objective bound is below a verified incumbent.
+    Both default on, run only without max_nodes/exact_nodes, and preserve
+    primary-objective ties. Each can be disabled for controlled comparisons.
 
     `objective_upper_bound` and `initial_connectivity_cuts` may be supplied by
     a connectivity-free solve over this same window. The former is valid because
@@ -2192,6 +2308,17 @@ def solve_one_asu_cpsat(
     num, den = as_fraction_tau(tau)
     q_surplus = den * u_g.astype(np.int64) - num * E_g.astype(np.int64)
 
+    # Completion improves the primary objective but can violate a tract count
+    # constraint. Strictly positive unemployment avoids disturbing count ties.
+    uncapped_reductions = max_nodes is None and exact_nodes is None
+    if uncapped_reductions and use_profitable_component_closure:
+        closure_edges = _profitable_closure_edges(nb_local, u_g, q_surplus)
+        for neighbor, profitable in closure_edges:
+            model.Add(x[neighbor] <= x[profitable])
+        if log:
+            print(f"  profitable component closure: {len(closure_edges)} implications",
+                  flush=True)
+
     separator_implications, separator_component_bounds = (
         _small_root_separator_implications(
             nb_local,
@@ -2225,25 +2352,15 @@ def solve_one_asu_cpsat(
     # this needs no separator -- the single UR row already limits how many
     # below-threshold (q<0) tracts can jointly appear in ANY feasible solution,
     # using the same best-case, connectivity/pop-ignoring supply trick as K_C
-    # and the M sub-solve below. Unproven vs. CP-SAT's own automatic knapsack-
+    # and the analytical count bound below. Unproven vs. CP-SAT's own knapsack-
     # cover cuts at linearization_level=2 -- opt-in pending an A/B test.
     if use_global_capacity_cardinality_bound or use_bridge_subtree_pruning:
         budget_global = _capacity_budget(q_surplus, forced_set, N)
 
     if use_global_capacity_cardinality_bound:
-        optional_idx = [i for i in range(N) if i not in forced_set]
-        negative_idx = sorted(
-            (i for i in optional_idx if q_surplus[i] < 0),
-            key=lambda i: q_surplus[i],
-            reverse=True,  # cheapest (closest to 0) consumer first
+        _, negative_idx, k_neg = _surplus_knapsack_bounds(
+            q_surplus, forced_set, N, budget_global
         )
-        running = budget_global
-        k_neg = 0
-        for i in negative_idx:
-            running += int(q_surplus[i])
-            if running < 0:
-                break
-            k_neg += 1
         if k_neg < len(negative_idx):
             model.Add(sum(x[i] for i in negative_idx) <= k_neg)
         if log:
@@ -2672,6 +2789,32 @@ def solve_one_asu_cpsat(
             hint, u_g, E_g, P_g, tau, pop_thresh, nb_local
         ) else None
     )
+    if (
+        uncapped_reductions and use_lagrangian_variable_fixing
+        and flow_source is not None
+        and forced_set.issubset(set(flow_source))
+        and component_ok(flow_source, u_g, E_g, P_g, tau, pop_thresh, nb_local)
+        and all(int(value) >= 0 for value in u_g)
+    ):
+        reduction_start = time.monotonic()
+        # Recompute L from a verified feasible selection, not caller metadata.
+        incumbent_floor = sum(int(u_g[i]) for i in flow_source)
+        conditional_bounds = _lagrangian_conditional_bounds(
+            u_g, q_surplus, forced_set
+        )
+        fixed_zero = [
+            i for i, bound in enumerate(conditional_bounds)
+            if i not in forced_set and bound < incumbent_floor
+        ]
+        for i in fixed_zero:
+            model.Add(x[i] == 0)
+        if log:
+            print(
+                f"  Lagrangian fixing: {len(fixed_zero)} nodes fixed to 0, "
+                f"incumbent={incumbent_floor}, "
+                f"elapsed={time.monotonic() - reduction_start:.3f}s",
+                flush=True,
+            )
     # Cut-pass rounds repeatedly overwrite the model's variable hints with
     # small, partial expand attempts (see _set_expand_hint); refresh x[] here
     # so the flow phase starts from a hint consistent with flow_source rather
@@ -2686,34 +2829,32 @@ def solve_one_asu_cpsat(
         if flow_source is not None else {}
     )
 
-    # Tighten the shared selection-count bound via a fast connectivity-free
-    # solve: max tracts s.t. UR/pop only (dropping connectivity only enlarges
-    # the feasible region, so this is a valid upper bound on ANY feasible
-    # selection). Shared by both connectivity formulations below -- signed
-    # flow uses it for per-edge bounds, arborescence uses it for depth bounds.
-    _mM = cp_model.CpModel()
-    _mx = [_mM.NewBoolVar(f"mx_{i}") for i in range(N)]
-    for _fi in forced_set:
-        _mM.Add(_mx[_fi] == 1)
-    _mM.Add(sum(int(P_g[i]) * _mx[i] for i in range(N)) >= int(pop_thresh))
-    _mM.Add(
-        sum(int(den) * int(u_g[i]) * _mx[i] for i in range(N))
-        - sum(int(num) * int(E_g[i]) * _mx[i] for i in range(N))
-        >= 0
+    # Tighten the shared selection-count bound without launching an auxiliary
+    # CP-SAT solve. The rate-only surplus knapsack has an exact greedy answer:
+    # include forced and non-negative-surplus nodes, then consume the available
+    # surplus with optional deficits from smallest to largest. Dropping the
+    # population and connectivity rows keeps this a valid upper bound for every
+    # feasible ASU while eliminating up to 10 seconds of setup/solve latency.
+    surplus_count_bound, _, surplus_negative_bound = _surplus_knapsack_bounds(
+        q_surplus, forced_set, N
     )
-    _mM.Maximize(sum(_mx))
-    _ms = cp_model.CpSolver()
-    _ms.parameters.num_search_workers = max(1, int(workers))
-    _ms.parameters.max_time_in_seconds = 10.0
-    _ms.parameters.cp_model_presolve = True
-    _ms.parameters.linearization_level = 2
-    _ms.parameters.log_search_progress = False
-    _ms_status = _ms.Solve(_mM)
-    if _ms_status == cp_model.OPTIMAL:
-        max_selected = max(1, int(round(_ms.ObjectiveValue())))
-    else:
-        max_selected = N
+    max_selected = N if surplus_count_bound is None else surplus_count_bound
+    max_selected = max(len(forced_set), min(N, int(max_selected)))
     M = max(1, max_selected - 1)
+
+    if log:
+        if surplus_count_bound is None:
+            print(
+                "  analytical surplus bound: rate relaxation infeasible; "
+                f"leaving flow count envelope at {N}",
+                flush=True,
+            )
+        else:
+            print(
+                f"  analytical surplus bound: selected <= {max_selected} "
+                f"({surplus_negative_bound} optional deficit tract(s))",
+                flush=True,
+            )
 
     selected_count = model.NewIntVar(len(forced_set), max_selected, "selected_count")
     model.Add(selected_count == sum(x))
@@ -7051,6 +7192,37 @@ def build_many_asus_cpsat(
 
     _emit_progress("INIT")
 
+    # Each concurrent territory keeps its own delta. Serialize aggregation and
+    # publication together so a later writer cannot overwrite a newer preview.
+    preview_lock = threading.Lock()
+    preview_deltas: Dict[object, Tuple[Set[int], Set[int]]] = {}
+
+    def _incumbent_preview(key, local_to_global, baseline_local):
+        if not progress_out_path:
+            return None
+        mapping = tuple(int(node) for node in local_to_global)
+        baseline = {mapping[int(node)] for node in baseline_local}
+
+        def report(selected_local, _objective):
+            selected = {mapping[int(node)] for node in selected_local}
+            with preview_lock:
+                preview_deltas[key] = (selected - baseline, baseline - selected)
+                added, removed = set(), set()
+                for delta_added, delta_removed in preview_deltas.values():
+                    added.update(delta_added)
+                    removed.update(delta_removed)
+                _emit_progress(
+                    "INCUMBENT_PREVIEW",
+                    exploring_added_idx=sorted(added),
+                    exploring_removed_idx=sorted(removed - added),
+                )
+        return report
+
+    def _clear_incumbent_previews():
+        with preview_lock:
+            preview_deltas.clear()
+            _emit_progress("INCUMBENT_CLEAR")
+
     if verbose:
         print(
             "[igraph] articulation-point acceleration: "
@@ -7427,6 +7599,10 @@ def build_many_asus_cpsat(
                         log=verbose,
                         hint=seed_local,
                         hint_obj=seed_objective,
+                        incumbent_report_callback=_incumbent_preview(
+                            ("expansion", unit_index), territory_global, seed_local
+                        ),
+                        incumbent_report_interval_seconds=60.0,
                         deterministic_ties=deterministic_ties,
                         tie_break_rank=expansion_tie_rank,
                         objective_shaving=objective_shaving,
@@ -7491,6 +7667,7 @@ def build_many_asus_cpsat(
                     expanded_results = [_expand_standalone(0)]
 
                 expanded_units = [nodes for nodes, _ in expanded_results]
+                _clear_incumbent_previews()
                 expansion_statuses = [status for _, status in expanded_results]
                 should_merge = (
                     merge_adjacent
@@ -7769,41 +7946,9 @@ def build_many_asus_cpsat(
                     "RELAXATION_PROVEN_OPTIMAL",
                 )
 
-            incumbent_callback = None
-            if progress_out_path and len(windows) == 1:
-                baseline_local = {int(node) for node in (hint_local or [])}
-
-                def incumbent_callback(
-                    selected_local: List[int],
-                    _objective: int,
-                ) -> None:
-                    selected_local_set = {int(node) for node in selected_local}
-                    candidate_local = {
-                        int(neighbor)
-                        for node in selected_local_set
-                        for neighbor in w["nb_local"][node]
-                        if int(neighbor) not in selected_local_set
-                    }
-
-                    def _to_global(local_nodes: Set[int]) -> List[int]:
-                        return [
-                            int(w["sub"][local_node])
-                            for local_node in sorted(local_nodes)
-                        ]
-
-                    _emit_progress(
-                        "INCUMBENT_PREVIEW",
-                        exploring_idx=_to_global(
-                            selected_local_set & baseline_local
-                        ),
-                        exploring_candidate_idx=_to_global(candidate_local),
-                        exploring_added_idx=_to_global(
-                            selected_local_set - baseline_local
-                        ),
-                        exploring_removed_idx=_to_global(
-                            baseline_local - selected_local_set
-                        ),
-                    )
+            incumbent_callback = _incumbent_preview(
+                ("window", w["seed"]), w["sub"], hint_local or []
+            )
 
             result = solve_one_asu_cpsat(
                 nb_local=w["nb_local"], u_g=w["u_g"], E_g=w["E_g"], P_g=w["P_g"],
@@ -7863,8 +8008,7 @@ def build_many_asus_cpsat(
         # Remove any provisional incumbent overlay before refining or committing
         # the returned solution. The subsequent commit snapshot paints the final
         # ASU through the normal assignment path.
-        if progress_out_path and len(windows) == 1:
-            _emit_progress("INCUMBENT_CLEAR")
+        _clear_incumbent_previews()
 
         # ---- Refine each window's result within its own reserved territory ----
         candidates: List[List[int]] = []

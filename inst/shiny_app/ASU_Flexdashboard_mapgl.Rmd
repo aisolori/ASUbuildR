@@ -724,20 +724,20 @@ update_map_with_data <- function(map_id = "edit_map", new_data = NULL) {
         line_opacity = 1,
         visibility = "none"
       ) |>
-      mapgl::add_line_layer(
+      mapgl::add_fill_layer(
         id = "exploring_removed",
         source = data,
-        line_color = "#D32F2F",
-        line_width = 4,
-        line_opacity = 1,
+        fill_color = "#D32F2F",
+        fill_opacity = 0.25,
+        fill_antialias = FALSE,
         visibility = "none"
       ) |>
-      mapgl::add_line_layer(
+      mapgl::add_fill_layer(
         id = "exploring_added",
         source = data,
-        line_color = "#2E7D32",
-        line_width = 4,
-        line_opacity = 1,
+        fill_color = "#2E7D32",
+        fill_opacity = 0.25,
+        fill_antialias = FALSE,
         visibility = "none"
       ) |>
       mapgl::add_line_layer(
@@ -1040,7 +1040,10 @@ output$algo_blurb <- shiny::renderUI({
        </p>
        <p>
          While solving, a live <em>CP-SAT log</em> panel appears (top-right)
-         showing progress. When the solver finishes, the map and summary table
+         showing progress. Single-ASU and partition expansion incumbents are
+         checked every minute. Subtle green/red fills show additions/removals
+         relative to each solve's starting hint; these temporary previews clear
+         before results are committed. When the solver finishes, the map and summary table
          update automatically; tracts with <code>asunum = 0</code> are not in
          any ASU.
        </p>
@@ -1642,6 +1645,10 @@ print('[runner] OK', flush=True)
             overlay_idx <- suppressWarnings(as.integer(
               progress_payload[[overlay_spec$payload]] %||% integer(0)
             ))
+            # Suppress retained/candidate outlines, including older snapshots.
+            if (overlay_spec$layer %in% c("exploring", "exploring_candidate")) {
+              overlay_idx <- integer(0)
+            }
             overlay_idx <- unique(overlay_idx[
               !is.na(overlay_idx) & overlay_idx >= 0L &
                 overlay_idx < nrow(merged_df)
@@ -2036,22 +2043,22 @@ output$initial_map <- mapgl::renderMaplibre({
       line_opacity = 1,
       visibility = "none"
     ) |>
-    mapgl::add_line_layer(
+    mapgl::add_fill_layer(
       id = "exploring_removed",
       source = layer_source,
       source_layer = source_layer,
-      line_color = "#D32F2F",
-      line_width = 4,
-      line_opacity = 1,
+      fill_color = "#D32F2F",
+      fill_opacity = 0.25,
+      fill_antialias = FALSE,
       visibility = "none"
     ) |>
-    mapgl::add_line_layer(
+    mapgl::add_fill_layer(
       id = "exploring_added",
       source = layer_source,
       source_layer = source_layer,
-      line_color = "#2E7D32",
-      line_width = 4,
-      line_opacity = 1,
+      fill_color = "#2E7D32",
+      fill_opacity = 0.25,
+      fill_antialias = FALSE,
       visibility = "none"
     )
 }) |>
@@ -2191,22 +2198,22 @@ output$edit_map <- mapgl::renderMaplibre({
       line_opacity = 1,
       visibility = "none"
     ) |>
-    mapgl::add_line_layer(
+    mapgl::add_fill_layer(
       id = "exploring_removed",
       source = layer_source,
       source_layer = source_layer,
-      line_color = "#D32F2F",
-      line_width = 4,
-      line_opacity = 1,
+      fill_color = "#D32F2F",
+      fill_opacity = 0.25,
+      fill_antialias = FALSE,
       visibility = "none"
     ) |>
-    mapgl::add_line_layer(
+    mapgl::add_fill_layer(
       id = "exploring_added",
       source = layer_source,
       source_layer = source_layer,
-      line_color = "#2E7D32",
-      line_width = 4,
-      line_opacity = 1,
+      fill_color = "#2E7D32",
+      fill_opacity = 0.25,
+      fill_antialias = FALSE,
       visibility = "none"
     ) |>
     # Pre-add hidden overlay layers; visibility="none" is the off-state so that
