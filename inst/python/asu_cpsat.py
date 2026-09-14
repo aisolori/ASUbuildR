@@ -1209,28 +1209,22 @@ def _asu_flow_capacity_hybrid_groups(
 _ASU_FULL_SUBSOLVER_PATTERN = (
     "portfolio_max_lp",
     "portfolio_max_lp",
-    "objective_shaving_max_lp",
     "lb_tree_search",
     "objective_lb_search_max_lp",
-    
-    "asu_flow_capacity_hybrid",
     "quick_restart_no_lp",
+    
     "asu_probe_fast",
     "pseudo_costs",
     "asu_probe_deep",
-
-    "variables_shaving",
-    "objective_shaving_max_lp",
-    "portfolio_max_lp",
     "reduced_costs",
     "max_lp",
 
-    "objective_lb_search",
     "core_max_lp",
     "core",
-    "objective_lb_search_no_lp",
-
+    "lb_tree_search",
+    "no_lp"
 )
+
 def _asu_full_subsolvers(
     workers: int,
     use_tract_first_search: bool = False,
@@ -2572,9 +2566,9 @@ def solve_one_asu_cpsat(
             ranked = sorted(
                 component,
                 key=lambda node: (
+                    -int(u_g[node]),
                     int(q_surplus[node]) <= 0,
                     -int(q_surplus[node]),
-                    -int(u_g[node]),
                     -int(root_distances[node]),
                     int(node),
                 ),
@@ -6044,6 +6038,114 @@ def repair_connectivity_free_selection(
     return sorted(best)
 
 
+def _repair_takeover_donor(
+    donor_remaining: Sequence[int],
+    available_nodes: Sequence[int],
+    nb: List[List[int]],
+    u: np.ndarray,
+    E: np.ndarray,
+    P: np.ndarray,
+    tau: float,
+    pop_thresh: int,
+    time_limit: float,
+    workers: int,
+    *,
+    stable_values: Optional[Sequence[str]] = None,
+    rel_gap: Optional[float] = None,
+    log: bool = False,
+    solve_kwargs: Optional[Dict[str, object]] = None,
+) -> List[int]:
+    """Re-solve an ASU after a takeover while preserving all surviving tracts.
+
+    The donor may use only its surviving tracts and currently unassigned nodes.
+    Forcing the survivors lets the solve reconnect a split donor or add enough
+    population/rate capacity to make it qualify again. If the solve cannot
+    improve a still-valid donor, its surviving assignment is retained.
+    """
+    donor = sorted({int(node) for node in donor_remaining})
+    if not donor:
+        return []
+
+    allowed = set(donor) | {int(node) for node in available_nodes}
+    root_global = max(
+        donor,
+        key=lambda node: (
+            u[node] / max(u[node] + E[node], 1e-12),
+            P[node],
+            -node,
+        ),
+    )
+
+    reachable = {root_global}
+    queue = [root_global]
+    head = 0
+    while head < len(queue):
+        node = queue[head]
+        head += 1
+        for neighbor in nb[node]:
+            if neighbor in allowed and neighbor not in reachable:
+                reachable.add(neighbor)
+                queue.append(neighbor)
+
+    # A forced survivor outside the root's available component makes repair
+    # impossible because no allowed connector can join the pieces.
+    if not set(donor).issubset(reachable):
+        return donor if component_ok(donor, u, E, P, tau, pop_thresh, nb) else []
+
+    sub = sorted(reachable)
+    local_index = {global_node: local_node for local_node, global_node in enumerate(sub)}
+    nb_local = [
+        sorted(
+            local_index[neighbor]
+            for neighbor in nb[global_node]
+            if neighbor in local_index
+        )
+        for global_node in sub
+    ]
+    donor_local = sorted(local_index[node] for node in donor)
+    root_local = int(local_index[root_global])
+    stable = (
+        [str(stable_values[node]) for node in sub]
+        if stable_values is not None
+        else [str(node).zfill(12) for node in sub]
+    )
+    stable_order = sorted(range(len(sub)), key=lambda node: (stable[node], node))
+    tie_break_rank = [0] * len(sub)
+    for rank, local_node in enumerate(stable_order):
+        tie_break_rank[local_node] = rank
+
+    donor_valid = component_ok(donor, u, E, P, tau, pop_thresh, nb)
+    extra_kwargs = dict(solve_kwargs or {})
+    result = solve_one_asu_cpsat(
+        nb_local=nb_local,
+        u_g=u[sub],
+        E_g=E[sub],
+        P_g=P[sub],
+        tau=tau,
+        pop_thresh=pop_thresh,
+        root_local=root_local,
+        time_limit=time_limit,
+        workers=workers,
+        rel_gap=rel_gap,
+        log=log,
+        hint=donor_local,
+        hint_obj=int(u[donor].sum()) if donor_valid else None,
+        forced_selected=donor_local,
+        tie_break_rank=tie_break_rank,
+        **extra_kwargs,
+    )
+    if result is None:
+        return donor if donor_valid else []
+
+    repaired = sorted(sub[local_node] for local_node in result.sel_idx_local)
+    max_nodes = extra_kwargs.get("max_nodes")
+    if component_ok(repaired, u, E, P, tau, pop_thresh, nb) and (
+        max_nodes is None or len(repaired) <= int(max_nodes)
+    ):
+        return repaired
+    return donor if donor_valid else []
+
+
 def solve_asu_graph_cut_only(
     nb_local: List[List[int]],
     u_g: np.ndarray,
@@ -8858,12 +8960,10 @@ def build_many_asus_cpsat(
     # After polish/merge settles, let the single biggest (by unemployment
     # captured) committed ASU re-solve against every tract in the state --
     # including tracts already claimed by OTHER ASUs, not just unassigned
-    # ones. Any donor ASU that loses tracts is re-checked with component_ok;
-    # one that no longer holds up (disconnected / below tau or pop_thresh) is
-    # dropped entirely (all its tracts, not just the taken ones, become
-    # unassigned) rather than repaired. The whole takeover is accepted only
-    # if it strictly increases total unemployment captured across all
-    # surviving ASUs; otherwise every assignment is left untouched.
+    # ones. Every donor ASU that loses tracts is given a repair solve against
+    # its surviving tracts plus currently unassigned territory. Only after all
+    # affected donors have had that opportunity is the whole takeover accepted
+    # or rejected based on whether total captured unemployment strictly rises.
     if polish_time_limit > 0 and not _stop_requested(stop_flag_path):
         committed_ids_takeover = np.unique(asu_id[asu_id > 0]).astype(int).tolist()
         if committed_ids_takeover:
@@ -8994,14 +9094,68 @@ def build_many_asus_cpsat(
                         trial_asu_id = asu_id.copy()
                         trial_asu_id[list(current_set)] = -1
                         dropped_donor_ids: List[int] = []
+                        repaired_donor_ids: List[int] = []
                         for donor_id in donor_ids:
                             donor_global = np.where(asu_id == donor_id)[0].astype(int).tolist()
                             donor_remaining = sorted(set(donor_global) - added)
                             trial_asu_id[donor_global] = -1
-                            if donor_remaining and component_ok(
-                                donor_remaining, u, E, P, tau, pop_thresh, nb
-                            ):
-                                trial_asu_id[donor_remaining] = donor_id
+                            available_for_repair = sorted(
+                                set(np.where(trial_asu_id < 0)[0].astype(int).tolist())
+                                - new_set
+                            )
+                            if verbose:
+                                print(
+                                    f"  [SINGLE-ASU TAKEOVER] repairing donor ASU "
+                                    f"{donor_id}: survivors={len(donor_remaining)}, "
+                                    f"available={len(available_for_repair)}",
+                                    flush=True,
+                                )
+                            repaired_donor = _repair_takeover_donor(
+                                donor_remaining,
+                                available_for_repair,
+                                nb,
+                                u,
+                                E,
+                                P,
+                                tau,
+                                pop_thresh,
+                                polish_time_limit,
+                                workers,
+                                stable_values=stable_values,
+                                rel_gap=rel_gap,
+                                log=verbose,
+                                solve_kwargs={
+                                    "deterministic_ties": deterministic_ties,
+                                    "objective_shaving": objective_shaving,
+                                    "use_root_articulation_implications": use_root_articulation_implications,
+                                    "use_signed_flow": use_signed_flow,
+                                    "use_arborescence": use_arborescence,
+                                    "configure_subsolvers": configure_subsolvers,
+                                    "use_tract_first_search": use_tract_first_search,
+                                    "use_flow_first_search": use_flow_first_search,
+                                    "use_tract_capacity_search": use_tract_capacity_search,
+                                    "use_flow_capacity_hybrid_search": use_flow_capacity_hybrid_search,
+                                    "incumbent_stall_seconds": incumbent_stall_seconds,
+                                    "use_flow_count_envelope": use_flow_count_envelope,
+                                    "use_small_root_separators": use_small_root_separators,
+                                    "root_separator_max_size": root_separator_max_size,
+                                    "root_separator_clause_limit": root_separator_clause_limit,
+                                    "root_separator_target_limit": root_separator_target_limit,
+                                    "use_separator_cardinality_bounds": use_separator_cardinality_bounds,
+                                    "solution_pool_size": solution_pool_size,
+                                    "use_bridge_edge_bounds": use_bridge_edge_bounds,
+                                    "use_articulation_edge_bounds": use_articulation_edge_bounds,
+                                    "use_distance_flow_bounds": use_distance_flow_bounds,
+                                    "use_global_capacity_cardinality_bound": use_global_capacity_cardinality_bound,
+                                    "use_bridge_subtree_pruning": use_bridge_subtree_pruning,
+                                    "max_nodes": polish_max_nodes,
+                                    "stop_flag_path": stop_flag_path,
+                                    "skip_flag_path": skip_flag_path,
+                                },
+                            )
+                            if repaired_donor:
+                                trial_asu_id[repaired_donor] = donor_id
+                                repaired_donor_ids.append(donor_id)
                             else:
                                 dropped_donor_ids.append(donor_id)
                         trial_asu_id[new_global] = big_asu_id
@@ -9018,6 +9172,10 @@ def build_many_asus_cpsat(
                                     f"(+{len(added)}), unemp={new_objective}, "
                                     f"total unemployment {total_before} -> "
                                     f"{total_after}"
+                                    + (
+                                        f"; repaired donor ASU(s): {repaired_donor_ids}"
+                                        if repaired_donor_ids else ""
+                                    )
                                     + (
                                         f"; dropped donor ASU(s): {dropped_donor_ids}"
                                         if dropped_donor_ids else ""
