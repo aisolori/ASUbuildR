@@ -27,6 +27,7 @@ Imports:
     flexdashboard,
     RColorBrewer,
     mapgl,
+    markdown,
     rmarkdown,
     stringr,
     sf,

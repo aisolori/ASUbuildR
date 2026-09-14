@@ -263,6 +263,7 @@ check_asu_python <- function() {
   )
 
   if (all(available)) {
+    if (!asu_assert_ortools_version(required = FALSE)) return(FALSE)
     message("Python environment is properly configured")
     return(TRUE)
   } else {

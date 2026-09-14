@@ -54,6 +54,15 @@ jobs:
         run: |
           install.packages(".", repos = NULL, type = "source")
 
+      - name: Check installed Python bridge helpers
+        shell: Rscript {0}
+        run: |
+          ns <- asNamespace("ASUbuildR")
+          helpers <- c("asu_use_python", "asu_assert_ortools_version", "asu_load_py")
+          for (helper in helpers) {
+            stopifnot(is.function(get(helper, envir = ns, inherits = FALSE)))
+          }
+
       - name: Bootstrap Python and solver dependencies
         shell: Rscript {0}
         run: |

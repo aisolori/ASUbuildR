@@ -27,6 +27,35 @@ asu_use_python <- function(required = FALSE) {
   TRUE
 }
 
+# Check compatibility after the caller has selected its Python interpreter.
+# Keep this in the package namespace: build_asu() also runs in fresh R sessions
+# where dashboard development helpers have never been sourced.
+asu_assert_ortools_version <- function(required = FALSE) {
+  problem <- tryCatch({
+    ortools <- reticulate::import("ortools", convert = TRUE)
+    version <- as.character(ortools[["__version__"]])
+    if (length(version) != 1L || is.na(version) || !nzchar(version)) {
+      stop("OR-Tools did not report a version.")
+    }
+    if (utils::compareVersion(version, "9.15") < 0L) {
+      paste0("ASUbuildR requires OR-Tools >= 9.15; found ", version, ".")
+    } else {
+      NULL
+    }
+  }, error = function(e) {
+    paste0("Could not verify the OR-Tools version: ", conditionMessage(e))
+  })
+
+  if (is.null(problem)) return(TRUE)
+  problem <- paste0(
+    problem,
+    " Run ASUbuildR::setup_asu_python(force = TRUE), then restart R."
+  )
+  if (required) stop(problem, call. = FALSE)
+  message(problem)
+  FALSE
+}
+
 #' Load the ASU CP-SAT Python module
 #' @keywords internal
 asu_load_py <- function() {
