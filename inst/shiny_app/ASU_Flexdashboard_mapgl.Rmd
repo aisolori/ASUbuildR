@@ -981,7 +981,7 @@ shiny::conditionalPanel(
     shiny::numericInput("cpsat_pop",       "Population threshold",      value = 10000,  min = 0, step = 100),
     shiny::numericInput("cpsat_max",       "Max ASUs",                  value = 30,     min = 1, step = 1),
     shiny::numericInput("cpsat_timelimit", "Time limit (sec) per window", value = 18000, min = 0, step = 60),
-    shiny::numericInput("cpsat_incumbent_stall_seconds", "Incumbent stall limit (sec)", value = 600, min = 0, step = 30),
+    shiny::numericInput("cpsat_incumbent_stall_seconds", "Incumbent stall limit (sec)", value = 300, min = 0, step = 30),
     shiny::numericInput("cpsat_workers",   "Total CP-SAT workers (detected cores - 2)", value = max(1, parallel::detectCores(logical = FALSE)-2), min = 1, step = 1),
     shiny::numericInput("cpsat_parallel_asus", "Concurrent ASU solves", value = 1, min = 1, step = 1),
     shiny::numericInput("cpsat_relgap",        "Relative gap (optional)",    value = NULL, min = 0, step = 0.0001),
@@ -1190,10 +1190,16 @@ if (identical(algo_choice, "cpsat")) {
     return()
   }
   session <- shiny::getDefaultReactiveDomain()
+  cpsat_running(TRUE)
+  cpsat_stage_text("initializing run")
+  append_cpsat_log("[run] Button clicked (CP-SAT).")
+  # Let this observer finish its first reactive flush so the lightweight log
+  # panel reaches the browser before TIGER downloads, geometry preparation, or
+  # either MapLibre widget begins. Start the expensive work immediately after
+  # that flush rather than holding the log until this whole branch yields.
+  session$onFlushed(function() {
+  shiny::isolate({
   shiny::withProgress(message = "Running OR-Tools CP-SAT…", value = 0, {
-    cpsat_running(TRUE)
-    cpsat_stage_text("initializing run")
-    append_cpsat_log("[run] Button clicked (CP-SAT).")
     # ---- 1) Preconditions & parameters --------------------------------
     shiny::req(uploaded_data(), state(), tract_year())
     sel_year <- selected_year              # from your earlier NE override logic
@@ -1414,13 +1420,14 @@ kwargs = dict(
     use_tract_first_search=False,
     use_flow_first_search=False,
     use_tract_capacity_search=False,
+    # Conservative production profile: retain the proven, low-volume cuts and
+    # leave the larger experimental flow/cardinality families opt-in.
     use_flow_capacity_hybrid_search=True,
     use_flow_count_envelope=False,
     use_small_root_separators=True,
-    root_separator_max_size=6,
-
-    root_separator_clause_limit=5000,
-    root_separator_target_limit=1000,
+    root_separator_max_size=5,
+    root_separator_clause_limit=1000,
+    root_separator_target_limit=500,
     solution_pool_size=32,
     full_graph_window=True,
     use_bridge_edge_bounds=True,
@@ -1737,6 +1744,8 @@ print('[runner] OK', flush=True)
   })
 
   # stop the parent observer here so non-CP-SAT code below doesn’t run
+  })
+  }, once = TRUE)
   return(invisible(NULL))
 }
 # --- end CP-SAT branch --------------------------------------------------
@@ -2068,10 +2077,11 @@ output$initial_map <- mapgl::renderMaplibre({
 
 ## Map {data-width="800"}
 ```{r}
-mapgl::maplibreOutput("initial_map", height = "100vh")
-
-# Log overlay (shows only while running)
+# Mount the lightweight log output before the map widget so that, when both
+# invalidate in the same reactive flush, the browser receives the log first.
 shiny::uiOutput("log_overlay")
+
+mapgl::maplibreOutput("initial_map", height = "100vh")
 
 ```
 

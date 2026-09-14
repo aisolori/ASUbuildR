@@ -13,7 +13,7 @@ build_asu(
   time_limit = 1200,
   workers = max(1L, parallel::detectCores(logical = TRUE) - 1L),
   rel_gap = NA_real_,
-  configure_subsolvers = FALSE,
+  configure_subsolvers = TRUE,
   use_tract_first_search = FALSE,
   use_flow_count_envelope = TRUE,
   use_small_root_separators = TRUE,
@@ -103,48 +103,10 @@ Sound but unproven on real data -- opt-in, default FALSE}
 Sound on cycles (any connected selection admits a rooted spanning-tree
 flow within these caps) but unproven on real data -- opt-in, default FALSE}
 
-\item{use_distance_flow_count_envelope}{logical; same distance-from-root
-fact as \code{use_distance_flow_bounds}, but expressed against the live
-\code{selected_count} model variable (as \code{use_flow_count_envelope} already
-does with the uniform bound) instead of the static \code{max_selected}
-constant, so the bound keeps tightening as CP-SAT narrows
-\code{selected_count} anywhere during the main solve. Sound but unproven on
-real data -- opt-in, default FALSE}
-
-\item{use_direct_endpoint_gating}{logical; add explicit \verb{L*x <= f <= U*x}
-linear rows per signed flow endpoint, alongside the existing reified
-zero-flow constraints, to expose the same bound directly to the LP
-relaxation. Sound but unproven on real data -- opt-in, default FALSE}
-
-\item{use_capacity_radius_pruning}{logical; vertex-weighted-Dijkstra
-generalization of the bridge-subtree fix: hard-fixes any tract whose
-cheapest root path already consumes more UR-surplus budget than the
-whole window can supply. Sound but unproven on real data -- opt-in,
-default FALSE}
-
-\item{use_capacity_cover_cuts}{logical; disaggregated generalization of
-the bridge-subtree/capacity-radius fixes into genuine size-2/3 knapsack
-cover cuts (\verb{sum(x_i for i in cover) <= |cover| - 1}) over the same
-UR-surplus budget, instead of only fixing individual tracts to 0.
-Sound (each cover is provably minimal and jointly infeasible under the
-same best-case budget argument) but unproven on real data -- opt-in,
-default FALSE}
-
-\item{use_lobe_capacity_cardinality_bounds}{logical; generalizes the
-window-wide capacity cardinality bound into one cut per root-separating
-articulation lobe, so the LP can no longer concentrate fractional
-below-threshold weight inside a single component the way one pooled
-cut allows. Reuses the same global budget as the pooled bound (sound
-disaggregation), but real-data solve-time benefit is unproven -- opt-in,
-default FALSE}
-
-\item{use_bisection_max_selected}{logical; tighten the connectivity-free
-max-selected-tracts bound via a feasibility bisection on cardinality
-("does any selection of size >= K satisfy pop/UR?") instead of relying
-solely on one Maximize call, taking the tighter of the two. Sound (a
-query only lowers the bound on a proven CP-SAT INFEASIBLE result; a
-timeout leaves it unchanged) but real-data benefit is unproven --
-opt-in, default FALSE}
+\item{use_distance_flow_count_envelope, use_direct_endpoint_gating, use_capacity_radius_pruning, use_capacity_cover_cuts, use_lobe_capacity_cardinality_bounds, use_bisection_max_selected}{deprecated
+compatibility arguments. These experiments are no longer implemented. Their
+default \code{FALSE} is ignored; setting any to \code{TRUE} produces a warning
+instead of silently doing nothing.}
 
 \item{use_connectivity_free_repair}{logical; solve the unemployment objective
 subject to population and UR requirements without connectivity, repair the
@@ -221,9 +183,10 @@ specifically for the uncapped combine/re-solve pass (\code{NA_integer_} uses
 
 \item{verbose}{logical; print CP-SAT logs}
 
-\item{parallel_asus}{maximum number of ASU windows or standalone expansions
-solved concurrently. Use \code{1} (the default) to solve ASUs sequentially;
-the configured \code{workers} are then available to each solve}
+\item{parallel_asus}{maximum number of main ASU windows solved concurrently.
+Use \code{1} (the default) to solve main windows sequentially. Partitioned
+standalone expansions always run sequentially and each receives all configured
+\code{workers}}
 
 \item{use_flow_first_search}{logical; enable the experimental flow-first
 worker, choosing the widest flow domain, breaking ties by incident tract
