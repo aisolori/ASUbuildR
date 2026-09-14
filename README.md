@@ -49,6 +49,10 @@ when Conda is not already available.
 
 ## Running the Application
 
+New to the dashboard? Read the [Dashboard user guide](inst/shiny_app/dashboard-guide.md)
+for a quick start, button descriptions, CP-SAT parameters, and save/export instructions.
+The same guide is available inside the dashboard under **How to Use ASUbuildR**.
+
 Launch the interactive dashboard with:
 
 ``` r
