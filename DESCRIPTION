@@ -1,11 +1,11 @@
 Package: ASUbuildR
 Type: Package
 Title: A Shiny Interface for Constructing Areas of Substantial Unemployment
-Version: 0.6.41
+Version: 0.6.42
 Authors@R: c(
     person("David", "Schmidt", email = "deschmidt@detr.nv.gov", role = c("aut", "cre")),
-    person("Michael", "Frank", role = "aut"),
-    person("Antonio", "Solorio", email = "aisolorio@detr.nv.gov", role = "ctb")
+    person("Antonio", "Solorio", email = "aisolorio@detr.nv.gov", role = c("aut", "ctb")),
+    person("Michael", "Frank", role = "ctb")
   )
 Description: Provides a point-and-click GUI together with helper algorithms
     for building Areas of Substantial Unemployment (ASUs) from Census tract
