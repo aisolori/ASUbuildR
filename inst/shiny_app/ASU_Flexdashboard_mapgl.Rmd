@@ -199,7 +199,9 @@ if (is_dev_mode) {
   source(file.path(r_dir, "run_tract_hunter.R"))
   source(file.path(r_dir, "run_asu_original.r"))
   source(file.path(r_dir,"setup_asu_python.R"))
+  source(file.path(r_dir, "read_asu_warm_start.R"))
 } else {
+  asu_read_warm_start <- getFromNamespace("asu_read_warm_start", "ASUbuildR")
   message("→ Installed package mode: functions should already be available")
 }
 
@@ -974,17 +976,47 @@ shiny::conditionalPanel(
       "CP-SAT strategy",
       choices = c(
         "Partitioning strategy (potential multiple ASUs)" = "partition",
+        "Statewide joint multi-ASU (experimental)" = "statewide_joint",
         "Legacy single-ASU solve" = "single"
       ),
       selected = "single"
     ),
+    shiny::checkboxInput("cpsat_use_warm_start", "Use saved ASUs as a warm start", value = FALSE),
+    shiny::conditionalPanel(
+      condition = "input.cpsat_use_warm_start === true",
+      shiny::fileInput("cpsat_warm_start", "Warm-start RDS", accept = ".rds", multiple = FALSE),
+      shiny::helpText("Matches GEOID plus asunum/asu_id to the current input data. Saved groups must meet current thresholds and connectivity. Max ASUs includes these groups. In statewide mode, the file replaces automatic seed search and relaxed hints; assignments remain changeable.")
+    ),
+    shiny::conditionalPanel(
+      condition = "input.cpsat_strategy === 'partition'",
+      shiny::checkboxInput(
+        "cpsat_joint_partition_expansion",
+        "Joint multi-ASU expansion (experimental)", value = FALSE
+      ),
+      shiny::helpText("When enabled, up to three neighboring seed territories are pooled into one solve. Batches run sequentially with all workers and a shared 1800-second limit per batch. May use more memory; invalid seeds may remain inactive.")
+    ),
     shiny::numericInput("cpsat_tau",       "UR threshold (τ)",          value = 0.0645, min = 0, max = 1, step = 0.0001),
     shiny::numericInput("cpsat_pop",       "Population threshold",      value = 10000,  min = 0, step = 100),
     shiny::numericInput("cpsat_max",       "Max ASUs",                  value = 30,     min = 1, step = 1),
-    shiny::numericInput("cpsat_timelimit", "Time limit (sec) per window", value = 18000, min = 0, step = 60),
+    shiny::conditionalPanel(
+      condition = "input.cpsat_strategy !== 'statewide_joint'",
+      shiny::numericInput("cpsat_timelimit", "Time limit (sec) per window", value = 18000, min = 0, step = 60)
+    ),
+    shiny::conditionalPanel(
+      condition = "input.cpsat_strategy === 'statewide_joint'",
+      shiny::numericInput("cpsat_statewide_seed_seconds", "Statewide seed search (sec)", value = 60, min = 0, step = 10),
+      shiny::numericInput("cpsat_statewide_seconds", "Statewide joint solve (sec)", value = 1800, min = 0, step = 60),
+      shiny::checkboxInput("cpsat_statewide_relaxed_hint", "Hint all relaxation-selected tracts", value = TRUE),
+      shiny::checkboxInput("cpsat_statewide_tighten_model", "Tighten statewide joint model", value = TRUE),
+      shiny::helpText("The relaxed hint suggests selection without fixing ownership or flows. Tightening adds derived population, connectivity-region, and flow bounds; it does not impose a tract cap. Turn either option off for comparison."),
+      shiny::helpText("One joint model over all loaded tracts, with up to Max ASUs group slots and all workers. Large states or high Max ASUs values may require substantial memory. Seed search is a separate budget; 0 skips it. Valid seeds are retained as a fallback. No later polishing, takeover, or uncapped combine pass runs.")
+    ),
     shiny::numericInput("cpsat_incumbent_stall_seconds", "Incumbent stall limit (sec)", value = 300, min = 0, step = 30),
     shiny::numericInput("cpsat_workers",   "Total CP-SAT workers (detected cores - 2)", value = max(1, parallel::detectCores(logical = FALSE)-2), min = 1, step = 1),
-    shiny::numericInput("cpsat_parallel_asus", "Concurrent ASU solves", value = 1, min = 1, step = 1),
+    shiny::conditionalPanel(
+      condition = "input.cpsat_strategy !== 'statewide_joint'",
+      shiny::numericInput("cpsat_parallel_asus", "Concurrent ASU solves", value = 1, min = 1, step = 1)
+    ),
     shiny::numericInput("cpsat_relgap",        "Relative gap (optional)",    value = NULL, min = 0, step = 0.0001),
     shiny::checkboxInput("cpsat_enable_max_nodes", "Limit tracts per ASU (cap + combine)", value = FALSE),
     shiny::conditionalPanel(
@@ -1214,12 +1246,22 @@ if (identical(algo_choice, "cpsat")) {
     parallel_asus <- if (is.null(input$cpsat_parallel_asus)) 1L else max(1L, as.integer(input$cpsat_parallel_asus))
     cpsat_strategy <- if (is.null(input$cpsat_strategy) || identical(input$cpsat_strategy, "")) "partition" else as.character(input$cpsat_strategy)
     use_partitioning <- identical(cpsat_strategy, "partition")
+    use_statewide_joint <- identical(cpsat_strategy, "statewide_joint")
+    statewide_relaxed_hint <- isTRUE(input$cpsat_statewide_relaxed_hint)
+    statewide_tighten_model <- isTRUE(input$cpsat_statewide_tighten_model)
+    statewide_seconds <- if (is.null(input$cpsat_statewide_seconds) || !is.finite(input$cpsat_statewide_seconds)) 1800 else max(0, as.numeric(input$cpsat_statewide_seconds))
+    statewide_seed_seconds <- if (is.null(input$cpsat_statewide_seed_seconds) || !is.finite(input$cpsat_statewide_seed_seconds)) 60 else max(0, as.numeric(input$cpsat_statewide_seed_seconds))
+    joint_partition_expansion <- use_partitioning && isTRUE(input$cpsat_joint_partition_expansion)
+    if (use_partitioning) append_cpsat_log(sprintf("[run] partition expansion mode: %s",
+                            if (joint_partition_expansion) "joint (experimental)" else "sequential"))
+    if (use_statewide_joint) append_cpsat_log(sprintf("[run] statewide joint: seed_limit=%.1fs joint_limit=%.1fs max_asus=%d workers=%d",
+                                                      statewide_seed_seconds, statewide_seconds, max_asus, workers))
     rel_gap  <- if (!is.null(input$cpsat_relgap) && !is.na(input$cpsat_relgap)) as.numeric(input$cpsat_relgap) else NA_real_
     max_nodes_enabled <- isTRUE(input$cpsat_enable_max_nodes)
     max_nodes_per_asu <- if (max_nodes_enabled && !is.null(input$cpsat_max_nodes) && !is.na(input$cpsat_max_nodes)) as.integer(input$cpsat_max_nodes) else NA_integer_
     combine_timelimit <- if (max_nodes_enabled && !is.null(input$cpsat_combine_timelimit) && !is.na(input$cpsat_combine_timelimit)) as.integer(input$cpsat_combine_timelimit) else NA_integer_
     append_cpsat_log(sprintf("[run] params: strategy=%s tau=%.6f pop=%d max=%d limit=%ds stall=%ds workers=%d concurrent_asus=%d rel_gap=%s max_nodes_per_asu=%s combine_time_limit=%s",
-           if (use_partitioning) "partition" else "single",
+           cpsat_strategy,
            tau, pop_thr, max_asus, tlimit, incumbent_stall_seconds, workers, parallel_asus,
                              if (is.na(rel_gap)) "None" else as.character(rel_gap),
                              if (is.na(max_nodes_per_asu)) "None" else as.character(max_nodes_per_asu),
@@ -1316,6 +1358,29 @@ if (identical(algo_choice, "cpsat")) {
     merged_df <- merged_sf |> sf::st_drop_geometry()
     append_cpsat_log(sprintf("[NB] Tracts kept: %d (after join)", nrow(merged_df)))
 
+    warm_start <- NULL
+    if (isTRUE(input$cpsat_use_warm_start)) {
+      warm_start <- tryCatch({
+        if (is.null(input$cpsat_warm_start)) stop("Choose a warm-start RDS file or disable warm start.")
+        asu_read_warm_start(
+          input$cpsat_warm_start$datapath, merged_df$GEOID, data = merged_df,
+          neighbors = lapply(merged_sf$continuous, function(iv) as.integer(iv) - 1L),
+          tau = tau, pop_thresh = pop_thr, max_asus = max_asus,
+          max_nodes = if (is.na(max_nodes_per_asu)) NULL else max_nodes_per_asu)
+      }, error = function(e) e)
+      if (inherits(warm_start, "error")) {
+        append_cpsat_log(paste0("[warm start] rejected: ", conditionMessage(warm_start)))
+        shiny::showModal(shiny::modalDialog(title = "Warm-start problem",
+                         conditionMessage(warm_start), easyClose = TRUE))
+        cpsat_running(FALSE)
+        return(invisible(NULL))
+      }
+      append_cpsat_log(sprintf("[STAGE] WARM_START loaded=%s asus=%d assigned_tracts=%d matched_tracts=%d ignored_unassigned=%d baseline_unemp=%.0f",
+                              input$cpsat_warm_start$name, warm_start$asu_count,
+                              warm_start$assigned_tracts, warm_start$matched_tracts,
+                              warm_start$ignored_unassigned, warm_start$baseline_unemp))
+    }
+
     clean_sf_columns <- function(x) {
       g <- sf::st_geometry(x)
       df <- x |>
@@ -1328,7 +1393,7 @@ if (identical(algo_choice, "cpsat")) {
     # then repaint this existing basemap without replacing its geometry or
     # rebuilding any layers.
     initial_sf <- merged_sf |>
-      dplyr::mutate(asunum = 0L) |>
+      dplyr::mutate(asunum = if (is.null(warm_start)) 0L else pmax(0L, warm_start$ids)) |>
       dplyr::select(-dplyr::any_of("continuous")) |>
       clean_sf_columns()
     full_data(initial_sf)
@@ -1342,6 +1407,7 @@ if (identical(algo_choice, "cpsat")) {
         tract_ASU_emp   = as.integer(round(tract_ASU_emp)),
         tract_pop2024   = as.integer(round(tract_pop_cur))
       )
+    if (!is.null(warm_start)) df_py$warm_start_asu <- warm_start$ids
     
     # Use the island-fixed neighborhood lists for the Python solver
     nb_lists <- lapply(merged_sf$continuous, function(iv) {
@@ -1405,13 +1471,14 @@ print('[runner] module path added')
 from asu_cpsat import build_many_asus_cpsat
 import pandas as pd
 
-df = pd.read_csv(r'%s')
+df = pd.read_csv(r'%s', dtype={'geoid': str})
 with open(r'%s','r') as f:
     nb = json.load(f)
 print('[runner] inputs: rows=' + str(len(df)) + ' nb_lists=' + str(len(nb)))
 
 kwargs = dict(
     df=df, nb=nb,
+    initial_asu_id=df['warm_start_asu'].tolist() if 'warm_start_asu' in df.columns else None,
     tau=%s, pop_thresh=%d, max_asus=%d,
     time_limit=%d, workers=%d, parallel_asus=%d, verbose=True,
     configure_subsolvers=True,
@@ -1440,6 +1507,12 @@ kwargs = dict(
     connectivity_free_time_limit=60.0,
     harvest_connectivity_free_asus=%s,
     harvest_all_connectivity_free_components=%s,
+    joint_partition_expansion=%s,
+    statewide_joint=%s,
+    statewide_joint_time_limit=%s,
+    statewide_seed_time_limit=%s,
+    statewide_relaxed_hint=%s,
+    statewide_tighten_model=%s,
     use_graph_cut_repair=True,
     graph_cut_repair_time_limit=60,
     standalone_expansion_time_limit=1800,
@@ -1459,8 +1532,8 @@ COMBINE_TL = %s
 if COMBINE_TL is not None and not (isinstance(COMBINE_TL, float) and math.isnan(COMBINE_TL)):
     kwargs['combine_time_limit'] = int(COMBINE_TL)
 print('[runner] window scope: all remaining tracts', flush=True)
-print('[runner] strategy: ' + ('partition' if kwargs['harvest_connectivity_free_asus'] else 'single'), flush=True)
-print('[runner] fixed-search mode: flow-capacity-hybrid', flush=True)
+print('[runner] strategy: ' + ('statewide_joint' if kwargs['statewide_joint'] else ('partition' if kwargs['harvest_connectivity_free_asus'] else 'single')), flush=True)
+print('[runner] search: ' + ('custom joint portfolio' if kwargs['statewide_joint'] else 'flow-capacity-hybrid'), flush=True)
 print('[runner] launching CP-SAT…', flush=True)
 res = build_many_asus_cpsat(**kwargs)
 print('[runner] solver finished; writing json', flush=True)
@@ -1475,6 +1548,12 @@ print('[runner] OK', flush=True)
         format(tau, scientific = FALSE), pop_thr, max_asus, tlimit, workers, parallel_asus,
   if (use_partitioning) "True" else "False",
   if (use_partitioning) "True" else "False",
+  if (joint_partition_expansion) "True" else "False",
+  if (use_statewide_joint) "True" else "False",
+  format(statewide_seconds, scientific = FALSE),
+  format(statewide_seed_seconds, scientific = FALSE),
+  if (statewide_relaxed_hint) "True" else "False",
+  if (statewide_tighten_model) "True" else "False",
         incumbent_stall_seconds,
         stop_file, skip_file,
       progress_json,
