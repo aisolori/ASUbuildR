@@ -10,9 +10,10 @@
 #' @param max_asus max number of ASUs to carve
 #' @param time_limit seconds per window
 #' @param workers CP-SAT threads
-#' @param parallel_asus maximum number of ASU windows or standalone expansions
-#'   solved concurrently. Use `1` (the default) to solve ASUs sequentially;
-#'   the configured `workers` are then available to each solve
+#' @param parallel_asus maximum number of main ASU windows solved concurrently.
+#'   Use `1` (the default) to solve main windows sequentially. Partitioned
+#'   standalone expansions always run sequentially and each receives all
+#'   configured `workers`
 #' @param rel_gap optional relative MIP gap (e.g. 0.01)
 #' @param configure_subsolvers logical; if `FALSE`, use OR-Tools' default
 #'   subsolver portfolio instead of the ASU-specific portfolio
@@ -56,43 +57,10 @@
 #'   `max_selected - 1 - dist(root, tail)` using BFS distance from the root.
 #'   Sound on cycles (any connected selection admits a rooted spanning-tree
 #'   flow within these caps) but unproven on real data -- opt-in, default FALSE
-#' @param use_distance_flow_count_envelope logical; same distance-from-root
-#'   fact as `use_distance_flow_bounds`, but expressed against the live
-#'   `selected_count` model variable (as `use_flow_count_envelope` already
-#'   does with the uniform bound) instead of the static `max_selected`
-#'   constant, so the bound keeps tightening as CP-SAT narrows
-#'   `selected_count` anywhere during the main solve. Sound but unproven on
-#'   real data -- opt-in, default FALSE
-#' @param use_direct_endpoint_gating logical; add explicit `L*x <= f <= U*x`
-#'   linear rows per signed flow endpoint, alongside the existing reified
-#'   zero-flow constraints, to expose the same bound directly to the LP
-#'   relaxation. Sound but unproven on real data -- opt-in, default FALSE
-#' @param use_capacity_radius_pruning logical; vertex-weighted-Dijkstra
-#'   generalization of the bridge-subtree fix: hard-fixes any tract whose
-#'   cheapest root path already consumes more UR-surplus budget than the
-#'   whole window can supply. Sound but unproven on real data -- opt-in,
-#'   default FALSE
-#' @param use_capacity_cover_cuts logical; disaggregated generalization of
-#'   the bridge-subtree/capacity-radius fixes into genuine size-2/3 knapsack
-#'   cover cuts (`sum(x_i for i in cover) <= |cover| - 1`) over the same
-#'   UR-surplus budget, instead of only fixing individual tracts to 0.
-#'   Sound (each cover is provably minimal and jointly infeasible under the
-#'   same best-case budget argument) but unproven on real data -- opt-in,
-#'   default FALSE
-#' @param use_lobe_capacity_cardinality_bounds logical; generalizes the
-#'   window-wide capacity cardinality bound into one cut per root-separating
-#'   articulation lobe, so the LP can no longer concentrate fractional
-#'   below-threshold weight inside a single component the way one pooled
-#'   cut allows. Reuses the same global budget as the pooled bound (sound
-#'   disaggregation), but real-data solve-time benefit is unproven -- opt-in,
-#'   default FALSE
-#' @param use_bisection_max_selected logical; tighten the connectivity-free
-#'   max-selected-tracts bound via a feasibility bisection on cardinality
-#'   ("does any selection of size >= K satisfy pop/UR?") instead of relying
-#'   solely on one Maximize call, taking the tighter of the two. Sound (a
-#'   query only lowers the bound on a proven CP-SAT INFEASIBLE result; a
-#'   timeout leaves it unchanged) but real-data benefit is unproven --
-#'   opt-in, default FALSE
+#' @param use_distance_flow_count_envelope,use_direct_endpoint_gating,use_capacity_radius_pruning,use_capacity_cover_cuts,use_lobe_capacity_cardinality_bounds,use_bisection_max_selected
+#'   deprecated compatibility arguments. These experiments are no longer
+#'   implemented. Their default `FALSE` is ignored; setting any to `TRUE`
+#'   produces a warning instead of silently doing nothing.
 #' @param use_connectivity_free_repair logical; solve the unemployment objective
 #'   subject to population and UR requirements without connectivity, repair the
 #'   selected components, and use the result only when it is a better valid hint
@@ -166,7 +134,7 @@ build_asu <- function(
     time_limit = 1200,
     workers = max(1L, parallel::detectCores(logical = TRUE) - 1L),
     rel_gap = NA_real_,
-    configure_subsolvers = FALSE,
+    configure_subsolvers = TRUE,
     use_tract_first_search = FALSE,
     use_flow_count_envelope = TRUE,
     use_small_root_separators = TRUE,
@@ -203,6 +171,23 @@ build_asu <- function(
 ) {
   asu_use_python(required = TRUE)
   asu_assert_ortools_version(required = TRUE)
+
+  removed_cut_options <- c(
+    use_distance_flow_count_envelope = isTRUE(use_distance_flow_count_envelope),
+    use_direct_endpoint_gating = isTRUE(use_direct_endpoint_gating),
+    use_capacity_radius_pruning = isTRUE(use_capacity_radius_pruning),
+    use_capacity_cover_cuts = isTRUE(use_capacity_cover_cuts),
+    use_lobe_capacity_cardinality_bounds = isTRUE(use_lobe_capacity_cardinality_bounds),
+    use_bisection_max_selected = isTRUE(use_bisection_max_selected)
+  )
+  enabled_removed_options <- names(removed_cut_options)[removed_cut_options]
+  if (length(enabled_removed_options)) {
+    warning(
+      "Deprecated cut option(s) are no longer implemented and were ignored: ",
+      paste(enabled_removed_options, collapse = ", "),
+      call. = FALSE
+    )
+  }
 
   # Normalize neighbor indexing to 0-based
   if (is.null(neighbors)) stop("Provide `neighbors` as a list of integer vectors (contiguity).")
@@ -242,6 +227,8 @@ build_asu <- function(
     root_separator_target_limit = as.integer(root_separator_target_limit),
     solution_pool_size = as.integer(solution_pool_size),
     use_bridge_edge_bounds = isTRUE(use_bridge_edge_bounds),
+    use_articulation_edge_bounds = isTRUE(use_articulation_edge_bounds),
+    use_distance_flow_bounds = isTRUE(use_distance_flow_bounds),
     max_nodes_per_asu = if (is.na(max_nodes_per_asu)) NULL else as.integer(max_nodes_per_asu),
     exact_nodes_per_asu = if (is.na(exact_nodes_per_asu)) NULL else as.integer(exact_nodes_per_asu),
     combine_capped_asus = isTRUE(combine_capped_asus),

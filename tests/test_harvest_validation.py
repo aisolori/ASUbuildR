@@ -13,10 +13,13 @@ import asu_cpsat as solver
 
 
 class HarvestValidationTest(unittest.TestCase):
-    def run_harvest(self, u, emp, seeds, territories, solve_result=None):
+    def run_harvest(
+        self, u, emp, seeds, territories, solve_result=None, workers=1
+    ):
+        n = len(u)
         df = pd.DataFrame({
-            "geoid": ["0", "1", "2"], "tract_ASU_unemp": u,
-            "tract_ASU_emp": emp, "tract_pop2024": [10000]*3,
+            "geoid": [str(i) for i in range(n)], "tract_ASU_unemp": u,
+            "tract_ASU_emp": emp, "tract_pop2024": [10000]*n,
         })
         info = dict(
             connectivity_free_standalone_asus=seeds,
@@ -33,9 +36,14 @@ class HarvestValidationTest(unittest.TestCase):
                          wraps=solver._merge_touching_asu_units) as merge,
             contextlib.redirect_stdout(log),
         ):
+            neighbors = [
+                [neighbor for neighbor in (i - 1, i + 1) if 0 <= neighbor < n]
+                for i in range(n)
+            ]
             result = solver.build_many_asus_cpsat(
-                df, [[1], [0, 2], [1]], .0645, 10000,
-                max_asus=3, workers=1, verbose=True, full_graph_window=True,
+                df, neighbors, .0645, 10000,
+                max_asus=len(seeds), workers=workers, verbose=True,
+                full_graph_window=True,
                 harvest_connectivity_free_asus=True,
                 harvest_all_connectivity_free_components=True,
                 standalone_expansion_time_limit=1,
@@ -78,6 +86,56 @@ class HarvestValidationTest(unittest.TestCase):
         self.assertEqual(list(result["asu_id"]), [1, 1, -1])
         self.assertEqual(solves[0].kwargs["hint_obj"], 20)
         self.assertIn("OBJECTIVE REGRESSION", log)
+
+    def test_expansions_are_sequential_and_receive_full_worker_budget(self):
+        result, log, solves, _ = self.run_harvest(
+            [10, 1, 1, 10],
+            [0, 0, 0, 0],
+            [[0], [3]],
+            lambda seeds, *args, **kwargs: [[0, 1], [3, 2]],
+            solver.CpsatResult([0], 10, 10, "OPTIMAL"),
+            workers=4,
+        )
+
+        self.assertEqual(list(result["asu_id"]), [1, -1, -1, 2])
+        self.assertEqual(len(solves), 2)
+        self.assertEqual([call.kwargs["workers"] for call in solves], [4, 4])
+        self.assertIn(
+            "[STAGE] PARTITION_EXPANSION round=1 mode=sequential solves=2 "
+            "workers_per_solve=4",
+            log,
+        )
+        self.assertIn(
+            "[STAGE] PARTITION_EXPANSION_COMPLETE round=1 "
+            "outcome=converged attempted=2 valid=2 rejected=0",
+            log,
+        )
+        self.assertIn("statuses=OPTIMAL:2", log)
+
+    def test_expansion_merge_restarts_before_next_stale_solve(self):
+        def territories(seeds, *args, **kwargs):
+            if len(seeds) == 2:
+                return [[0, 1, 2], [3]]
+            return [list(seeds[0])]
+
+        result, log, solves, _ = self.run_harvest(
+            [10, 1, 1, 10],
+            [0, 0, 0, 0],
+            [[0], [3]],
+            territories,
+            solver.CpsatResult([0, 1, 2], 12, 12, "OPTIMAL"),
+            workers=4,
+        )
+
+        self.assertEqual(len(solves), 1)
+        self.assertEqual(solves[0].kwargs["workers"], 4)
+        self.assertTrue(callable(
+            solves[0].kwargs["incumbent_interrupt_callback"]
+        ))
+        self.assertEqual(list(result["asu_id"]), [1, 1, 1, 1])
+        self.assertIn("outcome=immediate_merge_rerun", log)
+        self.assertIn("attempted=1 scheduled=2 skipped_stale=1", log)
+        self.assertIn("repartitioning before the next solve", log)
 
 
 if __name__ == "__main__":

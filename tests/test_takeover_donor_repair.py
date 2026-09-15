@@ -17,6 +17,7 @@ from asu_cpsat import _repair_takeover_donor  # noqa: E402
 
 
 class TakeoverDonorRepairTest(unittest.TestCase):
+<<<<<<< HEAD
     def test_salvages_best_disconnected_piece_without_taking_other_asus(self):
         # Tract 2 is occupied by another ASU and cannot reconnect the donor.
         repaired = _repair_takeover_donor(
@@ -62,6 +63,8 @@ class TakeoverDonorRepairTest(unittest.TestCase):
         )
         self.assertEqual(repaired, [0, 2])
 
+=======
+>>>>>>> fe2b02e74c641ae8259311ba9ad97e23ed77101c
     def test_adds_available_tract(self):
         neighbors = [[1, 2], [0], [0]]
         unemployed = np.array([20, 20, 500], dtype=np.int64)

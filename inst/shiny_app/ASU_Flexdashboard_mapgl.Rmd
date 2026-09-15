@@ -982,7 +982,7 @@ shiny::conditionalPanel(
     shiny::numericInput("cpsat_pop",       "Population threshold",      value = 10000,  min = 0, step = 100),
     shiny::numericInput("cpsat_max",       "Max ASUs",                  value = 30,     min = 1, step = 1),
     shiny::numericInput("cpsat_timelimit", "Time limit (sec) per window", value = 18000, min = 0, step = 60),
-    shiny::numericInput("cpsat_incumbent_stall_seconds", "Incumbent stall limit (sec)", value = 600, min = 0, step = 30),
+    shiny::numericInput("cpsat_incumbent_stall_seconds", "Incumbent stall limit (sec)", value = 300, min = 0, step = 30),
     shiny::numericInput("cpsat_workers",   "Total CP-SAT workers (detected cores - 2)", value = max(1, parallel::detectCores(logical = FALSE)-2), min = 1, step = 1),
     shiny::numericInput("cpsat_parallel_asus", "Concurrent ASU solves", value = 1, min = 1, step = 1),
     shiny::numericInput("cpsat_relgap",        "Relative gap (optional)",    value = NULL, min = 0, step = 0.0001),
@@ -1191,10 +1191,16 @@ if (identical(algo_choice, "cpsat")) {
     return()
   }
   session <- shiny::getDefaultReactiveDomain()
+  cpsat_running(TRUE)
+  cpsat_stage_text("initializing run")
+  append_cpsat_log("[run] Button clicked (CP-SAT).")
+  # Let this observer finish its first reactive flush so the lightweight log
+  # panel reaches the browser before TIGER downloads, geometry preparation, or
+  # either MapLibre widget begins. Start the expensive work immediately after
+  # that flush rather than holding the log until this whole branch yields.
+  session$onFlushed(function() {
+  shiny::isolate({
   shiny::withProgress(message = "Running OR-Tools CP-SAT…", value = 0, {
-    cpsat_running(TRUE)
-    cpsat_stage_text("initializing run")
-    append_cpsat_log("[run] Button clicked (CP-SAT).")
     # ---- 1) Preconditions & parameters --------------------------------
     shiny::req(uploaded_data(), state(), tract_year())
     sel_year <- selected_year              # from your earlier NE override logic
@@ -1415,13 +1421,14 @@ kwargs = dict(
     use_tract_first_search=False,
     use_flow_first_search=False,
     use_tract_capacity_search=False,
+    # Conservative production profile: retain the proven, low-volume cuts and
+    # leave the larger experimental flow/cardinality families opt-in.
     use_flow_capacity_hybrid_search=True,
     use_flow_count_envelope=False,
     use_small_root_separators=True,
-    root_separator_max_size=6,
-
-    root_separator_clause_limit=5000,
-    root_separator_target_limit=1000,
+    root_separator_max_size=5,
+    root_separator_clause_limit=1000,
+    root_separator_target_limit=500,
     solution_pool_size=32,
     full_graph_window=True,
     use_bridge_edge_bounds=True,
@@ -1738,6 +1745,8 @@ print('[runner] OK', flush=True)
   })
 
   # stop the parent observer here so non-CP-SAT code below doesn’t run
+  })
+  }, once = TRUE)
   return(invisible(NULL))
 }
 # --- end CP-SAT branch --------------------------------------------------
@@ -2069,10 +2078,11 @@ output$initial_map <- mapgl::renderMaplibre({
 
 ## Map {data-width="800"}
 ```{r}
-mapgl::maplibreOutput("initial_map", height = "100vh")
-
-# Log overlay (shows only while running)
+# Mount the lightweight log output before the map widget so that, when both
+# invalidate in the same reactive flush, the browser receives the log first.
 shiny::uiOutput("log_overlay")
+
+mapgl::maplibreOutput("initial_map", height = "100vh")
 
 ```
 
@@ -3047,180 +3057,11 @@ shiny::observeEvent(input$review_txt, {
 
 # How to Use ASUbuildR
 
-**About ASUbuildR 0.6.2**
+## User guide
 
-ASUbuildR is an application built in R using Shiny and Flexdashboard to
-create a point-and-click environment to build Areas of Substantial
-Unemployment (ASUs). It helps analysts build, inspect, edit, validate,
-and export tract-based ASU candidates. It does not replace current BLS
-program guidance or analyst review.
-
-The ASU creation logic in this program was created by a collaboration
-between the states of Ohio and Nevada, with the Shiny app and Graphical
-User Interface designed by Nevada’s Research & Analysis Bureau. The GitHub repository for this package can be found at <https://github.com/aisolori/ASUbuildR>
-
-**About the ASU Process**
-
-The ASU process typically begins when the U.S. Bureau of Labor
-Statistics distributes to each state a file providing the calculated
-inputs for regions within the state from which ASUs must be designated.
-This is provided as an Excel sheet with a filename like `ST_asuYY.xlsx`
-where ST is the state abbreviation and YY is the year for which the ASU
-is being designated. **ASUbuildR** is currently designed to pull
-information directly from this file, including identifying the state and
-year for which data should be retrieved. Because this file is built using public information but using
-preliminary LAUS data for June of the current year, archives of these
-files are not publicly available but also do not contain confidential
-information. Future versions of ASUbuildR may build these input files
-directly, but currently the state-specific input file is required.
-
-ASU candidates are evaluated on geographic contiguity, population, and
-unemployment rate. The dashboard defaults to a population threshold of
-10,000 and an operational unemployment-rate threshold of 6.45%, which
-rounds to 6.5% at one decimal place. Both review thresholds are editable;
-analysts should set them to the values required by current BLS guidance.
-
-**Using ASUbuildR**
-
-Install the package from GitHub with
-`pak::pak("aisolori/ASUbuildR")`, then launch it with
-`ASUbuildR::launch_ASUbuildR()`. Tract Hunter and Simple Snake need no
-separate Python configuration. To use CP-SAT, run
-`ASUbuildR::setup_asu_python()` once before launching the dashboard.
-
-**Basic Navigation**
-
-Within the app window, there are a series of tabs across the top. These
-control the basic navigation within the app. The functionality of each
-tab will be described in detail below.
-
--   Data Initialization: this is where you load the Excel file from BLS.
-
--   Load Initial ASU: here you use the data from BLS to generate an
-    initial list of potential ASUs.
-
--   Modify ASU Selections: this is the primary window you will interact
-    with. It allows for the manipulation and refinement of the data.
-
--   Save and Load Data: this allows you to save the current state of the
-    modified data and maps to be loaded later. If you have already saved
-    data, you can come straight here to load that map.
-
--   ASU Review and Finalization: this tab contains tools to review the
-    summarized ASUs, to generate an output CSV file to review individual
-    tracts, and to generate a batch TXT file that can be uploaded to
-    BLS.
-
-**Data Initialization**
-
-To begin the ASU building process, click the `Browse` button on the left
-side of the page. Once a file has been selected, an overview of the file
-will appear on the right to confirm the file has successfully loaded.
-You may review the contents of the columns to ensure that data appears
-to be loaded correctly. This script assumes the columns are maintained
-in a consistent order by BLS - changes to the structure of the file will
-require updates to the structure of this code.
-
-When review is complete, continue to the next tab - Load Initial ASU.
-
-**Load Initial ASU**
-
-There are three initial-building options:
-
--   **Tract Hunter** seeds and expands candidate groups, then lets you run
-  additional Hunter and Combine Groups passes. It considers the configured
-  population requirement while improving total unemployment in ASUs.
-
--   **Simple Snake** grows candidates tract by tract from high-unemployment
-  seeds. It is a quick starting point but does not enforce the population
-  qualification while building.
-
--   **CP-SAT (OR-Tools)** optimizes contiguous tract assignments against the
-  selected unemployment and population thresholds. It requires the optional
-  Python environment created by `ASUbuildR::setup_asu_python()`.
-
-If the state being loaded is a New England state, you will see an additional option to select the year to download.  Because the Census Bureau only maintains NECTA-based census tracts for 2021 and earlier, using the default settings may cause the app to crash if your Excel file uses these older GEOIDs.
-
-Choose an algorithm, then click **Load tracts & initialise**. The app downloads
-the selected Census tract boundaries, joins the uploaded BLS data, and runs
-the chosen builder. Runtime varies by state, algorithm, and CP-SAT time limit.
-When processing finishes, the map and ASU summary appear on the right.
-
-If using the Tract Hunter, use the **Run Hunter** and **Combine Groups** buttons to allow the algorithm to attempt to improve the existing ASUs.
-
-The summary table provides aggregate population, labor force,
-unemployment, and unemployment rate for each candidate ASU.
-
-To begin manually manipulating the data, proceed to the next tab, Modify ASU
-Selections. Or, if the number of modifications is large or the state
-takes a long time to run, skip ahead to perform an initial save of the
-data on Save and Load Data.
-
-**Modify ASU Selections**
-
-This tab is where all edits to the ASU selections are made. A number of
-tools are provided to aid in the optimization of the ASUs. In general,
-*selected* tracts will be outlined in red on the map.  A summary of selected tracts as well as aggregate statistics will be displayed on the right of the map.
-
--   Hover over the map. Hovering the mouse over the map will display
-    information about that tract useful to the selection process.
-
--   Click on the map. Clicking on the map will select, or unselect, a
-    particular tract.
-
--   Select ASU Number: This dropdown allows you to select all the tracts
-    in a particular ASU. If you select None, this will effectively clear
-    all selected tracts.
-
--   Change ASU Value / Update Selected Tracts: This is how you change
-    the pre-assigned ASU number. Enter the numeric value in the box
-    under *Change ASU Value:* and then click the *Update Selected
-    Tracts* to change the value. The numeric value remains in the box,
-    providing a convenient way to keep changing tracts or groups of
-    tracts to the same ASU. Further, changing the ASU number to 0 is how
-    selected tracts are removed from any ASUs.
-
--   Selection Summary: The summary and sortable tract table update
-  automatically. Selecting rows in the table highlights those tracts on
-  the map; map and percentile highlights are reflected in the table.
-
--   Percentile Threshold: This allows you to examine the tracts in your current selection with either high or low unemployment rates.  This is useful for identifying tracts outside of current ASUs that you may wish to include in an ASU or identifying tracts inside of current ASUs that you may with to drop.  Please choose whether you want to highlight Low or High unemployment tracts and enter a number in the Percentile Threshold box to highlight the top or bottom X% of tracts (X is the number you enter).  For example, if you have 200 tracts selected and choose 5 as your threshold and High unemployment, clicking the **Highlight Tracts** button will turn the color of the 10 tracts with the highest unemployment rates black.  Selecting **Clear Highlights** will clear all current highlighting.
-
--   Enter a GEOID / Select a Single Tract: This functionality is most
-    useful when using the CSV output that this app generates on the
-    **ASU Review and Finalization** tab. Given the 11-character GEOID,
-    you can input that to highlight a single tract to examine where it
-    fits. This can be helpful for fine-tuning - reviewing the
-    highest-unemployment tracts not included in an ASU to ensure they
-    cannot be connected in to improve the ASU.
-
--   Reset to Initial Data: This button will reset all changes you have
-    made to the state of the map after the **Load Initial ASU** process.
-    For when you’ve just broken everything and want to start over. Use
-    with caution!
-
-**Save and Load Data**
-
-This tab contains some simple options to help save and load the current
-state of the map. While Nevada had only 6 initial ASUs to review other
-states may have over 100! This will save the background data of the app
-as an RDS file, or load data from an RDS file.
-
-To specify a directory other than your working directory, paste that
-directory into the `Save Directory Path` box.
-
-**ASU Review and Finalization**
-
-This will typically be the last screen in the process. Set the applicable
-unemployment-rate and population thresholds, then select **Generate ASU
-Summary**. The table checks unemployment, population, and contiguity. Green
-`TRUE` values pass a test; red `FALSE` values require review. Qualification
-uses the unrounded aggregate unemployment rate.
-
-Generate LSS .txt File and Create Summary CSV will both create files in
-the directory specified in the **Save and Load Data** tab (or your
-working directory). The LSS TXT file should be formatted to be able to
-upload to LSS directly once the ASUs are completed. The Summary CSV file
-provides a handy output of all selected tracts and a useful tool to
-review the selections for high-unemployment tracts that were not
-included.
+```{r dashboard-user-guide, echo=FALSE}
+dashboard_guide_path <- file.path(
+  dirname(knitr::current_input(dir = TRUE)), "dashboard-guide.md"
+)
+shiny::includeMarkdown(dashboard_guide_path)
+```

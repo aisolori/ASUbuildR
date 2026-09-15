@@ -13,6 +13,7 @@ import asu_cpsat as solver
 
 
 class FinalPolishImmediateMergeTest(unittest.TestCase):
+<<<<<<< HEAD
     def test_distant_merge_skips_unchanged_polish_and_exchange_precedes_takeover(self):
         frame = pd.DataFrame({
             "geoid": [str(node) for node in range(10)],
@@ -67,11 +68,17 @@ class FinalPolishImmediateMergeTest(unittest.TestCase):
         self.assertEqual(events, ["solve", "solve", "solve", "regional", "solve"])
         self.assertEqual(result["n_asu"], 2)
 
+=======
+>>>>>>> fe2b02e74c641ae8259311ba9ad97e23ed77101c
     def test_merge_restarts_before_next_original_asu_is_polished(self):
         frame = pd.DataFrame({
             "geoid": [str(node) for node in range(6)],
             "tract_ASU_unemp": [30, 30, 10, 20, 20, 5],
+<<<<<<< HEAD
             "tract_ASU_emp": [250, 250, 90, 80, 80, 95],
+=======
+            "tract_ASU_emp": [70, 70, 90, 80, 80, 95],
+>>>>>>> fe2b02e74c641ae8259311ba9ad97e23ed77101c
             "tract_pop2024": [6000, 6000, 1000, 6000, 6000, 1000],
         })
         prepared = {
@@ -84,8 +91,12 @@ class FinalPolishImmediateMergeTest(unittest.TestCase):
             "connectivity_free_standalone_asus": [[0, 1], [3, 4]],
         }
         polish_results = [
+<<<<<<< HEAD
             # ASU 1 has more unemployment despite less surplus capacity.
             # It adds tract 2 from its local window [0, 1, 2], touching ASU 2.
+=======
+            # ASU 1 adds tract 2 and now touches ASU 2 at tract 3.
+>>>>>>> fe2b02e74c641ae8259311ba9ad97e23ed77101c
             solver.CpsatResult([0, 1, 2], 0, 70, "OPTIMAL"),
             # The next solve must be the newly merged five-tract ASU.
             solver.CpsatResult([0, 1, 2, 3, 4, 5], 0, 115, "OPTIMAL"),
@@ -125,11 +136,14 @@ class FinalPolishImmediateMergeTest(unittest.TestCase):
             for call in exact_solve.call_args_list
         ]
         self.assertEqual(hint_sizes[:2], [2, 5])
+<<<<<<< HEAD
         self.assertEqual(exact_solve.call_args_list[0].kwargs["hint_obj"], 60)
         # ASU 1 has surplus 40 versus ASU 2's 200 (tau=.1 => den=9, num=1).
         first = exact_solve.call_args_list[0].kwargs
         self.assertEqual(9 * int(first["u_g"][first["hint"]].sum())
                          - int(first["E_g"][first["hint"]].sum()), 40)
+=======
+>>>>>>> fe2b02e74c641ae8259311ba9ad97e23ed77101c
         for call in exact_solve.call_args_list[:2]:
             self.assertTrue(callable(call.kwargs["incumbent_report_callback"]))
             self.assertEqual(call.kwargs["incumbent_report_interval_seconds"], 60.0)

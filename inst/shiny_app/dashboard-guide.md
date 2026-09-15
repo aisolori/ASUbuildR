@@ -93,14 +93,20 @@ infeasibility.
 | PARTITION_EXPANSION | Expanding seeds in assigned territories, one solve at a time. |
 | PARTITION_EXPANSION_COMPLETE | Summarizing that round. Rejected seeds did not produce valid ASUs; the whole run can continue. |
 | PARTITION_BUILD_MERGE / PARTITION_COMBINE | Joining touching candidates or groups. A merge may start another pass. |
+<<<<<<< HEAD
 | FINAL_POLISH | Reconsidering ASUs from most to least unemployment captured, with ASU number breaking ties. Each can reconsider its own and unassigned tracts; the order is recomputed after a merge. |
 | FINAL_POLISH_MERGE | Restarting polishing after a merge. |
 | REGIONAL_EXCHANGE | Letting two or three nearby ASUs exchange tracts together, while keeping every affected ASU valid. Only increases in combined unemployment are accepted. |
+=======
+| FINAL_POLISH | Reconsidering each ASU with unassigned tracts; additions and removals are possible. |
+| FINAL_POLISH_MERGE | Restarting polishing after a merge. |
+>>>>>>> fe2b02e74c641ae8259311ba9ad97e23ed77101c
 | SINGLE_ASU_TAKEOVER / TAKEOVER_DONOR_REPAIR | Trying a larger replacement and repairing affected groups before accepting or rejecting the attempt. |
 | FINAL_RESIDUAL_CHECK | Checking remaining tract components near the end. |
 
 Stages may repeat or be skipped depending on the strategy and results.
 
+<<<<<<< HEAD
 Regional exchanges run after final polishing, before statewide takeover.
 The exchange pass has up to four neighborhood attempts per
 run, with at most 60 seconds per attempt and 180 seconds total (or the
@@ -130,6 +136,8 @@ population, then lower tract index. Individual polish solves keep their root.
 Regional exchanges and residual searches choose the highest-capacity tract
 within each selection they find, allowing them to replace the original root.
 
+=======
+>>>>>>> fe2b02e74c641ae8259311ba9ad97e23ed77101c
 Pastel fills identify committed ASUs; colors can repeat, so check the tooltip's
 ASU number. Grey indicates unassigned tracts. During supported searches,
 translucent green/red fills show proposed additions/removals relative to the

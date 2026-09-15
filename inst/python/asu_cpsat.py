@@ -277,6 +277,23 @@ def _merge_touching_asu_units(
     return merged, merges
 
 
+def _asu_units_touch(
+    left: Sequence[int],
+    right: Sequence[int],
+    nb: List[List[int]],
+) -> bool:
+    """Return whether two tract sets overlap or share a graph edge."""
+    left_set = {int(node) for node in left}
+    right_set = {int(node) for node in right}
+    if left_set.intersection(right_set):
+        return True
+    return any(
+        int(neighbor) in right_set
+        for node in left_set
+        for neighbor in nb[node]
+    )
+
+
 def greedy_snake_hint(
     nb_local: List[List[int]],
     u_g: np.ndarray, # unemployment counts per tract
@@ -1297,6 +1314,7 @@ def _asu_full_subsolvers(
     use_tract_capacity_search: bool = False,
     use_flow_capacity_hybrid_search: bool = False,
     use_tract_first_probing: bool = False,
+    has_objective: bool = True,
 ) -> List[str]:
     """Return the bounded full-problem portfolio for one ASU solve."""
     workers = max(1, int(workers))
@@ -1497,6 +1515,100 @@ def _configure_asu_shared_tree(
             "shared_tree",
             search_branching=cp_model.PARTIAL_FIXED_SEARCH,
         )
+
+
+def _configure_asu_solver_portfolio(
+    params,
+    workers: int,
+    *,
+    use_tract_first_search: bool = False,
+    use_flow_first_search: bool = False,
+    use_tract_capacity_search: bool = False,
+    use_flow_capacity_hybrid_search: bool = False,
+    has_objective: bool = True,
+) -> None:
+    """Install the ASU portfolio on every CP-SAT solver invocation."""
+    workers = max(1, int(workers))
+    params.extra_subsolvers.clear()
+    params.subsolvers.clear()
+    params.filter_subsolvers.clear()
+
+    tract_first_probing = (
+        use_tract_first_search and _supports_tract_first_probing(params)
+    )
+    if use_flow_first_search:
+        _append_asu_subsolver_params(
+            params,
+            "asu_flow_first",
+            search_branching=cp_model.PARTIAL_FIXED_SEARCH,
+            linearization_level=2,
+            root_lp_iterations=25_000,
+            add_lp_constraints_lazily=False,
+            max_cut_rounds_at_level_zero=10,
+        )
+    if use_flow_capacity_hybrid_search:
+        _append_asu_subsolver_params(
+            params,
+            "asu_flow_capacity_hybrid",
+            search_branching=cp_model.PARTIAL_FIXED_SEARCH,
+            linearization_level=2,
+            root_lp_iterations=25_000,
+            add_lp_constraints_lazily=False,
+            max_cut_rounds_at_level_zero=10,
+        )
+    if use_tract_first_search:
+        _append_asu_subsolver_params(
+            params,
+            "asu_tract_first",
+            search_branching=cp_model.PARTIAL_FIXED_SEARCH,
+            linearization_level=2,
+        )
+    if use_tract_capacity_search:
+        _append_asu_subsolver_params(
+            params,
+            "asu_tract_capacity",
+            search_branching=cp_model.PARTIAL_FIXED_SEARCH,
+            linearization_level=2,
+        )
+
+    _append_asu_subsolver_params(
+        params,
+        "lb_tree_search",
+        save_lp_basis_in_lb_tree_search=False,
+        max_cut_rounds_at_level_zero=4,
+        add_objective_cut=True,
+        root_lp_iterations=100_000,
+    )
+    _configure_asu_lp_search_params(params)
+    _configure_asu_probe_variants(
+        params,
+        tract_first=tract_first_probing,
+    )
+    _configure_asu_pseudo_costs(params)
+
+    full_subsolvers = _asu_full_subsolvers(
+        workers,
+        use_tract_first_search=use_tract_first_search,
+        use_flow_first_search=use_flow_first_search,
+        use_tract_capacity_search=use_tract_capacity_search,
+        use_flow_capacity_hybrid_search=use_flow_capacity_hybrid_search,
+        use_tract_first_probing=tract_first_probing,
+        has_objective=has_objective,
+    )
+    params.subsolvers.extend(full_subsolvers)
+    params.num_full_subsolvers = len(full_subsolvers)
+    params.filter_subsolvers.extend(list(dict.fromkeys(
+        full_subsolvers + [
+            "rins*",
+            "lb_relax_lns",
+            "graph_arc_lns",
+            "graph_var_lns",
+            "graph_cst_lns",
+            "rnd_var_lns",
+            "rnd_cst_lns",
+            "ls*",
+        ]
+    )))
 
 
 def reverse_prune_hint(
@@ -2320,6 +2432,7 @@ def solve_one_asu_cpsat(
     objective_no_improve_stop: Optional[int] = None,
     incumbent_report_callback: Optional[Callable[[List[int], int], None]] = None,
     incumbent_report_interval_seconds: float = 60.0,
+    incumbent_interrupt_callback: Optional[Callable[[List[int], int], bool]] = None,
     use_profitable_component_closure: bool = True,
     use_lagrangian_variable_fixing: bool = True,
 ) -> Optional[CpsatResult]:
@@ -2380,9 +2493,25 @@ def solve_one_asu_cpsat(
     `incumbent_report_callback`, when supplied, receives the latest connected
     local-node selection and objective on a periodic cadence during the main
     CP-SAT search. Reporting is observational only and never changes the model.
+
+    `incumbent_interrupt_callback`, when supplied, is evaluated for every
+    improving connected incumbent. Returning true stops the current solve after
+    preserving that incumbent, allowing the caller to validate, merge, and
+    restart outside CP-SAT's callback context.
     """
     N = len(nb_local)
     if N == 0:
+        return None
+    screen_status = _connectivity_free_feasibility(
+        u_g, E_g, P_g, tau, pop_thresh,
+        seconds=min(5.0, max(0.0, float(time_limit)) * 0.1), workers=workers,
+        required=sorted(set([int(root_local)] + list(forced_selected or []))),
+        max_nodes=max_nodes, exact_nodes=exact_nodes, stop_path=stop_flag_path,
+    )
+    if log:
+        print(f"[CONNECTIVITY-FREE SCREEN] {N} tracts: {screen_status}" +
+              ("; skipping connected solve" if screen_status == "INFEASIBLE" else ""), flush=True)
+    if screen_status == "INFEASIBLE":
         return None
     custom_modes = [
         bool(use_tract_first_search),
@@ -2493,6 +2622,29 @@ def solve_one_asu_cpsat(
         ):
             raise ValueError("Connected solve returned an invalid expanded ASU")
         return CpsatResult(orig, root_local_orig, int(u_g_orig[orig].sum()) if orig else 0, status)
+
+    def _incumbent_requests_interrupt(
+        selection: Sequence[int],
+    ) -> bool:
+        if incumbent_interrupt_callback is None:
+            return False
+        expanded_selection = sorted({
+            original_node
+            for contracted_node in selection
+            for original_node in expand_c[int(contracted_node)]
+        })
+        try:
+            return bool(incumbent_interrupt_callback(
+                expanded_selection,
+                int(u_g_orig[expanded_selection].sum()),
+            ))
+        except Exception as exc:
+            if log:
+                print(
+                    f"  [incumbent] interrupt callback failed: {exc}",
+                    flush=True,
+                )
+            return False
 
     model = cp_model.CpModel()
 
@@ -2802,8 +2954,6 @@ def solve_one_asu_cpsat(
     old_boundary_literals_equivalent = 0
     _DYNAMIC_SEPARATOR_MAX = 16
     _DYNAMIC_TARGETS_PER_COMPONENT = 3
-    root_distances = _root_graph_distances(nb_local, root_local)
-
     def _component_key(component: set) -> Tuple[int, int]:
         # Smallest tract count first; ties broken by smallest unemployment.
         return (len(component), int(u_g[list(component)].sum()))
@@ -2877,9 +3027,9 @@ def solve_one_asu_cpsat(
             ranked = sorted(
                 component,
                 key=lambda node: (
+                    -int(u_g[node]),
                     int(q_surplus[node]) <= 0,
                     -int(q_surplus[node]),
-                    -int(u_g[node]),
                     -int(root_distances[node]),
                     int(node),
                 ),
@@ -2926,6 +3076,15 @@ def solve_one_asu_cpsat(
         solver.parameters.log_search_progress = False  # silent; summary logged after loop
         solver.parameters.cp_model_presolve = True
         solver.parameters.linearization_level = 2
+        if configure_subsolvers:
+            _configure_asu_solver_portfolio(
+                solver.parameters,
+                workers,
+                use_tract_first_search=tract_first_enabled,
+                use_flow_first_search=flow_first_enabled,
+                use_tract_capacity_search=tract_capacity_enabled,
+                use_flow_capacity_hybrid_search=flow_capacity_hybrid_enabled,
+            )
 
         status = solver.Solve(model)
         if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
@@ -2944,7 +3103,8 @@ def solve_one_asu_cpsat(
 
         if len(root_component) == len(selected):
             objective = int(round(solver.ObjectiveValue()))
-            if objective > best_obj:
+            improved_connected = objective > best_obj
+            if improved_connected:
                 best_connected, best_obj = selected, objective
                 if best_obj > lower_bound:
                     model.Add(obj_expr >= best_obj)
@@ -2955,6 +3115,14 @@ def solve_one_asu_cpsat(
                     f"(best so far={best_obj}), elapsed={time.monotonic() - start_time:.1f}s",
                     flush=True,
                 )
+            if improved_connected and _incumbent_requests_interrupt(selected):
+                if log:
+                    print(
+                        "  [merge] cut-pass incumbent touches another ASU; "
+                        "returning it for validation and immediate merge/restart.",
+                        flush=True,
+                    )
+                return _to_orig(selected, "MERGE_STOPPED_FEASIBLE")
             if (
                 status == cp_model.OPTIMAL
                 and not deterministic_ties
@@ -3162,35 +3330,10 @@ def solve_one_asu_cpsat(
         if flow_source is not None else {}
     )
 
-    # Tighten the shared selection-count bound without launching an auxiliary
-    # CP-SAT solve. The rate-only surplus knapsack has an exact greedy answer:
-    # include forced and non-negative-surplus nodes, then consume the available
-    # surplus with optional deficits from smallest to largest. Dropping the
-    # population and connectivity rows keeps this a valid upper bound for every
-    # feasible ASU while eliminating up to 10 seconds of setup/solve latency.
-    surplus_count_bound, _, surplus_negative_bound = _surplus_knapsack_bounds(
-        q_surplus, forced_set, N
-    )
-    max_selected = N if surplus_count_bound is None else surplus_count_bound
-    max_selected = max(len(forced_set), min(N, int(max_selected)))
+    # The shared selection-count variable and its rate-relaxed upper bound were
+    # installed before the cut pass so rooted-distance propagation was active
+    # there too. Reuse the same bound as the flow capacity.
     M = max(1, max_selected - 1)
-
-    if log:
-        if surplus_count_bound is None:
-            print(
-                "  analytical surplus bound: rate relaxation infeasible; "
-                f"leaving flow count envelope at {N}",
-                flush=True,
-            )
-        else:
-            print(
-                f"  analytical surplus bound: selected <= {max_selected} "
-                f"({surplus_negative_bound} optional deficit tract(s))",
-                flush=True,
-            )
-
-    selected_count = model.NewIntVar(len(forced_set), max_selected, "selected_count")
-    model.Add(selected_count == sum(x))
     if flow_source is not None:
         model.AddHint(selected_count, len(flow_source))
 
@@ -3551,6 +3694,14 @@ def solve_one_asu_cpsat(
         _scout.parameters.cp_model_probing_level = 2
         _scout.parameters.cut_level = 1
         if configure_subsolvers:
+            _configure_asu_solver_portfolio(
+                _scout.parameters,
+                workers,
+                use_tract_first_search=tract_first_enabled,
+                use_flow_first_search=flow_first_enabled,
+                use_tract_capacity_search=tract_capacity_enabled,
+                use_flow_capacity_hybrid_search=flow_capacity_hybrid_enabled,
+            )
             _scout.parameters.ignore_subsolvers.extend([
                 "lb_tree_search",
                 "probing",
@@ -3607,6 +3758,15 @@ def solve_one_asu_cpsat(
             proof_solver.parameters.log_search_progress = bool(log)
             proof_solver.parameters.cp_model_presolve = True
             proof_solver.parameters.linearization_level = 2
+            if configure_subsolvers:
+                _configure_asu_solver_portfolio(
+                    proof_solver.parameters,
+                    workers,
+                    use_tract_first_search=tract_first_enabled,
+                    use_flow_first_search=flow_first_enabled,
+                    use_tract_capacity_search=tract_capacity_enabled,
+                    use_flow_capacity_hybrid_search=flow_capacity_hybrid_enabled,
+                )
             proof_iterations += 1
             proof_status = proof_solver.Solve(proof_model)
 
@@ -3924,15 +4084,13 @@ def solve_one_asu_cpsat(
 
             allowed = list(dict.fromkeys(
               full_subsolvers + [
-                "shared_tree",
-
                 "rins*",
                 "lb_relax_lns",
 
                 "graph_arc_lns",
                 "graph_var_lns",
                 "graph_cst_lns",
-                "graph_dec_lns",
+                #"graph_dec_lns", usually not good
 
                 "rnd_var_lns",
                 "rnd_cst_lns",
@@ -3980,11 +4138,7 @@ def solve_one_asu_cpsat(
                 tract_first=tract_first_enabled,
             )
             _configure_asu_pseudo_costs(params)
-            _configure_asu_shared_tree(
-                params,
-                workers=workers,
-                tract_first=tract_first_enabled,
-            )
+
             if configure_subsolvers:
                 configure_asu_subsolvers(params, workers)
             if rel_gap is not None:
@@ -4131,6 +4285,7 @@ def solve_one_asu_cpsat(
 
             class _MainSolveCallback(cp_model.CpSolverSolutionCallback):
                 def on_solution_callback(self) -> None:
+                    nonlocal stop_kind
                     candidate_obj = int(round(self.ObjectiveValue()))
                     with progress_lock:
                         if candidate_obj <= progress["best_obj"]:
@@ -4142,6 +4297,12 @@ def solve_one_asu_cpsat(
                             progress["best_obj"] = candidate_obj
                             progress["best_selection"] = candidate
                             progress["last_incumbent_time"] = time.monotonic()
+
+                    if incumbent_interrupt_callback is not None:
+                        if _incumbent_requests_interrupt(candidate):
+                            stop_kind = "merge"
+                            stopped.set()
+                            self.stop_search()
 
             def _on_best_bound(bound: float) -> None:
                 nonlocal stop_kind
@@ -4282,6 +4443,8 @@ def solve_one_asu_cpsat(
                         status_name = "SKIPPED_FEASIBLE"
                     elif stop_kind == "bound":
                         status_name = "BOUND_STOPPED_FEASIBLE"
+                    elif stop_kind == "merge":
+                        status_name = "MERGE_STOPPED_FEASIBLE"
                     else:
                         status_name = "STOPPED_FEASIBLE"
                     selected = list(best_connected)
@@ -4293,6 +4456,13 @@ def solve_one_asu_cpsat(
                             f"no-improvement threshold ({bound_stop_value:.1f} <= "
                             f"{bound_stop_threshold}); returning incumbent "
                             f"{best_obj if best_obj >= 0 else 'none'}.",
+                            flush=True,
+                        )
+                    elif stop_kind == "merge":
+                        print(
+                            "  [merge] improving incumbent touches another ASU; "
+                            f"returning incumbent {best_obj} for validation and "
+                            "immediate merge/restart.",
                             flush=True,
                         )
                     else:
@@ -4545,9 +4715,14 @@ def solve_one_asu_cpsat(
                 tie_solver.parameters.cp_model_presolve = True
                 tie_solver.parameters.linearization_level = 2
                 if configure_subsolvers:
-                    tie_solver.parameters.ignore_subsolvers.extend([
-                        "pseudo_costs", "reduced_costs", "default_lp", "quick_restart",
-                    ])
+                    _configure_asu_solver_portfolio(
+                        tie_solver.parameters,
+                        workers,
+                        use_tract_first_search=tract_first_enabled,
+                        use_flow_first_search=flow_first_enabled,
+                        use_tract_capacity_search=tract_capacity_enabled,
+                        use_flow_capacity_hybrid_search=flow_capacity_hybrid_enabled,
+                    )
                 tie_status = tie_solver.Solve(model)
                 if tie_status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
                     break
@@ -5643,6 +5818,7 @@ def solve_local_repair(
     solver.parameters.cp_model_presolve = True
     solver.parameters.linearization_level = 2
     solver.parameters.random_seed = int(random_seed)
+    _configure_asu_solver_portfolio(solver.parameters, num_workers)
 
     status = solver.Solve(model)
     solve_secs = time.monotonic() - t0
@@ -6019,6 +6195,7 @@ def solve_connectivity_free_relaxation(
     solver.parameters.cp_model_presolve = True
     solver.parameters.linearization_level = 2
     solver.parameters.log_search_progress = False
+    _configure_asu_solver_portfolio(solver.parameters, workers)
 
     class _RelaxedIncumbentCollector(cp_model.CpSolverSolutionCallback):
         def __init__(self, log_enabled: bool, start_time: float) -> None:
@@ -6840,10 +7017,11 @@ def solve_asu_graph_cut_only(
     stall_rounds: Optional[int] = 5,
 ) -> Optional["CpsatResult"]:
     """
-    Standalone ASU solver that enforces connectivity purely through iterative
-    lazy vertex-separator cuts -- no exact flow-based connectivity phase at
-    all. Unlike the cut pre-pass inside `solve_one_asu_cpsat`, there is no
-    round cap: each round either adds boundary cuts for whatever components
+    Standalone ASU solver that enforces connectivity through iterative
+    constraint-generation vertex-separator cuts -- no exact flow-based
+    connectivity phase at all. Unlike the cut pre-pass inside
+    `solve_one_asu_cpsat`, there is no round cap: each round either adds
+    representative separator cuts for components disconnected from the root
     are disconnected from the root, or (once a connected candidate is found)
     tightens the objective floor to strictly require a better one next round.
     The loop stops when the model goes INFEASIBLE (the current incumbent is
@@ -6854,8 +7032,7 @@ def solve_asu_graph_cut_only(
     A stall only ends the search early; whatever `best_connected` incumbent
     was already found is still returned. Intended to be run against a
     connectivity-free relaxation's selection/bound/cuts as a completely
-    separate experiment from the other warm-start and solve paths -- it does
-    not touch or get called by any of them.
+    graph-cut repair path used while preparing a window hint.
     """
     N = len(nb_local)
     if N == 0:
@@ -6924,7 +7101,8 @@ def solve_asu_graph_cut_only(
         else:
             model.Add(x[v] == 0)
 
-    seen_seeded_cuts: set = set()
+    seen_cut_signatures: set = set()
+    separator_pool: Dict[int, List[frozenset]] = {}
     for component_orig, boundary_orig in (initial_connectivity_cuts or []):
         component_c = {
             int(node_map_c[int(node)])
@@ -6943,11 +7121,17 @@ def solve_asu_graph_cut_only(
             if node in boundary_c:
                 continue
             cut_key = (node, boundary_tuple)
-            if cut_key in seen_seeded_cuts:
+            if cut_key in seen_cut_signatures:
                 continue
-            seen_seeded_cuts.add(cut_key)
+            seen_cut_signatures.add(cut_key)
             if boundary_tuple:
                 model.AddBoolOr([x[node].Not()] + [x[boundary] for boundary in boundary_tuple])
+                separator = frozenset(
+                    boundary for boundary in boundary_tuple
+                    if boundary != root_local and boundary != node
+                )
+                if separator:
+                    separator_pool.setdefault(node, []).append(separator)
             else:
                 model.Add(x[node] == 0)
 
@@ -6980,6 +7164,15 @@ def solve_asu_graph_cut_only(
     pending_expand: List[set] = initial_pending
     best_num_components: Optional[int] = None
     stall_count = 0
+    root_distances = _root_graph_distances(nb_local, root_local)
+    separator_attempts = 0
+    separator_accepted = 0
+    separator_duplicates = 0
+    separator_dominated = 0
+    separator_superseded = 0
+    fallback_clauses = 0
+    _DYNAMIC_SEPARATOR_MAX = 16
+    _DYNAMIC_TARGETS_PER_COMPONENT = 3
 
     def _set_expand_hint(nodes: set) -> None:
         hint = model.Proto().solution_hint
@@ -6987,6 +7180,43 @@ def solve_asu_graph_cut_only(
         hint.values.clear()
         for i in range(N):
             model.AddHint(x[i], 1 if i in nodes else 0)
+
+    def _pick_component_targets(component: set) -> List[int]:
+        u_target = max(component, key=lambda node: (int(u_g[node]), -int(node)))
+        q_target = max(
+            component,
+            key=lambda node: (int(q_surplus[node]), int(u_g[node]), -int(node)),
+        )
+        far_target = max(
+            component,
+            key=lambda node: (int(root_distances[node]), int(u_g[node]), -int(node)),
+        )
+        targets = list(dict.fromkeys([int(q_target), int(u_target), int(far_target)]))
+        return targets[:_DYNAMIC_TARGETS_PER_COMPONENT]
+
+    def _register_separator(target: int, separator: Sequence[int]) -> Optional[Tuple[int, ...]]:
+        nonlocal separator_attempts, separator_accepted
+        nonlocal separator_duplicates, separator_dominated, separator_superseded
+        separator_attempts += 1
+        candidate = frozenset(
+            int(node) for node in separator
+            if int(node) != root_local and int(node) != int(target)
+        )
+        if not candidate:
+            return None
+        existing = separator_pool.setdefault(int(target), [])
+        for prior in existing:
+            if prior == candidate:
+                separator_duplicates += 1
+                return None
+            if prior.issubset(candidate):
+                separator_dominated += 1
+                return None
+        kept = [prior for prior in existing if not candidate.issubset(prior)]
+        separator_superseded += len(existing) - len(kept)
+        separator_pool[int(target)] = kept + [candidate]
+        separator_accepted += 1
+        return tuple(sorted(candidate))
 
     class _GraphCutProgress(cp_model.CpSolverSolutionCallback):
         def __init__(self, log_enabled: bool, round_no: int, start: float) -> None:
@@ -7039,6 +7269,7 @@ def solve_asu_graph_cut_only(
         solver.parameters.log_search_progress = False
         solver.parameters.cp_model_presolve = True
         solver.parameters.linearization_level = 2
+        _configure_asu_solver_portfolio(solver.parameters, workers)
 
         progress = _GraphCutProgress(log, cut_round, start_time)
         status = solver.Solve(model, progress)
@@ -7050,6 +7281,7 @@ def solve_asu_graph_cut_only(
             break
 
         selected = [i for i in range(N) if solver.BooleanValue(x[i])]
+        selected_set = set(selected)
         selected_mask = np.zeros(N, dtype=bool)
         selected_mask[selected] = True
         # One igraph call replaces the old two-pass root-BFS + unseen-BFS: it
@@ -7106,17 +7338,49 @@ def solve_asu_graph_cut_only(
                 model.Add(obj_expr >= best_obj + 1)
 
         components: List[set] = [set(c) for c in all_components if root_local not in c]
+        round_cuts_added = 0
         for component in components:
             boundary = sorted({
                 w for v in component for w in nb_local[v]
                 if w not in component
             })
-            if boundary:
-                for v in component:
-                    model.AddBoolOr([x[v].Not()] + [x[w] for w in boundary])
-            else:
-                for v in component:
-                    model.Add(x[v] == 0)
+            targets = _pick_component_targets(component)
+            dynamic_added = 0
+            for target in targets:
+                separator = _minimum_root_vertex_separator(
+                    nb_local,
+                    root_local,
+                    target,
+                    protected_nodes=selected_set,
+                    max_size=_DYNAMIC_SEPARATOR_MAX,
+                )
+                if separator is None:
+                    continue
+                kept = _register_separator(target, separator)
+                if not kept:
+                    continue
+                model.AddBoolOr([x[target].Not()] + [x[node] for node in kept])
+                dynamic_added += 1
+                round_cuts_added += 1
+
+            if dynamic_added:
+                continue
+
+            # If a small minimum separator was unavailable or already present,
+            # retain a valid representative boundary cut. This keeps progress
+            # without restoring the old per-node, per-component clause flood.
+            boundary_tuple = tuple(boundary)
+            for target in targets:
+                cut_key = (target, boundary_tuple)
+                if cut_key in seen_cut_signatures:
+                    continue
+                seen_cut_signatures.add(cut_key)
+                if boundary_tuple:
+                    model.AddBoolOr([x[target].Not()] + [x[node] for node in boundary_tuple])
+                else:
+                    model.Add(x[target] == 0)
+                fallback_clauses += 1
+                round_cuts_added += 1
         num_components = len(components)
         # Try the smallest disconnected component first next round -- cheapest
         # to absorb, and most likely for a CP-SAT-guided swap to succeed.
@@ -7131,7 +7395,8 @@ def solve_asu_graph_cut_only(
             best_text = str(best_obj) if best_obj >= 0 else "none"
             print(
                 f"  [graph-cut] round {cut_round}: DISCONNECTED "
-                f"({num_components} component(s) cut), best_connected so far={best_text}, "
+                f"({num_components} component(s), {round_cuts_added} cut(s) added), "
+                f"best_connected so far={best_text}, "
                 f"elapsed={time.monotonic() - start_time:.1f}s",
                 flush=True,
             )
@@ -7151,7 +7416,10 @@ def solve_asu_graph_cut_only(
         print(
             f"  graph-cut-only solve: {cut_round} round(s), {elapsed:.1f}s, "
             f"status={status_name if best_connected is not None else 'INFEASIBLE'}, "
-            f"best unemp={obj_text}",
+            f"best unemp={obj_text}; separator attempts={separator_attempts}, "
+            f"accepted={separator_accepted}, duplicates={separator_duplicates}, "
+            f"dominated={separator_dominated}, superseded={separator_superseded}, "
+            f"fallback={fallback_clauses}",
             flush=True,
         )
 
@@ -7763,8 +8031,8 @@ def build_many_asus_cpsat(
     """
     Build ASUs in batches of up to `parallel_asus` disjoint candidate windows, solved
     concurrently; `parallel_asus=1` runs every full-window ASU solve sequentially.
-    Concurrent standalone-component harvest-expansion solves are capped separately,
-    by component count and worker budget, independent of `parallel_asus`. Two ASUs
+    Standalone-component harvest-expansion solves run sequentially and each receives
+    the full configured worker budget, independent of `parallel_asus`. Two ASUs
     built in the same batch that end up touching (share a
     queen-contiguity edge) are merged into one: the mediant inequality guarantees
     that combining two groups whose UR is each >= tau keeps the combined UR >= tau
@@ -7802,7 +8070,9 @@ def build_many_asus_cpsat(
     territory assigned by nearest-seed graph distance. Territories are disjoint,
     so one expansion cannot consume another standalone ASU or its frontier.
     Touching expansions are merged, their territories are repartitioned, and
-    CP-SAT expansion is rerun until no further merge occurs. A final fixed-point
+    CP-SAT expansion is rerun after either a merge or an unemployment gain.
+    A round with neither ends this loop; time-limited solves do not prove that
+    further improvement is impossible. A final fixed-point
     pass applies the same merge-and-expand rule to contacts across build batches.
 
     After merge/expansion stabilizes, each committed ASU is polished sequentially
@@ -7958,7 +8228,22 @@ def build_many_asus_cpsat(
                 tmp_path = f"{progress_out_path}.tmp"
                 with open(tmp_path, "w", encoding="utf-8") as handle:
                     json.dump(payload, handle)
-                os.replace(tmp_path, progress_out_path)
+                # On Windows the dashboard's brief read handle can prevent an
+                # otherwise-atomic replacement with WinError 5/32. Preserve
+                # atomic publication, but retry long enough to outlast a poll.
+                replace_delays = (0.01, 0.02, 0.04, 0.08, 0.12, 0.18, 0.25, 0.30)
+                for attempt, delay in enumerate(replace_delays):
+                    try:
+                        os.replace(tmp_path, progress_out_path)
+                        break
+                    except OSError as exc:
+                        windows_code = getattr(exc, "winerror", None)
+                        access_race = windows_code in (5, 32) or (
+                            windows_code is None and getattr(exc, "errno", None) == 13
+                        )
+                        if not access_race or attempt == len(replace_delays) - 1:
+                            raise
+                        time.sleep(delay)
         except Exception as exc:
             if verbose:
                 print(
@@ -7979,7 +8264,7 @@ def build_many_asus_cpsat(
         mapping = tuple(int(node) for node in local_to_global)
         baseline = {mapping[int(node)] for node in baseline_local}
 
-        def report(selected_local, _objective):
+        def report(selected_local, objective):
             selected = {mapping[int(node)] for node in selected_local}
             with preview_lock:
                 preview_deltas[key] = (selected - baseline, baseline - selected)
@@ -7992,6 +8277,15 @@ def build_many_asus_cpsat(
                     exploring_added_idx=sorted(added),
                     exploring_removed_idx=sorted(removed - added),
                 )
+                if verbose:
+                    preview_phase = key[0] if isinstance(key, tuple) else key
+                    print(
+                        f"  [incumbent map] phase={preview_phase} "
+                        f"objective={int(objective)} "
+                        f"added={len(selected - baseline)} "
+                        f"removed={len(baseline - selected)}",
+                        flush=True,
+                    )
         return report
 
     def _clear_incumbent_previews():
@@ -8262,29 +8556,36 @@ def build_many_asus_cpsat(
                     territory_sources, nb, remaining, u=u
                 )
                 territories = all_territories[:len(round_seeds)]
-                # Disjoint-territory harvest solves are independent of
-                # `parallel_asus`/`batch_size` (that knob limits concurrent
-                # *full* ASU windows, a much heavier workload) -- cap only by
-                # how many components there are and total worker budget, or
-                # this silently serializes harvesting whenever parallel_asus=1.
-                expansion_parallelism = min(
-                    len(round_seeds),
-                    max(1, int(workers)),
+                # Expansion solves deliberately run one at a time.  Besides
+                # making their logs and incumbents easier to attribute, this
+                # gives every territory the complete CP-SAT worker portfolio.
+                expansion_workers = max(1, int(workers))
+                expansion_started = time.monotonic()
+                attempted_seed_count = len(round_seeds)
+                independently_valid_count = sum(
+                    component_ok(nodes, u, E, P, tau, pop_thresh, nb)
+                    for nodes in round_seeds
                 )
-                expansion_workers = max(
-                    1, int(workers) // expansion_parallelism
+                territory_sizes = [len(nodes) for nodes in territories]
+                seed_tract_count = sum(len(nodes) for nodes in round_seeds)
+                seed_unemployment = sum(
+                    int(u[nodes].sum()) for nodes in round_seeds
                 )
                 if verbose:
-                    expansion_mode = (
-                        "sequential"
-                        if expansion_parallelism == 1
-                        else "parallel"
-                    )
                     print(
-                        f"  [EXPAND round={expansion_round}] "
-                        f"mode={expansion_mode}, "
-                        f"concurrent_solves={expansion_parallelism}, "
-                        f"workers_per_solve={expansion_workers}",
+                        f"\n[STAGE] PARTITION_EXPANSION "
+                        f"round={expansion_round} mode=sequential "
+                        f"solves={attempted_seed_count} "
+                        f"workers_per_solve={expansion_workers} "
+                        f"time_limit_per_solve={standalone_expansion_time_limit:.1f}s "
+                        f"seed_tracts={seed_tract_count} "
+                        f"seed_unemp={seed_unemployment} "
+                        f"independently_valid={independently_valid_count} "
+                        f"territory_tracts_total={sum(territory_sizes)} "
+                        f"territory_size_min={min(territory_sizes)} "
+                        f"territory_size_median={float(np.median(territory_sizes)):.1f} "
+                        f"territory_size_max={max(territory_sizes)} "
+                        f"incumbent_merge_check={'enabled' if merge_adjacent else 'disabled'}",
                         flush=True,
                     )
 
@@ -8356,6 +8657,38 @@ def build_many_asus_cpsat(
                         expansion_tie_rank[local_node] = rank
 
                     seed_objective = int(u_expansion[seed_local].sum())
+
+                    def _expansion_incumbent_touches_peer(
+                        candidate_local: List[int],
+                        _candidate_obj: int,
+                    ) -> bool:
+                        candidate_global = sorted(
+                            territory_global[local_node]
+                            for local_node in candidate_local
+                        )
+                        candidate_set = set(candidate_global)
+                        for peer_index, peer_seed in enumerate(round_seeds):
+                            if peer_index == unit_index:
+                                continue
+                            peer_nodes = (
+                                expanded_results[peer_index][0]
+                                if peer_index < len(expanded_results)
+                                else peer_seed
+                            )
+                            if not component_ok(
+                                peer_nodes, u, E, P, tau, pop_thresh, nb
+                            ):
+                                continue
+                            if (
+                                max_nodes_per_asu is not None
+                                and len(candidate_set | set(peer_nodes))
+                                > int(max_nodes_per_asu)
+                            ):
+                                continue
+                            if _asu_units_touch(candidate_global, peer_nodes, nb):
+                                return True
+                        return False
+
                     if verbose:
                         print(
                             f"  [EXPAND round={expansion_round} "
@@ -8384,6 +8717,10 @@ def build_many_asus_cpsat(
                             ("expansion", unit_index), territory_global, seed_local
                         ),
                         incumbent_report_interval_seconds=60.0,
+                        incumbent_interrupt_callback=(
+                            _expansion_incumbent_touches_peer
+                            if merge_adjacent else None
+                        ),
                         deterministic_ties=deterministic_ties,
                         tie_break_rank=expansion_tie_rank,
                         objective_shaving=objective_shaving,
@@ -8438,20 +8775,133 @@ def build_many_asus_cpsat(
                         optimal_territories[territory_key] = tuple(expanded_global)
                     return expanded_global, result.status
 
-                if len(round_seeds) > 1:
-                    with concurrent.futures.ThreadPoolExecutor(
-                        max_workers=expansion_parallelism
-                    ) as pool:
-                        expanded_results = list(
-                            pool.map(
-                                _expand_standalone,
-                                range(len(round_seeds)),
-                            )
+                expanded_results: List[Tuple[List[int], str]] = []
+                immediate_merged_units: Optional[List[List[int]]] = None
+                immediate_merge_count = 0
+                for unit_index in range(len(round_seeds)):
+                    expanded_results.append(_expand_standalone(unit_index))
+                    if (
+                        not merge_adjacent
+                        or _stop_requested(stop_flag_path)
+                    ):
+                        continue
+
+                    # Check after every expansion. Successfully expanded units
+                    # and independently valid pending seeds may merge now;
+                    # pending weak seeds remain separate so they still receive
+                    # their own repair attempt after the immediate repartition.
+                    provisional_valid_units: List[List[int]] = []
+                    pending_weak_units: List[List[int]] = []
+                    for candidate_index, seed_nodes in enumerate(round_seeds):
+                        if candidate_index < len(expanded_results):
+                            candidate_nodes = expanded_results[candidate_index][0]
+                            candidate_was_attempted = True
+                        else:
+                            candidate_nodes = seed_nodes
+                            candidate_was_attempted = False
+                        if component_ok(
+                            candidate_nodes, u, E, P, tau, pop_thresh, nb
+                        ):
+                            provisional_valid_units.append(candidate_nodes)
+                        elif not candidate_was_attempted:
+                            pending_weak_units.append(seed_nodes)
+
+                    candidate_merged_units, candidate_merge_count = (
+                        _merge_touching_asu_units(
+                            provisional_valid_units,
+                            nb,
+                            max_nodes=max_nodes_per_asu,
                         )
-                else:
-                    expanded_results = [_expand_standalone(0)]
+                        if len(provisional_valid_units) > 1
+                        else (provisional_valid_units, 0)
+                    )
+                    if candidate_merge_count == 0:
+                        continue
+                    if not all(
+                        component_ok(nodes, u, E, P, tau, pop_thresh, nb)
+                        for nodes in candidate_merged_units
+                    ):
+                        if verbose:
+                            print(
+                                "  [HARVEST MERGE] immediate sanity check "
+                                "failed; continuing the current expansion round",
+                                flush=True,
+                            )
+                        continue
+
+                    immediate_merged_units = (
+                        candidate_merged_units + pending_weak_units
+                    )
+                    immediate_merged_units.sort(
+                        key=lambda nodes: (-int(u[nodes].sum()), tuple(nodes))
+                    )
+                    immediate_merge_count = candidate_merge_count
+                    break
 
                 _clear_incumbent_previews()
+                attempted_statuses = [status for _, status in expanded_results]
+                if immediate_merged_units is not None:
+                    # Retire only attempted seeds whose expansion failed.
+                    # Unattempted weak seeds were carried into
+                    # immediate_merged_units and will be repaired next round.
+                    rejected_attempts = 0
+                    for seed_nodes, (nodes, status) in zip(
+                        round_seeds, expanded_results
+                    ):
+                        if component_ok(nodes, u, E, P, tau, pop_thresh, nb):
+                            continue
+                        rejected_attempts += 1
+                        remaining[nodes] = True
+                        tried[nodes] = False
+                        poisoned_seeds.add(tuple(sorted(seed_nodes)))
+                        if verbose:
+                            print(
+                                f"  [SKIP] candidate seed "
+                                f"(seed={len(seed_nodes)} tract(s)) has no "
+                                f"valid expansion (status={status}); excluded "
+                                "before immediate merge, tracts released to "
+                                "remaining pool",
+                                flush=True,
+                            )
+
+                    if verbose:
+                        status_counts: Dict[str, int] = {}
+                        for status in attempted_statuses:
+                            status_counts[status] = (
+                                status_counts.get(status, 0) + 1
+                            )
+                        status_counts_text = ",".join(
+                            f"{status}:{status_counts[status]}"
+                            for status in sorted(status_counts)
+                        ) or "none"
+                        print(
+                            f"[STAGE] PARTITION_EXPANSION_COMPLETE "
+                            f"round={expansion_round} "
+                            f"outcome=immediate_merge_rerun "
+                            f"attempted={len(expanded_results)} "
+                            f"scheduled={attempted_seed_count} "
+                            f"skipped_stale="
+                            f"{attempted_seed_count - len(expanded_results)} "
+                            f"rejected={rejected_attempts} "
+                            f"merges={immediate_merge_count} "
+                            f"output_groups={len(immediate_merged_units)} "
+                            f"statuses={status_counts_text} "
+                            f"elapsed="
+                            f"{time.monotonic() - expansion_started:.3f}s",
+                            flush=True,
+                        )
+                        print(
+                            f"  [HARVEST MERGE] round {expansion_round}, "
+                            f"immediately after expansion "
+                            f"{len(expanded_results)}/{attempted_seed_count}: "
+                            f"{attempted_seed_count} seed group(s) -> "
+                            f"{len(immediate_merged_units)} touching/pending "
+                            "group(s); repartitioning before the next solve",
+                            flush=True,
+                        )
+                    active_units = immediate_merged_units
+                    continue
+
                 # Filter before merging: a failed seed is not an ASU and must
                 # not invalidate unrelated valid merges (or join those groups).
                 valid_seeds, valid_results = [], []
@@ -8479,24 +8929,72 @@ def build_many_asus_cpsat(
                     and len(expanded_units) > 1
                     and not _stop_requested(stop_flag_path)
                 )
-                if not should_merge:
-                    active_units = expanded_units
-                    commit_seeds = round_seeds
-                    final_statuses = expansion_statuses
-                    break
-
                 merged_units, merge_count = _merge_touching_asu_units(
                     expanded_units, nb, max_nodes=max_nodes_per_asu
+                ) if should_merge else (expanded_units, 0)
+                round_gain = (
+                    sum(int(u[nodes].sum()) for nodes in expanded_units)
+                    - sum(int(u[nodes].sum()) for nodes in round_seeds)
                 )
+
+                def _log_expansion_stage_complete(
+                    outcome: str, output_groups: int, merges: int
+                ) -> None:
+                    if not verbose:
+                        return
+                    status_counts: Dict[str, int] = {}
+                    for status in attempted_statuses:
+                        status_counts[status] = status_counts.get(status, 0) + 1
+                    status_counts_text = ",".join(
+                        f"{status}:{status_counts[status]}"
+                        for status in sorted(status_counts)
+                    ) or "none"
+                    print(
+                        f"[STAGE] PARTITION_EXPANSION_COMPLETE "
+                        f"round={expansion_round} outcome={outcome} "
+                        f"attempted={attempted_seed_count} "
+                        f"valid={len(expanded_units)} "
+                        f"rejected={attempted_seed_count - len(expanded_units)} "
+                        f"merges={merges} output_groups={output_groups} "
+                        f"valid_seed_unemp={sum(int(u[nodes].sum()) for nodes in round_seeds)} "
+                        f"expanded_unemp={sum(int(u[nodes].sum()) for nodes in expanded_units)} "
+                        f"gain={round_gain} statuses={status_counts_text} "
+                        f"elapsed={time.monotonic() - expansion_started:.3f}s",
+                        flush=True,
+                    )
+
                 if merge_count == 0:
                     active_units = expanded_units
                     commit_seeds = round_seeds
                     final_statuses = expansion_statuses
+                    if round_gain > 0 and not _stop_requested(stop_flag_path):
+                        _log_expansion_stage_complete(
+                            "gain_rerun", len(active_units), 0
+                        )
+                        if verbose:
+                            print(f"[PARTITION] round {expansion_round}: unemployment "
+                                  f"gain={round_gain}; repartitioning and rerunning expansion",
+                                  flush=True)
+                        continue
+                    _log_expansion_stage_complete(
+                        "converged", len(active_units), 0
+                    )
+                    if verbose:
+                        proven = bool(expansion_statuses) and all(
+                            status == "OPTIMAL" for status in expansion_statuses)
+                        print(f"[PARTITION] round {expansion_round}: no merge or unemployment gain; "
+                              + ("all current rooted territory solves optimal."
+                                 if proven else
+                                 "stopping with available results; further improvement is not ruled out."),
+                              flush=True)
                     break
                 if not all(
                     component_ok(nodes, u, E, P, tau, pop_thresh, nb)
                     for nodes in merged_units
                 ):
+                    _log_expansion_stage_complete(
+                        "merge_sanity_fallback", len(expanded_units), 0
+                    )
                     if verbose:
                         print(
                             "  [HARVEST MERGE] sanity check failed; "
@@ -8519,6 +9017,9 @@ def build_many_asus_cpsat(
                         "repartitioning and rerunning expansion",
                         flush=True,
                     )
+                _log_expansion_stage_complete(
+                    "merged_rerun", len(merged_units), merge_count
+                )
                 active_units = merged_units
 
             committed_any = False
@@ -8602,6 +9103,20 @@ def build_many_asus_cpsat(
             hint_obj_uncapped = (
                 int(w["u_g"][np.array(hint_uncapped, dtype=int)].sum()) if hint_valid_uncapped else None
             )
+            if verbose:
+                committed_mask = asu_id > 0
+                print(
+                    f"\n[STAGE] PARTITION_BUILD_UNCAPPED_RESCUE "
+                    f"asu_target={k + 1} seed={w['seed']} "
+                    f"reason={reason.replace(' ', '_')} "
+                    f"window_tracts={len(w['nb_local'])} "
+                    f"committed_asus={len(np.unique(asu_id[committed_mask]))} "
+                    f"committed_unemp={int(u[np.where(committed_mask)[0]].sum())} "
+                    f"remaining_tracts={int(remaining.sum())} workers={workers} "
+                    f"time_limit={float(time_limit):.1f}s "
+                    f"incumbent_merge_check=disabled",
+                    flush=True,
+                )
             result = solve_one_asu_cpsat(
                 nb_local=w["nb_local"], u_g=w["u_g"], E_g=w["E_g"], P_g=w["P_g"],
                 tau=tau, pop_thresh=pop_thresh, root_local=w["root_local"],
@@ -8703,7 +9218,36 @@ def build_many_asus_cpsat(
         workers_each = max(1, int(workers) // len(windows))
 
         def _solve(w: Dict) -> Optional[CpsatResult]:
+            committed_global = np.where(asu_id > 0)[0].astype(int).tolist()
+            main_merge_interrupt_enabled = bool(
+                merge_adjacent
+                and max_nodes_per_asu is None
+                and committed_global
+            )
+
+            def _main_incumbent_touches_committed(
+                candidate_local: List[int],
+                _candidate_obj: int,
+            ) -> bool:
+                candidate_global = [
+                    w["sub"][local_node] for local_node in candidate_local
+                ]
+                return _asu_units_touch(candidate_global, committed_global, nb)
+
             if verbose:
+                committed_mask = asu_id > 0
+                print(
+                    f"\n[STAGE] PARTITION_BUILD "
+                    f"asu_target={k + 1} seed={w['seed']} "
+                    f"window_tracts={len(w['nb_local'])} "
+                    f"committed_asus={len(np.unique(asu_id[committed_mask]))} "
+                    f"committed_unemp={int(u[np.where(committed_mask)[0]].sum())} "
+                    f"remaining_tracts={int(remaining.sum())} workers={workers_each} "
+                    f"time_limit={float(time_limit):.1f}s "
+                    f"incumbent_merge_check="
+                    f"{'enabled' if main_merge_interrupt_enabled else 'disabled'}",
+                    flush=True,
+                )
                 print(f"  [seed={w['seed']}] >>> starting CP-SAT solve (nodes={len(w['nb_local'])}, "
                       f"workers={workers_each}, time_limit={time_limit}s)", flush=True)
             # The greedy warm-start hint is built on the full window (cap-unaware),
@@ -8794,6 +9338,10 @@ def build_many_asus_cpsat(
                 skip_flag_path=skip_flag_path,
                 incumbent_report_callback=incumbent_callback,
                 incumbent_report_interval_seconds=60.0,
+                incumbent_interrupt_callback=(
+                    _main_incumbent_touches_committed
+                    if main_merge_interrupt_enabled else None
+                ),
                 # cluster_groups intentionally NOT passed here: tying high-UR
                 # cluster members via equality is provably correct (validated
                 # against brute force) but empirically hurts this time-limited
@@ -8940,6 +9488,49 @@ def build_many_asus_cpsat(
             if not component_ok(S_final, u, E, P, tau, pop_thresh, nb):
                 S_final = S
 
+            # A main-build incumbent may have stopped as soon as it touched an
+            # already committed ASU. Merge that candidate immediately instead
+            # of temporarily committing two touching ASUs and deferring the
+            # union until the late combine/polish phases. The union of connected
+            # feasible ASUs joined by an edge remains connected, meets the
+            # population threshold, and preserves the unemployment-rate bound.
+            touching_ids = sorted({
+                int(asu_id[neighbor])
+                for node in S_final
+                for neighbor in nb[node]
+                if int(asu_id[neighbor]) > 0
+            }) if merge_adjacent and max_nodes_per_asu is None else []
+            if touching_ids:
+                prior_asu_count = len(np.unique(asu_id[asu_id > 0]))
+                merged_nodes = sorted(set(S_final) | {
+                    int(node)
+                    for node in np.where(np.isin(asu_id, touching_ids))[0]
+                })
+                if component_ok(merged_nodes, u, E, P, tau, pop_thresh, nb):
+                    asu_id[merged_nodes] = min(touching_ids)
+                    remaining[merged_nodes] = False
+                    tried[merged_nodes] = False
+                    asu_id[:] = _sequential_asu_ids(asu_id)
+                    k = len(np.unique(asu_id[asu_id > 0]))
+                    _emit_progress("MAIN_IMMEDIATE_MERGE")
+                    if verbose:
+                        print(
+                            f"[STAGE] PARTITION_BUILD_MERGE "
+                            f"candidate_tracts={len(S_final)} "
+                            f"touched_asus={','.join(map(str, touching_ids))} "
+                            f"merged_tracts={len(merged_nodes)} "
+                            f"asus_before={prior_asu_count} asus_after={k} "
+                            f"action=restart",
+                            flush=True,
+                        )
+                        print(
+                            f"  [MERGE] main-build candidate touched ASU(s) "
+                            f"{touching_ids}; merged immediately and restarting "
+                            "the partition loop.",
+                            flush=True,
+                        )
+                    continue
+
             k += 1
             asu_id[S_final] = k
             remaining[S_final] = False
@@ -9028,7 +9619,12 @@ def build_many_asus_cpsat(
             if verbose:
                 combine_kind = "capped" if combine_capped else "harvested"
                 print(
-                    f"\n[COMBINE] round {combine_round}: {len(groups_to_improve)} touching-cluster "
+                    f"\n[STAGE] PARTITION_COMBINE round={combine_round} "
+                    f"groups={len(groups_to_improve)} "
+                    f"touching_asus={sum(len(m) for m in groups_to_improve)} "
+                    f"kind={combine_kind} workers={workers} "
+                    f"time_limit_per_solve={float(combine_solve_time_limit):.1f}s\n"
+                    f"[COMBINE] round {combine_round}: {len(groups_to_improve)} touching-cluster "
                     f"group(s) found across {sum(len(m) for m in groups_to_improve)} "
                     f"{combine_kind} ASUs; "
                     f"improving via CP-SAT ...",
@@ -9208,7 +9804,13 @@ def build_many_asus_cpsat(
 
             if verbose:
                 print(
-                    f"\n[SWEEP round={sweep_round}] seed={root_global} "
+                    f"\n[STAGE] CAPACITY_SWEEP round={sweep_round} "
+                    f"seed={root_global} window_tracts={len(sub)} "
+                    f"remaining_tracts={int(remaining.sum())} "
+                    f"committed_asus={len(np.unique(asu_id[asu_id > 0]))} "
+                    f"workers={workers} "
+                    f"time_limit={float(capacity_sweep_time_limit):.1f}s\n"
+                    f"[SWEEP round={sweep_round}] seed={root_global} "
                     f"(q_surplus={int(q_cand[best_pos])}): window r={r}, "
                     f"nodes={len(sub)}, pop={int(P_g.sum())}",
                     flush=True,
@@ -9346,7 +9948,8 @@ def build_many_asus_cpsat(
                 f"checking_asu={asu_number} "
                 f"position={polish_position}/{polish_count} "
                 f"total_unemp={total_polish_unemp} "
-                f"tracts={len(current_global)}",
+                f"tracts={len(current_global)} "
+                f"incumbent_merge_check=enabled",
                 flush=True,
             )
         if not component_ok(
@@ -9433,6 +10036,19 @@ def build_many_asus_cpsat(
             polish_tie_rank[local_node] = rank
 
         current_objective = int(u[current_global].sum())
+        other_committed = np.where(
+            (asu_id > 0) & (asu_id != asu_number)
+        )[0].astype(int).tolist()
+
+        def _polish_incumbent_touches_other_asu(
+            candidate_local: List[int],
+            _candidate_obj: int,
+        ) -> bool:
+            if not other_committed:
+                return False
+            candidate_global = [sub[local_node] for local_node in candidate_local]
+            return _asu_units_touch(candidate_global, other_committed, nb)
+
         if verbose:
             print(
                 f"  [FINAL POLISH round={polish_round} "
@@ -9457,6 +10073,11 @@ def build_many_asus_cpsat(
             log=verbose,
             hint=current_local,
             hint_obj=current_objective,
+            incumbent_report_callback=_incumbent_preview(
+                ("final_polish", polish_round, asu_number), sub, current_local
+            ),
+            incumbent_report_interval_seconds=60.0,
+            incumbent_interrupt_callback=_polish_incumbent_touches_other_asu,
             deterministic_ties=deterministic_ties,
             tie_break_rank=polish_tie_rank,
             objective_shaving=objective_shaving,
@@ -9485,6 +10106,9 @@ def build_many_asus_cpsat(
             stop_flag_path=stop_flag_path,
             skip_flag_path=skip_flag_path,
         )
+        # Remove the provisional delta before retaining the seed, validating a
+        # replacement, or publishing its committed assignment.
+        _clear_incumbent_previews()
         if result is None:
             if verbose:
                 print(
@@ -9570,6 +10194,8 @@ def build_many_asus_cpsat(
                 )
 
             polish_completed = True
+            restart_after_merge = False
+            merge_sanity_failed = False
             for polish_position, asu_number in enumerate(polish_ids, start=1):
                 if not _polish_one_asu(
                     asu_number,
@@ -9579,47 +10205,56 @@ def build_many_asus_cpsat(
                 ):
                     polish_completed = False
                     break
-            if not polish_completed or not merge_adjacent:
-                break
+                if not merge_adjacent:
+                    continue
 
-            committed_ids = np.unique(asu_id[asu_id > 0]).astype(int).tolist()
-            committed_ids.sort()
-            committed_units = [
-                np.where(asu_id == asu_number)[0].astype(int).tolist()
-                for asu_number in committed_ids
-            ]
-            merged_units, merge_count = _merge_touching_asu_units(
-                committed_units,
-                nb,
-                max_nodes=polish_max_nodes,
-            )
-            if merge_count == 0:
-                break
-            if not all(
-                component_ok(nodes, u, E, P, tau, pop_thresh, nb)
-                for nodes in merged_units
-            ):
-                if verbose:
-                    print(
-                        "[FINAL POLISH MERGE] sanity check failed; retaining "
-                        "the separately polished ASUs",
-                        flush=True,
-                    )
-                break
+                # A polish can make this ASU touch another one.  Check now,
+                # before spending time polishing ASUs whose assignments would
+                # become stale after the merge.  Any merge restarts the round
+                # with a freshly computed ASU order and territory.
+                committed_ids = np.unique(
+                    asu_id[asu_id > 0]
+                ).astype(int).tolist()
+                committed_ids.sort()
+                committed_units = [
+                    np.where(asu_id == committed_id)[0].astype(int).tolist()
+                    for committed_id in committed_ids
+                ]
+                merged_units, merge_count = _merge_touching_asu_units(
+                    committed_units,
+                    nb,
+                    max_nodes=polish_max_nodes,
+                )
+                if merge_count == 0:
+                    continue
+                if not all(
+                    component_ok(nodes, u, E, P, tau, pop_thresh, nb)
+                    for nodes in merged_units
+                ):
+                    merge_sanity_failed = True
+                    if verbose:
+                        print(
+                            "[FINAL POLISH MERGE] sanity check failed; retaining "
+                            "the separately polished ASUs",
+                            flush=True,
+                        )
+                    break
 
-            merged_assignments: List[Tuple[int, List[int]]] = []
-            for nodes in merged_units:
-                member_ids = np.unique(asu_id[nodes]).astype(int).tolist()
-                member_ids = [member for member in member_ids if member > 0]
-                merged_assignments.append((min(member_ids), nodes))
+                merged_assignments: List[Tuple[int, List[int]]] = []
+                for nodes in merged_units:
+                    member_ids = np.unique(asu_id[nodes]).astype(int).tolist()
+                    member_ids = [
+                        member for member in member_ids if member > 0
+                    ]
+                    merged_assignments.append((min(member_ids), nodes))
 
-            old_committed_mask = asu_id > 0
-            asu_id[old_committed_mask] = -1
-            remaining[old_committed_mask] = True
-            for merged_id, nodes in merged_assignments:
-                asu_id[nodes] = merged_id
-                remaining[nodes] = False
-            _emit_progress("FINAL_POLISH_MERGE")
+                old_committed_mask = asu_id > 0
+                asu_id[old_committed_mask] = -1
+                remaining[old_committed_mask] = True
+                for merged_id, nodes in merged_assignments:
+                    asu_id[nodes] = merged_id
+                    remaining[nodes] = False
+                _emit_progress("FINAL_POLISH_MERGE")
 
                 if verbose:
                     print(
@@ -9669,9 +10304,8 @@ def build_many_asus_cpsat(
     # captured) committed ASU re-solve against every tract in the state --
     # including tracts already claimed by OTHER ASUs, not just unassigned
     # ones. Any donor ASU that loses tracts is re-checked with component_ok;
-    # one that no longer holds up (disconnected / below tau or pop_thresh) is
-    # dropped entirely (all its tracts, not just the taken ones, become
-    # unassigned) rather than repaired. The whole takeover is accepted only
+    # damaged donors are repaired from their remnants and unassigned tracts,
+    # with the takeover and all surviving ASUs fixed. The whole takeover is accepted only
     # if it strictly increases total unemployment captured across all
     # surviving ASUs; otherwise every assignment is left untouched.
     if polish_time_limit > 0 and not _stop_requested(stop_flag_path):
@@ -9797,17 +10431,94 @@ def build_many_asus_cpsat(
                         trial_asu_id = asu_id.copy()
                         trial_asu_id[list(current_set)] = -1
                         dropped_donor_ids: List[int] = []
+                        repaired_donor_ids: List[int] = []
                         for donor_id in donor_ids:
                             donor_global = np.where(asu_id == donor_id)[0].astype(int).tolist()
                             donor_remaining = sorted(set(donor_global) - added)
                             trial_asu_id[donor_global] = -1
-                            if donor_remaining and component_ok(
-                                donor_remaining, u, E, P, tau, pop_thresh, nb
-                            ):
-                                trial_asu_id[donor_remaining] = donor_id
+                            available_for_repair = sorted(
+                                set(np.where(trial_asu_id < 0)[0].astype(int).tolist())
+                                - new_set
+                            )
+                            if verbose:
+                                print(
+                                    f"  [SINGLE-ASU TAKEOVER] repairing donor ASU "
+                                    f"{donor_id}: survivors={len(donor_remaining)}, "
+                                    f"available={len(available_for_repair)}",
+                                    flush=True,
+                                )
+                            repaired_donor = _repair_takeover_donor(
+                                donor_remaining,
+                                available_for_repair,
+                                nb,
+                                u,
+                                E,
+                                P,
+                                tau,
+                                pop_thresh,
+                                polish_time_limit,
+                                workers,
+                                stable_values=stable_values,
+                                rel_gap=rel_gap,
+                                log=verbose,
+                                solve_kwargs={
+                                    "deterministic_ties": deterministic_ties,
+                                    "objective_shaving": objective_shaving,
+                                    "use_root_articulation_implications": use_root_articulation_implications,
+                                    "use_signed_flow": use_signed_flow,
+                                    "use_arborescence": use_arborescence,
+                                    "configure_subsolvers": configure_subsolvers,
+                                    "use_tract_first_search": use_tract_first_search,
+                                    "use_flow_first_search": use_flow_first_search,
+                                    "use_tract_capacity_search": use_tract_capacity_search,
+                                    "use_flow_capacity_hybrid_search": use_flow_capacity_hybrid_search,
+                                    "incumbent_stall_seconds": incumbent_stall_seconds,
+                                    "use_flow_count_envelope": use_flow_count_envelope,
+                                    "use_small_root_separators": use_small_root_separators,
+                                    "root_separator_max_size": root_separator_max_size,
+                                    "root_separator_clause_limit": root_separator_clause_limit,
+                                    "root_separator_target_limit": root_separator_target_limit,
+                                    "use_separator_cardinality_bounds": use_separator_cardinality_bounds,
+                                    "solution_pool_size": solution_pool_size,
+                                    "use_bridge_edge_bounds": use_bridge_edge_bounds,
+                                    "use_articulation_edge_bounds": use_articulation_edge_bounds,
+                                    "use_distance_flow_bounds": use_distance_flow_bounds,
+                                    "use_global_capacity_cardinality_bound": use_global_capacity_cardinality_bound,
+                                    "use_bridge_subtree_pruning": use_bridge_subtree_pruning,
+                                    "max_nodes": polish_max_nodes,
+                                    "stop_flag_path": stop_flag_path,
+                                    "skip_flag_path": skip_flag_path,
+                                },
+                            )
+                            if repaired_donor:
+                                trial_asu_id[repaired_donor] = donor_id
+                                repaired_donor_ids.append(donor_id)
                             else:
                                 dropped_donor_ids.append(donor_id)
                         trial_asu_id[new_global] = big_asu_id
+
+                        for donor_id in list(dropped_donor_ids):
+                            if _stop_requested(stop_flag_path):
+                                break
+                            remnants = np.flatnonzero(
+                                (asu_id == donor_id) & (trial_asu_id <= 0)
+                            ).tolist()
+                            if not remnants:
+                                continue
+                            if verbose:
+                                print(f"[STAGE] TAKEOVER_DONOR_REPAIR asu={donor_id}", flush=True)
+                            repaired, repair_status = _search_unassigned_asu(
+                                np.flatnonzero(trial_asu_id <= 0).tolist(), nb,
+                                u, E, P, tau, pop_thresh, polish_time_limit, workers,
+                                stop_flag_path, donor_nodes=remnants,
+                                max_nodes=polish_max_nodes, exact_nodes=exact_nodes_per_asu,
+                            )
+                            if repaired:
+                                trial_asu_id[repaired] = donor_id
+                                dropped_donor_ids.remove(donor_id)
+                            if verbose:
+                                print(f"[DONOR REPAIR] ASU {donor_id}: {repair_status}, "
+                                      f"retained unemployment={int(u[repaired].sum())}", flush=True)
 
                         total_after = int(u[np.where(trial_asu_id > 0)[0]].sum())
                         if total_after > total_before:
@@ -9841,6 +10552,58 @@ def build_many_asus_cpsat(
                             flush=True,
                         )
 
+    # Check the final residual graph after takeover/repair, including singleton
+    # components. Never equate a time limit or ASU limit with infeasibility.
+    residual_check = dict(status="UNRESOLVED", exhausted=False, added_asus=0,
+                          components_checked=0, unresolved_components=[])
+    pending_components = list(_connected_components(nb, asu_id <= 0))
+    while pending_components:
+        if _stop_requested(stop_flag_path):
+            residual_check["status"] = "STOPPED"
+            break
+        # Small components first; each solve receives the full worker budget.
+        pending_components.sort(key=lambda nodes: (len(nodes), min(nodes)), reverse=True)
+        component = pending_components.pop()
+        if verbose:
+            print(f"[STAGE] FINAL_RESIDUAL_CHECK tracts={len(component)} "
+                  f"pending_components={len(pending_components)}", flush=True)
+        selected, residual_status = _search_unassigned_asu(
+            component, nb, u, E, P, tau, pop_thresh,
+            polish_time_limit, workers, stop_flag_path,
+            max_nodes=polish_max_nodes, exact_nodes=exact_nodes_per_asu,
+        )
+        residual_check["components_checked"] += 1
+        if residual_status == "INFEASIBLE":
+            continue
+        if not selected:
+            residual_check["unresolved_components"].append(
+                dict(nodes=list(map(int, component)), status=residual_status))
+            continue
+        if len(np.unique(asu_id[asu_id > 0])) >= max_asus:
+            residual_check.update(status="MAX_ASUS_REACHED",
+                                  feasible_unassigned_tracts=selected)
+            break
+        new_id = int(asu_id.max(initial=0)) + 1
+        asu_id[selected] = new_id
+        remaining = asu_id <= 0
+        component_mask = np.zeros(n, dtype=bool)
+        component_mask[component] = True
+        component_mask[selected] = False
+        pending_components.extend(_connected_components(nb, component_mask))
+        residual_check["added_asus"] += 1
+        _emit_progress("FINAL_RESIDUAL_ADDED")
+        if verbose:
+            print(f"[FINAL RESIDUAL] Added ASU {new_id}: "
+                  f"unemployment={int(u[selected].sum())}", flush=True)
+    else:
+        unresolved = residual_check["unresolved_components"]
+        residual_check.update(status=unresolved[0]["status"] if unresolved else "INFEASIBLE",
+                              exhausted=not unresolved)
+    residual_check["pending_components"] = len(pending_components)
+    residual_check["scope"] = "Current unassigned tracts, with existing ASUs fixed and configured tract limits."
+    if verbose:
+        print(f"[FINAL RESIDUAL] {residual_check}", flush=True)
+
     # Merge operations deliberately retain the smallest member ID internally,
     # which can leave gaps. Compact once all solver bookkeeping is finished so
     # the returned result guarantees ASU IDs 1..n with no missing labels.
@@ -9856,7 +10619,8 @@ def build_many_asus_cpsat(
 
     _emit_progress("DONE")
 
-    return {"asu_id": asu_id.tolist(), "n_asu": n_asu_final}
+    return {"asu_id": asu_id.tolist(), "n_asu": n_asu_final,
+            "residual_check": residual_check}
 
 
 # ---------- CLI ----------
