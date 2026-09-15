@@ -1,0 +1,214 @@
+"""Touching partition neighborhoods are jointly optimized, never auto-unioned."""
+import contextlib
+import io
+from pathlib import Path
+import sys
+from tempfile import TemporaryDirectory
+import unittest
+from unittest.mock import patch
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "inst" / "python"))
+import asu_cpsat as solver
+
+
+def chain(n):
+    return [[j for j in (i - 1, i + 1) if 0 <= j < n] for i in range(n)]
+
+
+class TouchingJointTest(unittest.TestCase):
+    def run_case(self, units, available, result=None, *, n=7, nb=None, **kwargs):
+        args = (units, available, chain(n) if nb is None else nb,
+                np.full(n, 10), np.zeros(n, dtype=int), np.full(n, 10000),
+                .2, 10000, kwargs.pop("seconds", 5), 4)
+        with patch.object(solver, "_solve_regional_exchange",
+                          return_value=(units, "UNKNOWN") if result is None else result) as solve:
+            answer = solver._reoptimize_touching_asu_units(*args, **kwargs)
+        return answer, solve
+
+    def test_window_is_all_reachable_free_tracts_but_excludes_other_asus(self):
+        # ASU [5] shields tract 6; the free window reaches > two hops from [1].
+        (_, updates), solve = self.run_case([[0], [1], [5]], range(7))
+        self.assertEqual(updates, 0)
+        self.assertEqual(solve.call_args.args[0], [[0], [1]])
+        self.assertEqual(solve.call_args.args[1], [0, 1, 2, 3, 4])
+        self.assertEqual(solve.call_args.args[9], 4)
+        self.assertTrue(solve.call_args.kwargs["allow_seed_consolidation"])
+        self.assertTrue(solve.call_args.kwargs["allow_inactive_seeds"])
+        self.assertIsNone(solve.call_args.kwargs["max_groups"])
+        self.assertTrue(solve.call_args.kwargs["tighten_model"])
+        self.assertTrue(solve.call_args.kwargs["use_joint_cuts"])
+        self.assertEqual(solve.call_args.kwargs["stage_prefix"], "PARTITION_TOUCHING_JOINT")
+
+    def test_non_touching_asus_do_not_launch_joint_solve(self):
+        answer, solve = self.run_case([[0], [2]], [1, 3, 4])
+        self.assertEqual(answer, ([[0], [2]], 0))
+        solve.assert_not_called()
+
+    def test_gain_can_keep_touching_asus_separate(self):
+        answer, _ = self.run_case([[0], [1]], [2], ([[0], [1, 2]], "OPTIMAL"))
+        self.assertEqual(answer, ([[0], [1, 2]], 1))
+
+    def test_equal_coverage_consolidation_is_accepted(self):
+        answer, _ = self.run_case([[0], [1]], [], ([[0, 1], []], "FEASIBLE"))
+        self.assertEqual(answer, ([[0, 1]], 1))
+
+    def test_no_improvement_or_timeout_does_not_force_union(self):
+        for status in ("OPTIMAL", "FEASIBLE", "UNKNOWN", "SKIPPED", "STOPPED"):
+            with self.subTest(status=status):
+                answer, _ = self.run_case([[0], [1]], [], ([[0], [1]], status))
+                self.assertEqual(answer, ([[0], [1]], 0))
+
+    def test_invalid_and_regressing_outputs_are_rejected(self):
+        cases = [([[0], []], {}), ([[0, 1], [1, 2]], {}),
+                 ([[0, 2], [1]], {}), ([[0], [1, 5]], {}),
+                 ([[1, 2], [0]], {}), ([[0, 1, 2], []], {"max_nodes": 2}),
+                 ([[0], [1], [2]], {})]
+        for candidate, options in cases:
+            with self.subTest(candidate=candidate, options=options):
+                answer, _ = self.run_case([[0], [1]], [2], (candidate, "FEASIBLE"), **options)
+                self.assertEqual(answer, ([[0], [1]], 0))
+
+    def test_equal_value_boundary_churn_is_rejected(self):
+        answer, _ = self.run_case([[0, 1], [2]], [3], ([[1], [2, 3]], "FEASIBLE"))
+        self.assertEqual(answer, ([[0, 1], [2]], 0))
+
+    def test_cache_ignores_labels_but_not_changed_window(self):
+        cache = set()
+        self.run_case([[0], [1]], [2], attempted=cache)
+        _, solve = self.run_case([[1], [0]], [2], attempted=cache)
+        solve.assert_not_called()
+        _, solve = self.run_case([[1], [0]], [2, 3], attempted=cache)
+        solve.assert_called_once()
+        _, solve = self.run_case([[1], [0]], [2, 3], attempted=cache, seconds=10)
+        solve.assert_called_once()
+
+    def test_cancelled_attempts_are_not_cached_and_zero_budget_is_disabled(self):
+        for status in ("STOPPED", "SKIPPED"):
+            cache = set()
+            self.run_case([[0], [1]], [], ([[0], [1]], status), attempted=cache)
+            self.assertFalse(cache)
+        answer, solve = self.run_case([[0], [1]], [], seconds=0)
+        self.assertEqual(answer, ([[0], [1]], 0))
+        solve.assert_not_called()
+
+    def test_protected_pending_tract_is_not_available(self):
+        _, solve = self.run_case([[0], [1]], [3, 4, 5, 6])
+        self.assertEqual(solve.call_args.args[1], [0, 1])
+
+    def test_more_than_three_touching_groups_use_one_model(self):
+        units = [[0], [1], [2], [3]]
+        _, solve = self.run_case(units, [4, 5, 6])
+        self.assertEqual(solve.call_args.args[0], units)
+        solve.assert_called_once()
+
+    def test_stage_stats_and_preview_mapping(self):
+        previews, log = [], io.StringIO()
+        with contextlib.redirect_stdout(log):
+            self.run_case([[1], [2]], [3], ([[1], [2, 3]], "OPTIMAL"),
+                          log=True, source="expansion",
+                          preview_factory=lambda nodes, units: previews.append((nodes, units)))
+        self.assertEqual(previews, [([1, 2, 3], [[1], [2]])])
+        self.assertIn("PARTITION_TOUCHING_JOINT source=expansion", log.getvalue())
+        self.assertIn("roots=movable", log.getvalue())
+        self.assertIn("accepted=1 groups_before=2 groups_after=2", log.getvalue())
+        self.assertIn("baseline_unemp=20 unemp=30 gain=10", log.getvalue())
+
+    def test_real_model_can_drop_original_root_and_keeps_custom_configuration(self):
+        u, emp, pop = np.array([1, 5, 5, 10, 20]), np.array([0, 20, 0, 0, 0]), np.full(5, 10000)
+        self.assertEqual(solver._pick_capacity_root([0, 1], u, emp, pop, .2), 0)
+        with patch.object(solver, "_configure_asu_solver_portfolio",
+                          wraps=solver._configure_asu_solver_portfolio) as configure:
+            groups, updates = solver._reoptimize_touching_asu_units(
+                [[0, 1], [2, 3]], [4], chain(5), u, emp, pop, .2, 10000, 5, 2,
+                max_nodes=2)
+        self.assertEqual(updates, 1)
+        self.assertEqual(sorted(v for group in groups for v in group), [1, 2, 3, 4])
+        self.assertEqual(sum(int(u[group].sum()) for group in groups), 40)
+        self.assertTrue(all(solver.component_ok(group, u, emp, pop, .2, 10000,
+                                               chain(5), max_nodes=2) for group in groups))
+        self.assertGreaterEqual(configure.call_count, 2)
+        self.assertTrue(all(call.args[1] == 2 for call in configure.call_args_list))
+
+    def test_touching_cut_stages_carry_rows_into_flow_and_share_budget(self):
+        models, limits, cut_models = [], [], []
+        real_solve = solver.cp_model.CpSolver.Solve
+        real_pass = solver._joint_connectivity_cut_pass
+
+        def capture(instance, model, *args, **kwargs):
+            models.append(model.Clone())
+            limits.append(instance.parameters.max_time_in_seconds)
+            instance.parameters.log_to_stdout = False
+            return real_solve(instance, model, *args, **kwargs)
+
+        def capture_pass(*args, **kwargs):
+            result = real_pass(*args, **kwargs)
+            cut_models.append(args[0].Clone())
+            return result
+
+        output = io.StringIO()
+        with (patch.object(solver.cp_model.CpSolver, "Solve", new=capture),
+              patch.object(solver, "_joint_connectivity_cut_pass", side_effect=capture_pass),
+              contextlib.redirect_stdout(output)):
+            groups, updates = solver._reoptimize_touching_asu_units(
+                [[0], [1]], [2, 3], chain(4), np.full(4, 10), np.zeros(4, dtype=int),
+                np.full(4, 10000), .2, 10000, 5, 2, log=True)
+        self.assertEqual(updates, 1)
+        self.assertEqual(sorted(v for unit in groups for v in unit), [0, 1, 2, 3])
+        self.assertGreaterEqual(len(models), 2)
+        has_flow = lambda m: any(v.name.startswith("regional_flow_") for v in m.Proto().variables)
+        self.assertFalse(has_flow(models[0]))
+        self.assertTrue(has_flow(models[-1]))
+        self.assertTrue(all(0 < limit <= .75 for limit in limits[:-1]))
+        self.assertTrue(0 < limits[-1] < 5)
+        for i, row in enumerate(cut_models[0].Proto().constraints):
+            self.assertEqual(str(row), str(models[-1].Proto().constraints[i]))
+        log = output.getvalue()
+        for suffix in ("MODEL", "CUT_PASS", "CUT_ROUND", "CUT_COMPLETE", "FLOW"):
+            self.assertIn(f"[STAGE] PARTITION_TOUCHING_JOINT_{suffix} ", log)
+        self.assertIn("graph_cuts=True", log)
+        self.assertRegex(log, r"separator_cuts=[1-9][0-9]*")
+        self.assertRegex(log, r"seed_distance_rows=[1-9][0-9]*")
+        self.assertNotIn("[STAGE] STATEWIDE_JOINT", log)
+        self.assertNotIn("[STAGE] JOINT_EXPANSION", log)
+
+    def test_connected_prepass_gain_survives_unknown_touching_flow_solve(self):
+        real_solve = solver.cp_model.CpSolver.Solve
+
+        def unknown_flow(instance, model, *args, **kwargs):
+            if any(v.name.startswith("regional_flow_") for v in model.Proto().variables):
+                return solver.cp_model.UNKNOWN
+            return real_solve(instance, model, *args, **kwargs)
+
+        with patch.object(solver.cp_model.CpSolver, "Solve", new=unknown_flow):
+            groups, updates = solver._reoptimize_touching_asu_units(
+                [[0], [1]], [2], chain(3), np.full(3, 10), np.zeros(3, dtype=int),
+                np.full(3, 10000), .2, 10000, 5, 2)
+        self.assertEqual(updates, 1)
+        self.assertEqual(sorted(v for unit in groups for v in unit), [0, 1, 2])
+
+    def test_touching_stop_or_skip_during_prepass_preserves_originals(self):
+        with TemporaryDirectory() as folder:
+            for option in ("stop_path", "skip_path"):
+                flag = Path(folder) / option
+                cache = set()
+
+                def cancel(instance, model, *args, **kwargs):
+                    flag.touch()
+                    return solver.cp_model.UNKNOWN
+
+                with patch.object(solver.cp_model.CpSolver, "Solve", autospec=True,
+                                  side_effect=cancel) as solve:
+                    groups, updates = solver._reoptimize_touching_asu_units(
+                        [[0], [1]], [2], chain(3), np.full(3, 10), np.zeros(3, dtype=int),
+                        np.full(3, 10000), .2, 10000, 5, 2, attempted=cache,
+                        **{option: str(flag)})
+                self.assertEqual((groups, updates), ([[0], [1]], 0))
+                solve.assert_called_once()
+                self.assertFalse(cache)
+                self.assertEqual(flag.exists(), option == "stop_path")
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -993,7 +993,8 @@ shiny::conditionalPanel(
         "cpsat_joint_partition_expansion",
         "Joint multi-ASU expansion (experimental)", value = FALSE
       ),
-      shiny::helpText("When enabled, up to three neighboring seed territories are pooled into one solve. Batches run sequentially with all workers and a shared 1800-second limit per batch. May use more memory; invalid seeds may remain inactive.")
+      shiny::helpText("When enabled, up to three neighboring seed territories are pooled into one solve. Batches run sequentially with all workers and a shared 1800-second limit per batch. May use more memory; invalid seeds may remain inactive."),
+      shiny::helpText("In partitioning, touching ASUs are jointly reoptimized with all reachable unassigned tracts instead of automatically merged. Roots and boundaries can move; the solver may keep separate groups or consolidate them. Combined unemployment cannot decrease. Graph cuts and a connectivity pre-pass are enabled automatically for these touching solves, independent of the joint-expansion checkbox. Each touching-cluster solve uses all workers and the expansion/polish budget (1800 seconds in this dashboard); the pre-pass shares that budget.")
     ),
     shiny::numericInput("cpsat_tau",       "UR threshold (τ)",          value = 0.0645, min = 0, max = 1, step = 0.0001),
     shiny::numericInput("cpsat_pop",       "Population threshold",      value = 10000,  min = 0, step = 100),
@@ -1008,6 +1009,8 @@ shiny::conditionalPanel(
       shiny::numericInput("cpsat_statewide_seconds", "Statewide joint solve (sec)", value = 1800, min = 0, step = 60),
       shiny::checkboxInput("cpsat_statewide_relaxed_hint", "Hint all relaxation-selected tracts", value = TRUE),
       shiny::checkboxInput("cpsat_statewide_tighten_model", "Tighten statewide joint model", value = TRUE),
+      shiny::checkboxInput("cpsat_statewide_graph_cuts", "Graph cuts + connectivity pre-pass (experimental)", value = FALSE),
+      shiny::helpText("Graph cuts add small-separator and seed-distance constraints, then run a short cut-only pre-pass before exact flow connectivity. The pre-pass shares the joint time limit (at most 60 seconds and 15% of the remaining budget). Disconnected trial groups are never accepted as ASUs."),
       shiny::helpText("The relaxed hint suggests selection without fixing ownership or flows. Tightening adds derived population, connectivity-region, and flow bounds; it does not impose a tract cap. Turn either option off for comparison."),
       shiny::helpText("One joint model over all loaded tracts, with up to Max ASUs group slots and all workers. Large states or high Max ASUs values may require substantial memory. Seed search is a separate budget; 0 skips it. Valid seeds are retained as a fallback. No later polishing, takeover, or uncapped combine pass runs.")
     ),
@@ -1066,10 +1069,13 @@ output$algo_blurb <- shiny::renderUI({
          builds as many separate, non-overlapping capped ASUs as it can), and
          <code>Combine/re-solve time limit</code>, an optional separate CP-SAT
          time budget for the final pass. Once no more capped ASUs can be
-         built, touching capped ASUs are automatically combined and re-solved
+         built in the legacy strategy, touching capped ASUs are automatically combined and re-solved
          (uncapped) by CP-SAT -- repeating until no more touching ASUs remain
          -- to improve the merged result. Leaving the combine time limit blank
-         reuses the main <code>Time limit</code> for that pass.
+         reuses the main <code>Time limit</code> for that legacy pass.
+         Partitioning instead jointly reoptimizes touching groups while keeping
+         the cap; its touching solves use the expansion/polish budget, not the
+         combine time limit. Statewide joint also keeps any enabled cap.
        </p>
        <p>
          While solving, a live <em>CP-SAT log</em> panel appears (top-right)
@@ -1249,6 +1255,7 @@ if (identical(algo_choice, "cpsat")) {
     use_statewide_joint <- identical(cpsat_strategy, "statewide_joint")
     statewide_relaxed_hint <- isTRUE(input$cpsat_statewide_relaxed_hint)
     statewide_tighten_model <- isTRUE(input$cpsat_statewide_tighten_model)
+    statewide_graph_cuts <- isTRUE(input$cpsat_statewide_graph_cuts)
     statewide_seconds <- if (is.null(input$cpsat_statewide_seconds) || !is.finite(input$cpsat_statewide_seconds)) 1800 else max(0, as.numeric(input$cpsat_statewide_seconds))
     statewide_seed_seconds <- if (is.null(input$cpsat_statewide_seed_seconds) || !is.finite(input$cpsat_statewide_seed_seconds)) 60 else max(0, as.numeric(input$cpsat_statewide_seed_seconds))
     joint_partition_expansion <- use_partitioning && isTRUE(input$cpsat_joint_partition_expansion)
@@ -1513,6 +1520,7 @@ kwargs = dict(
     statewide_seed_time_limit=%s,
     statewide_relaxed_hint=%s,
     statewide_tighten_model=%s,
+    statewide_graph_cuts=%s,
     use_graph_cut_repair=True,
     graph_cut_repair_time_limit=60,
     standalone_expansion_time_limit=1800,
@@ -1554,6 +1562,7 @@ print('[runner] OK', flush=True)
   format(statewide_seed_seconds, scientific = FALSE),
   if (statewide_relaxed_hint) "True" else "False",
   if (statewide_tighten_model) "True" else "False",
+  if (statewide_graph_cuts) "True" else "False",
         incumbent_stall_seconds,
         stop_file, skip_file,
       progress_json,

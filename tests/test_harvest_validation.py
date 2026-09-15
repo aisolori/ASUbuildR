@@ -3,6 +3,7 @@ import contextlib
 import io
 from pathlib import Path
 import sys
+from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
@@ -14,7 +15,8 @@ import asu_cpsat as solver
 
 class HarvestValidationTest(unittest.TestCase):
     def run_harvest(
-        self, u, emp, seeds, territories, solve_result=None, workers=1
+        self, u, emp, seeds, territories, solve_result=None, workers=1,
+        max_asus=None,
     ):
         n = len(u)
         df = pd.DataFrame({
@@ -27,13 +29,21 @@ class HarvestValidationTest(unittest.TestCase):
             hint_source="test", n_contracted=3, root_component=[0],
         )
         log = io.StringIO()
+
+        def joint(units, nodes, *args, **kwargs):
+            # Controlled feasible consolidation returned by the joint solver.
+            # The build must validate it, not perform an automatic union itself.
+            return [sorted(v for unit in units for v in unit)] + [[] for _ in units[1:]], "OPTIMAL"
+
         with (
+            TemporaryDirectory() as progress_dir,
             patch.object(solver, "_prepare_window_hint", return_value=info),
             patch.object(solver, "_partition_standalone_expansion_territories",
                          side_effect=territories),
             patch.object(solver, "solve_one_asu_cpsat", return_value=solve_result) as solve,
+            patch.object(solver, "_solve_regional_exchange", side_effect=joint) as merge,
             patch.object(solver, "_merge_touching_asu_units",
-                         wraps=solver._merge_touching_asu_units) as merge,
+                         side_effect=AssertionError("partition must not auto-merge")),
             contextlib.redirect_stdout(log),
         ):
             neighbors = [
@@ -42,15 +52,41 @@ class HarvestValidationTest(unittest.TestCase):
             ]
             result = solver.build_many_asus_cpsat(
                 df, neighbors, .0645, 10000,
-                max_asus=len(seeds), workers=workers, verbose=True,
+                max_asus=len(seeds) if max_asus is None else max_asus,
+                workers=workers, verbose=True,
                 full_graph_window=True,
                 harvest_connectivity_free_asus=True,
                 harvest_all_connectivity_free_components=True,
                 standalone_expansion_time_limit=1,
                 final_asu_polish_time_limit=0,
                 combine_capped_asus=False,
+                progress_out_path=str(Path(progress_dir) / "progress.json"),
             )
         return result, log.getvalue(), solve.call_args_list, merge.call_args_list
+
+    def test_seed_slots_prioritize_surplus_over_unemployment(self):
+        result, log, solves, _ = self.run_harvest(
+            [100, 0, 20], [1400, 10000, 0],
+            [[0], [2]],
+            lambda seeds, *args, **kwargs: [list(s) for s in seeds],
+            max_asus=1,
+        )
+        self.assertEqual(list(result["asu_id"]), [-1, -1, 1])
+        self.assertIn("seed_priority=q_surplus", log)
+        self.assertFalse(solves)
+
+    def test_equal_surplus_prefers_unemployment_then_stable_nodes(self):
+        for u, emp, expected in (
+            ([129, 0, 258], [0, 100000, 1871], [-1, -1, 1]),
+            ([20, 0, 20], [0, 10000, 0], [1, -1, -1]),
+        ):
+            with self.subTest(u=u):
+                result, _, _, _ = self.run_harvest(
+                    u, emp, [[2], [0]],
+                    lambda seeds, *args, **kwargs: [list(s) for s in seeds],
+                    max_asus=1,
+                )
+                self.assertEqual(list(result["asu_id"]), expected)
 
     def test_invalid_result_is_excluded_before_merging(self):
         result, log, solves, merges = self.run_harvest(
@@ -112,7 +148,7 @@ class HarvestValidationTest(unittest.TestCase):
         )
         self.assertIn("statuses=OPTIMAL:2", log)
 
-    def test_expansion_merge_restarts_before_next_stale_solve(self):
+    def test_expansion_joint_update_restarts_before_next_stale_solve(self):
         def territories(seeds, *args, **kwargs):
             if len(seeds) == 2:
                 return [[0, 1, 2], [3]]
@@ -129,11 +165,13 @@ class HarvestValidationTest(unittest.TestCase):
 
         self.assertEqual(len(solves), 1)
         self.assertEqual(solves[0].kwargs["workers"], 4)
-        self.assertTrue(callable(
+        self.assertIsNone(
             solves[0].kwargs["incumbent_interrupt_callback"]
-        ))
+        )
+        self.assertTrue(callable(solves[0].kwargs["incumbent_report_callback"]))
+        self.assertIn("incumbent_merge_check=disabled merge_check=after_solve", log)
         self.assertEqual(list(result["asu_id"]), [1, 1, 1, 1])
-        self.assertIn("outcome=immediate_merge_rerun", log)
+        self.assertIn("outcome=immediate_joint_rerun", log)
         self.assertIn("attempted=1 scheduled=2 skipped_stale=1", log)
         self.assertIn("repartitioning before the next solve", log)
 
