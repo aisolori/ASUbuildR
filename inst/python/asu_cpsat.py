@@ -3,7 +3,7 @@
 asu_cpsat.py — Build Areas of Substantial Unemployment (ASUs) with OR-Tools CP-SAT.
 
 Modified to ensure:
-1. Seeds are selected from unassigned tracts with high unemployment rate
+1. Eligible high-UR seeds and automatic roots are ranked by exact rate capacity
 2. Stops when no remaining unassigned tract has UR >= tau (6.45%)
 3. Warm starts can reroute around articulation points before pruning/refilling
 4. Proven-optimal ties prefer more threshold slack, then fewer tracts
@@ -75,6 +75,45 @@ def as_fraction_tau(tau: float) -> Tuple[int, int]:
 def ur_of(u_sum: int, E_sum: int) -> float:
     """Calculate unemployment rate from counts, avoiding divide-by-zero."""
     return 0.0 if (u_sum + E_sum) == 0 else u_sum / (u_sum + E_sum)
+
+
+def _capacity_root_order(candidates, u, E, P, tau):
+    """Highest exact rate capacity first; ties use population, then tract index."""
+    num, den = as_fraction_tau(tau)
+    return sorted(
+        map(int, candidates),
+        key=lambda node: (den * int(u[node]) - num * int(E[node]),
+                          int(P[node]), -node),
+        reverse=True,
+    )
+
+
+def _pick_capacity_root(candidates, u, E, P, tau):
+    """Choose a root only from the caller's eligible/current tracts."""
+    ordered = _capacity_root_order(candidates, u, E, P, tau)
+    if not ordered:
+        raise ValueError("root selection requires at least one eligible tract")
+    return ordered[0]
+
+
+def _add_capacity_root_order(model, x, roots, u, E, P, tau, *, hint=None, prefix="root"):
+    """Make the highest-capacity selected tract the variable-root flow source.
+
+    This chooses a representation of each connected selection without forcing
+    inclusion of the highest-capacity tract in the entire search window.
+    """
+    previous = 0
+    hinted = set(hint) if hint is not None else None
+    hinted_seen = False
+    for i in _capacity_root_order(range(len(x)), u, E, P, tau):
+        seen = model.NewBoolVar(f"{prefix}_prefix_{i}")
+        model.Add(roots[i] <= x[i])
+        model.Add(seen == previous + roots[i])
+        model.Add(x[i] <= seen)
+        if hinted is not None:
+            hinted_seen = hinted_seen or i in hinted
+            model.AddHint(seen, int(hinted_seen))
+        previous = seen
 
 
 def _stop_requested(stop_flag_path: Optional[str]) -> bool:
@@ -299,7 +338,7 @@ def greedy_snake_hint(
         rem = np.where(remaining & (UR >= tau))[0]
         if rem.size == 0:
             break
-        seed = int(rem[np.argmax(UR[rem])])
+        seed = _pick_capacity_root(rem, u_g, E_g, P_g, tau)
         sel = _expand(seed)
         gid = len(groups)
         for v in sel:
@@ -1209,28 +1248,48 @@ def _asu_flow_capacity_hybrid_groups(
 _ASU_FULL_SUBSOLVER_PATTERN = (
     "portfolio_max_lp",
     "portfolio_max_lp",
-    "objective_shaving_max_lp",
+    "portfolio_max_lp",
     "lb_tree_search",
     "objective_lb_search_max_lp",
-    
-    "asu_flow_capacity_hybrid",
+
+    "asu_probe_standard",
     "quick_restart_no_lp",
-    "asu_probe_fast",
-    "pseudo_costs",
+    "variables_shaving",
     "asu_probe_deep",
 
     "variables_shaving",
     "objective_shaving_max_lp",
     "portfolio_max_lp",
     "reduced_costs",
-    "max_lp",
 
-    "objective_lb_search",
+    "pseudo_costs",
+    "max_lp",
     "core_max_lp",
     "core",
-    "objective_lb_search_no_lp",
+    "no_lp",
 
+    "objective_shaving_max_lp",
+    "asu_probe_mega_deep"
 )
+
+# Every entry here remains applicable when a model has no objective. Keeping a
+# separate list matters because CP-SAT removes objective-only entries and then
+# pads back to num_full_subsolvers by cloning the first surviving entry.
+_ASU_FEASIBILITY_SUBSOLVER_PATTERN = (
+    "portfolio_max_lp",
+    "quick_restart_no_lp",
+    "asu_probe_fast",
+    "core_max_lp",
+    "max_lp",
+    "asu_probe_deep",
+    "portfolio_no_lp",
+    "quick_restart_max_lp",
+    "asu_probe_standard",
+    "asu_probe_very_deep",
+    "variables_shaving"
+)
+
+
 def _asu_full_subsolvers(
     workers: int,
     use_tract_first_search: bool = False,
@@ -1242,10 +1301,15 @@ def _asu_full_subsolvers(
     """Return the bounded full-problem portfolio for one ASU solve."""
     workers = max(1, int(workers))
     if workers < 6:
-        return []
-
-    full_budget = max(6, min(20, round(workers *.6)))
-    full_subsolvers: List[str] = list(_ASU_FULL_SUBSOLVER_PATTERN[:full_budget])
+        full_budget = workers
+    else:
+        full_budget = max(6, min(20, round(workers * .5)))
+    pattern = (
+        _ASU_FULL_SUBSOLVER_PATTERN
+        if has_objective
+        else _ASU_FEASIBILITY_SUBSOLVER_PATTERN
+    )
+    full_subsolvers: List[str] = list(pattern[:full_budget])
     custom_modes = [
         bool(use_tract_first_search),
         bool(use_flow_first_search),
@@ -1551,10 +1615,22 @@ def _spanning_tree_flows(hint: List[int], nb_local: List[List[int]], root_local:
 
 
 def component_ok(S: List[int], u: np.ndarray, E: np.ndarray, P: np.ndarray,
-                 tau: float, pop_thresh: int, nb: List[List[int]]) -> bool:
+                 tau: float, pop_thresh: int, nb: List[List[int]], *,
+                 required: Optional[Sequence[int]] = None,
+                 max_nodes: Optional[int] = None,
+                 exact_nodes: Optional[int] = None) -> bool:
+    """Validate original-tract selections using the model's exact rate rule."""
     if not S:
         return False
     Sset = set(S)
+    if (len(Sset) != len(S) or any(i < 0 or i >= len(nb) for i in Sset)
+            or not set(required or []).issubset(Sset)):
+        return False
+    if exact_nodes is not None:
+        if len(S) != int(exact_nodes):
+            return False
+    elif max_nodes is not None and len(S) > int(max_nodes):
+        return False
     # connectivity (BFS)
     seen = {S[0]}
     Q = [S[0]]
@@ -1567,34 +1643,169 @@ def component_ok(S: List[int], u: np.ndarray, E: np.ndarray, P: np.ndarray,
     if len(seen) != len(S):
         return False
     su, sE, sP = int(u[S].sum()), int(E[S].sum()), int(P[S].sum())
-    return (sP >= pop_thresh) and (ur_of(su, sE) >= tau)
+    num, den = as_fraction_tau(tau)
+    return (sP >= int(pop_thresh) and den * su - num * sE >= 0
+            and (tau <= 0 or su + sE > 0))
+
+
+def _add_asu_feasibility_constraints(
+    model, x, u, emp, pop, tau, pop_thresh, *,
+    tract_counts=None, max_nodes=None, exact_nodes=None,
+):
+    """Shared nonempty/population/rate/count rows for every ASU model.
+
+    tract_counts maps contracted variables back to original tract counts.
+    Connectivity and required/overlap nodes are supplied by each caller.
+    """
+    num, den = as_fraction_tau(tau)
+    population = sum(int(pop[i]) * var for i, var in enumerate(x))
+    surplus = sum((den * int(u[i]) - num * int(emp[i])) * var
+                  for i, var in enumerate(x))
+    model.Add(sum(x) >= 1)
+    model.Add(population >= int(pop_thresh))
+    model.Add(surplus >= 0)
+    if tau > 0:
+        model.Add(sum((int(u[i]) + int(emp[i])) * var
+                      for i, var in enumerate(x)) >= 1)
+    if exact_nodes is not None or max_nodes is not None:
+        weights = tract_counts if tract_counts is not None else [1] * len(x)
+        count = sum(int(weights[i]) * var for i, var in enumerate(x))
+        if exact_nodes is not None:
+            model.Add(count == int(exact_nodes))
+        else:
+            model.Add(count <= int(max_nodes))
+    return population, surplus
+
+
+def _connectivity_free_feasibility(u, emp, pop, tau, pop_thresh, *,
+                                   seconds=5, workers=1, required=None,
+                                   overlap=None, max_nodes=None, exact_nodes=None,
+                                   stop_path=None):
+    """Necessary ASU conditions on whole tracts; only INFEASIBLE rejects an area."""
+    if seconds <= 0 or _stop_requested(stop_path):
+        return "UNKNOWN"
+    model = cp_model.CpModel()
+    x = [model.NewBoolVar(f"screen_{i}") for i in range(len(u))]
+    _add_asu_feasibility_constraints(
+        model, x, u, emp, pop, tau, pop_thresh,
+        max_nodes=max_nodes, exact_nodes=exact_nodes,
+    )
+    for i in required or []:
+        model.Add(x[int(i)] == 1)
+    if overlap is not None:
+        model.Add(sum(x[int(i)] for i in overlap) >= 1)
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = min(5.0, float(seconds))
+    solver.parameters.num_search_workers = int(workers)
+    _configure_asu_solver_portfolio(
+        solver.parameters, workers, has_objective=False
+    )
+    # This model has no objective: stop as soon as feasibility is established.
+    status = solver.Solve(model)
+    return solver.StatusName(status)
+
+
+def _search_unassigned_asu(nodes, nb, u, emp, pop, tau, pop_thresh,
+                           seconds, workers, stop_path=None, donor_nodes=None,
+                           max_nodes=None, exact_nodes=None, skip_path=None):
+    """Search all supplied tracts with a variable root; INFEASIBLE is a proof.
+
+    Donor repair maximizes retained unemployment and must retain a donor tract.
+    Otherwise this is a feasibility search, without an objective or fixed root.
+    """
+    if _stop_requested(stop_path):
+        return [], "STOPPED"
+    if _stop_requested(skip_path):
+        _consume_flag(skip_path)
+        return [], "SKIPPED"
+    if seconds <= 0:
+        return [], "DISABLED"
+    deadline = time.monotonic() + float(seconds)
+    nodes = sorted(set(nodes))
+    n = len(nodes)
+    if not n:
+        return [], "INFEASIBLE"
+    index = {g: i for i, g in enumerate(nodes)}
+    screen_status = _connectivity_free_feasibility(
+        u[nodes], emp[nodes], pop[nodes], tau, pop_thresh,
+        seconds=min(5.0, float(seconds) * 0.1), workers=workers,
+        overlap=None if donor_nodes is None else [index[g] for g in donor_nodes if g in index],
+        max_nodes=max_nodes, exact_nodes=exact_nodes, stop_path=stop_path,
+    )
+    if screen_status == "INFEASIBLE":
+        print(f"[CONNECTIVITY-FREE SCREEN] {n} tracts: infeasible; skipping connected search", flush=True)
+        return [], "INFEASIBLE"
+    model = cp_model.CpModel()
+    x = [model.NewBoolVar(f"selected_{i}") for i in range(n)]
+    roots = [model.NewBoolVar(f"root_{i}") for i in range(n)]
+    model.Add(sum(roots) == 1)
+    _add_capacity_root_order(model, x, roots, u[nodes], emp[nodes], pop[nodes], tau)
+    net = [[] for _ in nodes]
+    injections = []
+    for i, g in enumerate(nodes):
+        injected = model.NewIntVar(0, n, f"injected_{i}")
+        model.Add(injected <= n * roots[i])
+        injections.append(injected)
+        for v in sorted(set(nb[g])):
+            if v not in index or i >= index[v]:
+                continue
+            j = index[v]
+            flow = model.NewIntVar(-n, n, f"flow_{i}_{j}")
+            model.Add(flow == 0).OnlyEnforceIf(x[i].Not())
+            model.Add(flow == 0).OnlyEnforceIf(x[j].Not())
+            net[i].append(flow)
+            net[j].append(-flow)
+    for i in range(n):
+        model.Add(sum(net[i]) == injections[i] - x[i])
+    model.Add(sum(injections) == sum(x))
+    _add_asu_feasibility_constraints(
+        model, x, u[nodes], emp[nodes], pop[nodes], tau, pop_thresh,
+        max_nodes=max_nodes, exact_nodes=exact_nodes,
+    )
+    if donor_nodes is not None:
+        donor = set(donor_nodes)
+        model.Add(sum(x[i] for i, g in enumerate(nodes) if g in donor) >= 1)
+        model.Maximize(sum(int(u[g]) * x[i] for i, g in enumerate(nodes)))
+    solver = cp_model.CpSolver()
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return [], "UNKNOWN"
+    solver.parameters.max_time_in_seconds = remaining
+    solver.parameters.num_search_workers = int(workers)
+    _configure_asu_solver_portfolio(
+        solver.parameters,
+        workers,
+        has_objective=donor_nodes is not None,
+    )
+    done = threading.Event()
+
+    def watch():
+        while not done.wait(0.1):
+            if _stop_requested(stop_path) or _stop_requested(skip_path):
+                _consume_flag(skip_path)
+                solver.StopSearch()
+                return
+
+    watcher = threading.Thread(target=watch, daemon=True)
+    watcher.start()
+    try:
+        status = solver.Solve(model) if not _stop_requested(stop_path) else cp_model.UNKNOWN
+    finally:
+        done.set()
+        watcher.join()
+    selected = []
+    if status in (cp_model.FEASIBLE, cp_model.OPTIMAL):
+        selected = [g for i, g in enumerate(nodes) if solver.BooleanValue(x[i])]
+        if not component_ok(selected, u, emp, pop, tau, pop_thresh, nb,
+                            max_nodes=max_nodes, exact_nodes=exact_nodes):
+            raise ValueError("Residual search returned an invalid ASU")
+    return selected, solver.StatusName(status)
 
 
 def can_hit_tau(u: np.ndarray, E: np.ndarray, P: np.ndarray,
                 nb_local: List[List[int]], tau: float, pop_thresh: int) -> bool:
-    """Quick optimistic screen: if no component can meet UR/pop, skip solving."""
-    if len(u) == 0:
-        return False
-    UR = u / np.maximum(u + E, 1e-12)
-    if UR.max(initial=0.0) < tau:
-        return False
-    # BFS-ball windows are always connected; single-component knapsack is sufficient
-    num, den = as_fraction_tau(tau)
-    D = den * u - num * E
-    rho = D / np.maximum(P, 1e-12)
-    ord_idx = np.argsort(-rho)
-    need = pop_thresh
-    cumD = 0.0
-    for j in ord_idx:
-        pj, dj = int(P[j]), float(D[j])
-        if pj <= 0:
-            continue
-        take = min(pj, need)
-        cumD += dj * (take / pj)
-        need -= take
-        if need <= 0:
-            break
-    return need <= 0 and cumD >= 0
+    """Reject only a proved-infeasible connectivity-free whole-tract model."""
+    return _connectivity_free_feasibility(u, E, P, tau, pop_thresh) != "INFEASIBLE"
 
 
 def queen_neighbors_from_geometries(gdf: "gpd.GeoDataFrame", geom_col: str = "geometry") -> List[List[int]]:
@@ -1876,6 +2087,40 @@ def _surplus_knapsack_bounds(
     return int(max_selected), negative_idx, max_negative
 
 
+def _remaining_selection_count_bound(
+    q_surplus, forced_set, excluded, tract_counts, *, max_nodes=None, exact_nodes=None,
+) -> Optional[int]:
+    """Upper bound after proven exclusions, including original-tract limits.
+
+    Rate and tract-budget relaxations are bounded separately; their minimum
+    remains optimistic for the joint problem. None means one is infeasible.
+    """
+    forced_set, excluded = set(forced_set), set(excluded)
+    if forced_set & excluded:
+        return None
+    active = [i for i in range(len(q_surplus)) if i not in excluded]
+    index = {node: i for i, node in enumerate(active)}
+    rate_bound, _, _ = _surplus_knapsack_bounds(
+        np.asarray([q_surplus[i] for i in active], dtype=np.int64),
+        {index[i] for i in forced_set}, len(active),
+    )
+    if rate_bound is None:
+        return None
+    limit = exact_nodes if exact_nodes is not None else max_nodes
+    if limit is None:
+        return rate_bound
+    remaining = int(limit) - sum(int(tract_counts[i]) for i in forced_set)
+    if remaining < 0:
+        return None
+    count_bound = len(forced_set)
+    for weight in sorted(int(tract_counts[i]) for i in active if i not in forced_set):
+        if weight > remaining:
+            break
+        remaining -= weight
+        count_bound += 1
+    return min(rate_bound, count_bound)
+
+
 def _profitable_closure_edges(nb, u, q):
     """Implications neighbor -> profitable node on the contracted graph."""
     return [
@@ -1945,76 +2190,74 @@ def _bridge_subtree_zero_fix(
     forced_set: set,
     budget_global: int,
 ) -> List[int]:
-    """
-    Extends the same root-rooted bridge DFS as _bridge_edge_bounds with a
-    bottom-up UR-surplus rollup to find bridge-gated subtrees that can NEVER
-    be entered in any feasible solution -- e.g. a high-UR island reachable
-    only through a long low-UR "moat": crediting the island's full positive
-    surplus plus every other positive-surplus tract elsewhere in the window
-    still can't offset the moat's deficit. Unlike the aggregate/per-separator
-    cardinality bounds (which only bound how many nodes could be selected),
-    this proves specific gateway nodes can never be selected and hard-fixes
-    x[gateway] = 0 -- the model's existing adjacency-support and flow/
-    connectivity constraints then make everything behind that gateway
-    infeasible too, with no extra bookkeeping needed here.
+    """Prove bridge gateways unaffordable using optimistic cyclic-block bounds.
 
-    For each node v, best_raw[v] is the best achievable net q of SOME
-    connected selection rooted at v within v's own subtree (trim any child
-    whose own best-case value is negative, unless that child's subtree
-    contains a forced node, which can't be trimmed away). Only sound at true
-    bridges (single forced path in); subtrees containing a forced node are
-    skipped entirely since those can never be zeroed out anyway.
-    Returns local node indices to fix to x[i] = 0.
+    Remove true bridges to form blocks. Inside each block, charge its required
+    entry and forced vertices but credit all other positive surplus for free:
+    internal connectivity may cost more, never less. The remaining block graph
+    is a tree, so optional negative child subtrees can safely be omitted there.
+    A DFS spanning tree *inside* a cyclic block cannot supply an upper bound.
     """
-    N = len(nb_local)
-    disc = [-1] * N
-    low = [0] * N
-    parent = [-1] * N
-    skipped_parent = [False] * N
-    best_raw = [0] * N
-    positive_within = [0] * N
-    has_forced = [False] * N
-    to_fix: List[int] = []
-    timer = 0
-
-    stack = [(root_local, iter(nb_local[root_local]))]
-    disc[root_local] = low[root_local] = timer
-    timer += 1
-    best_raw[root_local] = int(q_surplus[root_local])
-    positive_within[root_local] = max(0, int(q_surplus[root_local]))
-    has_forced[root_local] = root_local in forced_set
+    bridges = _bridge_edge_bounds(nb_local, root_local)
+    if not bridges:
+        return []
+    blocked_edges = {frozenset(edge) for edge in bridges}
+    block_of = {}
+    blocks = []
+    # Only the root's underlying component matters.
+    reachable = {root_local}
+    stack = [root_local]
     while stack:
-        u, it = stack[-1]
-        recursed = False
-        for w in it:
-            if w == parent[u] and not skipped_parent[u]:
-                skipped_parent[u] = True
-                continue
-            if disc[w] == -1:
-                parent[w] = u
-                disc[w] = low[w] = timer
-                timer += 1
-                best_raw[w] = int(q_surplus[w])
-                positive_within[w] = max(0, int(q_surplus[w]))
-                has_forced[w] = w in forced_set
-                stack.append((w, iter(nb_local[w])))
-                recursed = True
-                break
-            else:
-                low[u] = min(low[u], disc[w])
-        if not recursed:
-            stack.pop()
-            if stack:
-                p = stack[-1][0]
-                low[p] = min(low[p], low[u])
-                positive_within[p] += positive_within[u]
-                contribution = best_raw[u] if has_forced[u] else max(0, best_raw[u])
-                best_raw[p] += contribution
-                has_forced[p] = has_forced[p] or has_forced[u]
-                if low[u] > disc[p] and not has_forced[u]:
-                    if best_raw[u] + (budget_global - positive_within[u]) < 0:
-                        to_fix.append(u)
-    return to_fix
+        node = stack.pop()
+        for neighbor in nb_local[node]:
+            if neighbor not in reachable:
+                reachable.add(neighbor)
+                stack.append(neighbor)
+    for start in sorted(reachable):
+        if start in block_of:
+            continue
+        index = len(blocks)
+        members = []
+        stack = [start]
+        block_of[start] = index
+        while stack:
+            node = stack.pop()
+            members.append(node)
+            for neighbor in nb_local[node]:
+                if (neighbor not in block_of
+                        and frozenset((node, neighbor)) not in blocked_edges):
+                    block_of[neighbor] = index
+                    stack.append(neighbor)
+        blocks.append(members)
+
+    children = [[] for _ in blocks]
+    entry = {block_of[root_local]: root_local}
+    for near, far in bridges:
+        parent, child = block_of[near], block_of[far]
+        children[parent].append(child)
+        entry[child] = far
+    order = [block_of[root_local]]
+    for block in order:
+        order.extend(children[block])
+    best = [0] * len(blocks)
+    positive = [0] * len(blocks)
+    has_forced = [False] * len(blocks)
+    to_fix = []
+    for block in reversed(order):
+        members = blocks[block]
+        required = (set(members) & forced_set) | {entry[block]}
+        best[block] = sum(int(q_surplus[node]) if node in required
+                          else max(0, int(q_surplus[node])) for node in members)
+        positive[block] = sum(max(0, int(q_surplus[node])) for node in members)
+        has_forced[block] = bool(set(members) & forced_set)
+        for child in children[block]:
+            best[block] += best[child] if has_forced[child] else max(0, best[child])
+            positive[block] += positive[child]
+            has_forced[block] |= has_forced[child]
+        if (entry[block] != root_local and not has_forced[block]
+                and best[block] + int(budget_global) - positive[block] < 0):
+            to_fix.append(entry[block])
+    return sorted(to_fix)
 
 
 class CpsatResult:
@@ -2154,16 +2397,12 @@ def solve_one_asu_cpsat(
     if use_flow_capacity_hybrid_search and use_arborescence:
         raise ValueError("flow-capacity hybrid search requires an integer flow formulation")
 
+    required_orig = sorted({int(root_local)} | set(forced_selected or []))
     if hint is not None:
         hint = sorted({int(node) for node in hint})
-        forced_hint_nodes = {int(node) for node in (forced_selected or [])}
-        forced_hint_nodes.add(int(root_local))
-        hint_in_range = all(0 <= node < N for node in hint)
-        hint_valid = (
-            hint_in_range
-            and forced_hint_nodes.issubset(hint)
-            and (max_nodes is None or len(hint) <= int(max_nodes))
-            and component_ok(hint, u_g, E_g, P_g, tau, pop_thresh, nb_local)
+        hint_valid = component_ok(
+            hint, u_g, E_g, P_g, tau, pop_thresh, nb_local,
+            required=required_orig, max_nodes=max_nodes, exact_nodes=exact_nodes,
         )
         if not hint_valid:
             if log:
@@ -2172,13 +2411,30 @@ def solve_one_asu_cpsat(
                     flush=True,
                 )
             hint = None
-            hint_obj = None
+    # Metadata alone is never a certificate of a feasible objective floor.
+    hint_obj = int(u_g[hint].sum()) if hint else None
+    if hint is None:
+        screen_status = _connectivity_free_feasibility(
+            u_g, E_g, P_g, tau, pop_thresh,
+            seconds=min(5.0, max(0.0, float(time_limit)) * 0.1), workers=workers,
+            required=required_orig, max_nodes=max_nodes, exact_nodes=exact_nodes,
+            stop_path=stop_flag_path,
+        )
+        if log:
+            print(f"[CONNECTIVITY-FREE SCREEN] {N} tracts: {screen_status}" +
+                  ("; skipping connected solve" if screen_status == "INFEASIBLE" else ""), flush=True)
+        if screen_status == "INFEASIBLE":
+            return None
+    elif log:
+        print(f"[CONNECTIVITY-FREE SCREEN] {N} tracts: verified connected hint; "
+              "auxiliary solve skipped", flush=True)
 
     # Contract UR>=tau clusters so the model has fewer variables; expand at every
     # return point. All cluster members co-occur in any feasible solution (mediant
     # inequality), so this is exact — not an approximation.
     nb_c, u_c, E_c, P_c, expand_c, node_map_c = contract_high_ur_nodes(nb_local, u_g, E_g, P_g, tau)
     nb_local_orig, u_g_orig, root_local_orig = nb_local, u_g, root_local
+    E_g_orig, P_g_orig = E_g, P_g
     nb_local, u_g, E_g, P_g = nb_c, u_c, E_c, P_c
     N = len(nb_local)
     root_local = int(node_map_c[root_local_orig])
@@ -2213,15 +2469,36 @@ def solve_one_asu_cpsat(
     )
     if hint is not None:
         hint = sorted({int(node_map_c[v]) for v in hint})
+        expanded_hint = sorted({v for ri in hint for v in expand_c[ri]})
+        if not component_ok(
+            expanded_hint, u_g_orig, E_g_orig, P_g_orig, tau, pop_thresh,
+            nb_local_orig, required=required_orig,
+            max_nodes=max_nodes, exact_nodes=exact_nodes,
+        ):
+            hint = None
+        hint_obj = int(u_g[hint].sum()) if hint else None
 
     def _to_orig(sel: Optional[List[int]], status: str) -> "CpsatResult":
+        # Preserve the strongest verified incumbent even on timeout/interrupt.
+        if best_connected is not None and (
+            not sel or int(u_g[sel].sum()) < best_obj
+        ):
+            sel = best_connected
+            if status == "OPTIMAL":
+                status = "FEASIBLE"
         orig = sorted({v for ri in sel for v in expand_c[ri]}) if sel else []
+        if not component_ok(
+            orig, u_g_orig, E_g_orig, P_g_orig, tau, pop_thresh, nb_local_orig,
+            required=required_orig, max_nodes=max_nodes, exact_nodes=exact_nodes,
+        ):
+            raise ValueError("Connected solve returned an invalid expanded ASU")
         return CpsatResult(orig, root_local_orig, int(u_g_orig[orig].sum()) if orig else 0, status)
 
     model = cp_model.CpModel()
 
     # Decision variables
     x = [model.NewBoolVar(f"x_{i}") for i in range(N)]
+    fixed_zero_nodes: Set[int] = set()
 
     # Selecting the root permits its entire connected high-UR component at no cost.
     forced_set = {int(node_map_c[v]) for v in (forced_selected or [])}
@@ -2255,6 +2532,7 @@ def solve_one_asu_cpsat(
             model.Add(x[v] <= sum(x[w] for w in nb_local[v]))
         else:
             model.Add(x[v] == 0)
+            fixed_zero_nodes.add(v)
 
     seeded_cut_clauses = 0
     seen_seeded_cuts: set = set()
@@ -2287,6 +2565,7 @@ def solve_one_asu_cpsat(
                 )
             else:
                 model.Add(x[node] == 0)
+                fixed_zero_nodes.add(node)
             seeded_cut_clauses += 1
 
     if log and seeded_cut_clauses:
@@ -2307,6 +2586,52 @@ def solve_one_asu_cpsat(
     # u_i - tau*(u_i+E_i); sum(q_i * x_i) >= 0 is exactly the UR constraint below.
     num, den = as_fraction_tau(tau)
     q_surplus = den * u_g.astype(np.int64) - num * E_g.astype(np.int64)
+
+    # A connected selection containing node i needs at least dist(root, i) + 1
+    # selected contracted nodes. Build the shared count variable before the cut
+    # pass so this cheap projection of connectivity strengthens every solve,
+    # not only the final flow formulation.
+    surplus_count_bound, _, surplus_negative_bound = _surplus_knapsack_bounds(
+        q_surplus, forced_set, N
+    )
+    max_selected = N if surplus_count_bound is None else surplus_count_bound
+    max_selected = max(len(forced_set), min(N, int(max_selected)))
+    selected_count = model.NewIntVar(
+        len(forced_set), max_selected, "selected_count"
+    )
+    model.Add(selected_count == sum(x))
+    root_distances = _root_graph_distances(nb_local, root_local)
+    reachability_rows = 0
+    unreachable_fixed = 0
+    for node, distance in enumerate(root_distances):
+        if node == root_local:
+            continue
+        if distance >= N:
+            model.Add(x[node] == 0)
+            fixed_zero_nodes.add(node)
+            unreachable_fixed += 1
+            continue
+        model.Add(selected_count >= (int(distance) + 1) * x[node])
+        reachability_rows += 1
+
+    if log:
+        if surplus_count_bound is None:
+            print(
+                "  analytical surplus bound: rate relaxation infeasible; "
+                f"leaving selected-count upper bound at {N}",
+                flush=True,
+            )
+        else:
+            print(
+                f"  analytical surplus bound: selected <= {max_selected} "
+                f"({surplus_negative_bound} optional deficit tract(s))",
+                flush=True,
+            )
+        print(
+            f"  distance/cardinality reachability: {reachability_rows} row(s), "
+            f"{unreachable_fixed} unreachable node(s) fixed to 0",
+            flush=True,
+        )
 
     # Completion improves the primary objective but can violate a tract count
     # constraint. Strictly positive unemployment avoids disturbing count ties.
@@ -2376,6 +2701,7 @@ def solve_one_asu_cpsat(
         )
         for i in bridge_fixed_zero:
             model.Add(x[i] == 0)
+        fixed_zero_nodes.update(bridge_fixed_zero)
         if log:
             print(
                 f"  bridge subtree pruning: {len(bridge_fixed_zero)} gateway tract(s) "
@@ -2383,24 +2709,11 @@ def solve_one_asu_cpsat(
                 flush=True,
             )
 
-    # Population threshold
-    pop_expr = sum(int(P_g[i]) * x[i] for i in range(N))
-    model.Add(pop_expr >= int(pop_thresh))
-
-    # Optional hard cap (or, with `exact_nodes`, exact target) on total selected
-    # tracts, counted in original-graph units (each contracted node may
-    # represent multiple original tracts).
-    if exact_nodes is not None:
-        size_c = [len(grp) for grp in expand_c]
-        model.Add(sum(size_c[i] * x[i] for i in range(N)) == int(exact_nodes))
-    elif max_nodes is not None:
-        size_c = [len(grp) for grp in expand_c]
-        model.Add(sum(size_c[i] * x[i] for i in range(N)) <= int(max_nodes))
-
-    # UR >= tau as exact integer linear inequality
-    lhs = sum(int(den) * int(u_g[i]) * x[i] for i in range(N)) \
-        - sum(int(num) * int(E_g[i]) * x[i] for i in range(N))
-    model.Add(lhs >= 0)
+    pop_expr, lhs = _add_asu_feasibility_constraints(
+        model, x, u_g, E_g, P_g, tau, pop_thresh,
+        tract_counts=[len(grp) for grp in expand_c],
+        max_nodes=max_nodes, exact_nodes=exact_nodes,
+    )
 
     # Objective: maximize unemployment captured
     obj_expr = sum(int(u_g[i]) * x[i] for i in range(N))
@@ -2424,16 +2737,12 @@ def solve_one_asu_cpsat(
                     flush=True,
                 )
 
-    # Warm-start / floor: when a smallest-first component breakdown is given,
-    # start the cut-pass phase with NO incumbent and NO objective floor at all,
-    # so it is free to explore genuinely small, differently-shaped connected
-    # candidates. The known-good hint is still applied as a floor later, right
-    # before the exact flow phase, so the final committed answer never
-    # regresses below it -- only the cut-pass exploration is unshackled.
+    # Keep the verified incumbent independently of exploratory hints. Defer
+    # only the objective floor so the cut pass may explore smaller candidates.
     defer_hint_floor = bool(initial_pending)
+    best_connected = sorted(hint) if hint else None
+    best_obj = int(u_g[best_connected].sum()) if best_connected else -1
     if defer_hint_floor:
-        best_connected = None
-        best_obj = -1
         lower_bound = -1
     else:
         # Warm-start with the connected reverse-prune solution.
@@ -2446,10 +2755,6 @@ def solve_one_asu_cpsat(
         if hint_obj is not None and hint_obj > 0:
             model.Add(obj_expr >= hint_obj)
 
-        best_connected = sorted(hint) if hint and component_ok(
-            hint, u_g, E_g, P_g, tau, pop_thresh, nb_local
-        ) else None
-        best_obj = int(u_g[best_connected].sum()) if best_connected else -1
         lower_bound = hint_obj if (hint_obj is not None and hint_obj > 0) else -1
 
     start_time = time.monotonic()
@@ -2602,7 +2907,10 @@ def solve_one_asu_cpsat(
 
         if pending_expand:
             expand_component = pending_expand.pop(0)
-            expand_base = set(best_connected) if best_connected is not None else set(forced_set)
+            expand_base = (
+                set(best_connected) if best_connected is not None and not defer_hint_floor
+                else set(forced_set)
+            )
             _set_expand_hint(expand_base | expand_component)
             if log:
                 print(
@@ -2726,6 +3034,7 @@ def solve_one_asu_cpsat(
             else:
                 for target in targets:
                     model.Add(x[int(target)] == 0)
+                    fixed_zero_nodes.add(int(target))
                     fallback_clauses += 1
                     fallback_literals += 1
 
@@ -2777,18 +3086,14 @@ def solve_one_asu_cpsat(
     # The cut-pass phase was deliberately left unfloored to explore smaller
     # candidates; now apply the known-good hint as a floor for the exact flow
     # phase so the final committed answer never regresses below it.
-    if defer_hint_floor and hint_obj is not None and hint_obj > 0 and hint_obj > lower_bound:
-        model.Add(obj_expr >= hint_obj)
-        lower_bound = hint_obj
+    if best_connected is not None and best_obj > lower_bound:
+        model.Add(obj_expr >= best_obj)
+        lower_bound = best_obj
 
     # Finish with exact connectivity, strengthened by the cuts. Fall back to
     # the full hint for the flow phase's own warm-start if cut-pass never
     # reached a connected candidate of its own.
-    flow_source = best_connected if best_connected is not None else (
-        sorted(hint) if hint and component_ok(
-            hint, u_g, E_g, P_g, tau, pop_thresh, nb_local
-        ) else None
-    )
+    flow_source = best_connected
     if (
         uncapped_reductions and use_lagrangian_variable_fixing
         and flow_source is not None
@@ -2808,6 +3113,7 @@ def solve_one_asu_cpsat(
         ]
         for i in fixed_zero:
             model.Add(x[i] == 0)
+        fixed_zero_nodes.update(fixed_zero)
         if log:
             print(
                 f"  Lagrangian fixing: {len(fixed_zero)} nodes fixed to 0, "
@@ -2815,6 +3121,33 @@ def solve_one_asu_cpsat(
                 f"elapsed={time.monotonic() - reduction_start:.3f}s",
                 flush=True,
             )
+    # Recompute connectivity and rate capacity after proven exclusions. In
+    # particular, excluded positive-surplus nodes must no longer fund M.
+    reachable_after_fixing = set()
+    stack = [] if root_local in fixed_zero_nodes else [root_local]
+    reachable_after_fixing.update(stack)
+    while stack:
+        node = stack.pop()
+        for neighbor in nb_local[node]:
+            if neighbor not in fixed_zero_nodes and neighbor not in reachable_after_fixing:
+                reachable_after_fixing.add(neighbor)
+                stack.append(neighbor)
+    disconnected_after_fixing = set(range(N)) - reachable_after_fixing - fixed_zero_nodes
+    for node in disconnected_after_fixing:
+        model.Add(x[node] == 0)
+    fixed_zero_nodes.update(disconnected_after_fixing)
+    tightened_count = _remaining_selection_count_bound(
+        q_surplus, forced_set, fixed_zero_nodes, [len(grp) for grp in expand_c],
+        max_nodes=max_nodes, exact_nodes=exact_nodes,
+    )
+    if tightened_count is None:
+        model.AddBoolOr([])
+    elif tightened_count < max_selected:
+        if log:
+            print(f"  post-pruning count bound: {max_selected} -> {tightened_count}", flush=True)
+        max_selected = tightened_count
+        model.Add(selected_count <= max_selected)
+
     # Cut-pass rounds repeatedly overwrite the model's variable hints with
     # small, partial expand attempts (see _set_expand_hint); refresh x[] here
     # so the flow phase starts from a hint consistent with flow_source rather
@@ -3200,6 +3533,10 @@ def solve_one_asu_cpsat(
     # to improve the primal; the LNS subsolvers do the opposite -- suppress lbts
     # here so all 18 workers focus on finding better connected incumbents fast.
     _SCOUT_SECS = 10.0
+    status = cp_model.UNKNOWN
+    status_name = "UNKNOWN"
+    selected: List[int] = []
+    objective = -1
     if (
         remaining_time > _SCOUT_SECS + 30.0
         and not _stop_requested(stop_flag_path)
@@ -3233,11 +3570,13 @@ def solve_one_asu_cpsat(
                 if log:
                     print(f"  scout: improved incumbent to {_scout_obj} "
                           f"(+{_scout_obj - (hint_obj or 0)} vs hint)", flush=True)
-
-    status = cp_model.UNKNOWN
-    status_name = "UNKNOWN"
-    selected: List[int] = []
-    objective = -1
+            if (_scout_status == cp_model.OPTIMAL and _scout_obj >= best_obj
+                    and abs(_scout.BestObjectiveBound() - _scout_obj) < 1e-6):
+                status, status_name = cp_model.OPTIMAL, "OPTIMAL"
+                selected, objective = _scout_sel, _scout_obj
+                if log:
+                    print("  scout: primary optimum proved; skipping main "
+                          "optimization and proceeding to requested tie-breaks", flush=True)
     bound_stop_threshold = (
         int(objective_no_improve_stop)
         if objective_no_improve_stop is not None
@@ -3245,7 +3584,8 @@ def solve_one_asu_cpsat(
     )
     last_reported_incumbent: Optional[Tuple[int, ...]] = None
 
-    if objective_shaving and best_connected is not None and rel_gap is None:
+    if (status != cp_model.OPTIMAL and objective_shaving
+            and best_connected is not None and rel_gap is None):
         proof_model = model.clone()
         proof_model.ClearObjective()
         proof_model.ClearHints()
@@ -5263,14 +5603,7 @@ def solve_local_repair(
             model.Add(x[i] == int(i in current_set))
     model.Add(x[root_local] == 1)
 
-    model.Add(sum(int(P_g[i]) * x[i] for i in range(N)) >= int(pop_thresh))
-
-    num, den = as_fraction_tau(tau)
-    model.Add(
-        sum(int(den) * int(u_g[i]) * x[i] for i in range(N))
-        - sum(int(num) * int(E_g[i]) * x[i] for i in range(N))
-        >= 0
-    )
+    _add_asu_feasibility_constraints(model, x, u_g, E_g, P_g, tau, pop_thresh)
 
     obj_expr = sum(int(u_g[i]) * x[i] for i in range(N))
     model.Add(obj_expr >= current_u + 1)
@@ -5672,16 +6005,10 @@ def solve_connectivity_free_relaxation(
     for i in forced:
         model.Add(x[i] == 1)
 
-    pop_expr = sum(int(P_g[i]) * x[i] for i in range(N))
-    slack_expr = sum(
-        (int(den) * int(u_g[i]) - int(num) * int(E_g[i])) * x[i]
-        for i in range(N)
+    pop_expr, slack_expr = _add_asu_feasibility_constraints(
+        model, x, u_g, E_g, P_g, tau, pop_thresh, max_nodes=max_nodes,
     )
     objective_expr = sum(int(u_g[i]) * x[i] for i in range(N))
-    model.Add(pop_expr >= int(pop_thresh))
-    model.Add(slack_expr >= 0)
-    if max_nodes is not None:
-        model.Add(sum(x) <= int(max_nodes))
     if objective_floor is not None and objective_floor > 0:
         model.Add(objective_expr >= int(objective_floor))
     model.Maximize(objective_expr)
@@ -6044,6 +6371,453 @@ def repair_connectivity_free_selection(
     return sorted(best)
 
 
+def _polish_attempt_key(root, selected, window, tau, pop_thresh, max_nodes):
+    """Run-local identity; graph, counts and solver settings stay fixed in a run.
+
+    Include the actual incumbent, not just its objective: equal-value shapes
+    can expose different exchanges. An attempt is not an optimality certificate.
+    """
+    return (int(root), tuple(sorted(selected)), tuple(sorted(window)),
+            as_fraction_tau(tau), int(pop_thresh), max_nodes)
+
+
+class _RegionalExchangeState:
+    """One build's shared wall-time budget and neighborhood attempt history."""
+
+    def __init__(self, seconds):
+        self.remaining_seconds = min(180.0, max(0.0, float(seconds)))
+        self.attempted = set()
+        self.attempt_count = 0
+
+
+def _regional_exchange_windows(assignments, nb, u, *, hops=2, halo_hops=1, eligible_ids=None):
+    """Nearby pairs/triples, initially with a one-hop unassigned halo.
+
+    Neighbor discovery can cross unassigned tracts but never another ASU.
+    Round-robin anchors before their alternate pairs; triples allow a transfer
+    through a third group. Discovery distance is independent of halo size.
+    Every incumbent tract remains eligible, including interior tracts.
+    """
+    ids = sorted(set(int(v) for v in assignments if v > 0))
+    if eligible_ids is not None:
+        ids = [k for k in ids if k in eligible_ids]
+    eligible = set(ids)
+    units = {k: set(np.flatnonzero(assignments == k).tolist()) for k in ids}
+    value = {k: int(u[sorted(units[k])].sum()) for k in ids}
+    seen = set()
+    anchor_choices = []
+    for anchor in sorted(ids, key=lambda k: (-value[k], k)):
+        reached = set(units[anchor])
+        frontier = set(reached)
+        neighbors = {}
+        for distance in range(1, hops + 2):
+            following = set()
+            for node in sorted(frontier):
+                for other in nb[node]:
+                    owner = int(assignments[other])
+                    if owner in eligible and owner != anchor:
+                        neighbors.setdefault(owner, distance)
+                    elif owner <= 0 and other not in reached:
+                        following.add(other)
+            reached.update(following)
+            frontier = following
+        nearest = sorted(neighbors, key=lambda k: (neighbors[k], -value[k], k))[:2]
+        choices = ([tuple([anchor] + nearest)] if len(nearest) == 2 else [])
+        choices += [(anchor, other) for other in nearest]
+        anchor_choices.append(choices)
+    for rank in range(3):
+        for choices in anchor_choices:
+            if rank >= len(choices):
+                continue
+            choice = choices[rank]
+            group = tuple(sorted(choice))
+            if group in seen:
+                continue
+            seen.add(group)
+            region = set().union(*(units[k] for k in group))
+            frontier = set(region)
+            for _ in range(halo_hops):
+                following = {w for v in frontier for w in nb[v]
+                             if assignments[w] <= 0 and w not in region}
+                region.update(following)
+                frontier = following
+            yield group, sorted(region)
+
+
+def _regional_selection_bounds(q_surplus, group_count, *, max_nodes=None, exact_nodes=None):
+    """Rate-only total count bound, with one tract reserved for every other ASU."""
+    total, _, _ = _surplus_knapsack_bounds(q_surplus, set(), len(q_surplus))
+    total = len(q_surplus) if total is None else total
+    per_group = max(0, total - (group_count - 1))
+    cap = exact_nodes if exact_nodes is not None else max_nodes
+    if cap is not None:
+        per_group = min(per_group, int(cap))
+        total = min(total, group_count * int(cap))
+    return total, per_group
+
+
+def _solve_regional_exchange(units, nodes, nb, u, E, P, tau, pop_thresh,
+                             seconds, workers, *, max_nodes=None, exact_nodes=None,
+                             stop_path=None, skip_path=None):
+    """Jointly maximize unemployment in 2/3 disjoint ASUs with movable roots.
+
+    Each group retains an incumbent tract for identity, but its root can move
+    to the highest-capacity selected tract. No original root is locked in place.
+    Original tract variables avoid contractions that could prevent transfers.
+    Full incumbent flow hints and a total objective floor protect the baseline.
+    The budget includes model construction; cancellation retains valid seeds.
+    """
+    deadline = time.monotonic() + max(0.0, float(seconds))
+    seeds = [sorted(set(unit)) for unit in units]
+    nodes = sorted(set(nodes))
+    seed_nodes = [v for unit in seeds for v in unit]
+    if (len(seeds) not in (2, 3) or len(seed_nodes) != len(set(seed_nodes))
+            or not set(seed_nodes).issubset(nodes)
+            or not all(component_ok(unit, u, E, P, tau, pop_thresh, nb,
+                                    max_nodes=max_nodes, exact_nodes=exact_nodes)
+                       for unit in seeds)):
+        return seeds, "INVALID_SEED"
+
+    def cancellation():
+        if _stop_requested(stop_path):
+            return "STOPPED"
+        if _stop_requested(skip_path):
+            _consume_flag(skip_path)
+            return "SKIPPED"
+        return None
+
+    reason = cancellation()
+    if reason or time.monotonic() >= deadline:
+        return seeds, reason or "DISABLED"
+    index = {v: i for i, v in enumerate(nodes)}
+    local_nb = [[index[w] for w in nb[v] if w in index] for v in nodes]
+    n = len(nodes)
+    edges = sorted({(min(i, j), max(i, j)) for i in range(n)
+                    for j in local_nb[i] if i != j})
+    local_u, local_e, local_p = u[nodes], E[nodes], P[nodes]
+    num, den = as_fraction_tau(tau)
+    q = den * local_u.astype(np.int64) - num * local_e.astype(np.int64)
+    total_bound, group_bound = _regional_selection_bounds(
+        q, len(seeds), max_nodes=max_nodes, exact_nodes=exact_nodes
+    )
+    if group_bound < 1:
+        return seeds, "INVALID_SEED"
+    flow_bound = group_bound - 1
+    model = cp_model.CpModel()
+    x = [[model.NewBoolVar(f"regional_{k}_{i}") for i in range(n)]
+         for k in range(len(seeds))]
+    for i in range(n):
+        model.Add(sum(row[i] for row in x) <= 1)
+    model.Add(sum(var for row in x for var in row) <= total_bound)
+    for k, seed in enumerate(seeds):
+        reason = cancellation()
+        if reason or time.monotonic() >= deadline:
+            return seeds, reason or "UNKNOWN"
+        root = _pick_capacity_root(seed, u, E, P, tau)
+        root_local = index[root]
+        selected = [index[v] for v in seed]
+        selected_set = set(selected)
+        row = x[k]
+        model.Add(sum(row[i] for i in selected) >= 1)
+        roots = [model.NewBoolVar(f"regional_root_{k}_{i}") for i in range(n)]
+        model.Add(sum(roots) == 1)
+        _add_capacity_root_order(
+            model, row, roots, local_u, local_e, local_p, tau,
+            hint=selected, prefix=f"regional_root_{k}",
+        )
+        _add_asu_feasibility_constraints(
+            model, row, local_u, local_e, local_p, tau, pop_thresh,
+            max_nodes=max_nodes, exact_nodes=exact_nodes,
+        )
+        count = model.NewIntVar(1, group_bound, f"regional_count_{k}")
+        model.Add(count == sum(row))
+        hints = _spanning_tree_flows(selected, local_nb, root_local)
+        net = [[] for _ in nodes]
+        for edge_index, (i, j) in enumerate(edges):
+            if edge_index % 128 == 0:
+                reason = cancellation()
+                if reason or time.monotonic() >= deadline:
+                    return seeds, reason or "UNKNOWN"
+            flow = model.NewIntVar(-flow_bound, flow_bound, f"regional_flow_{k}_{i}_{j}")
+            for endpoint in (i, j):
+                model.Add(flow <= flow_bound * row[endpoint])
+                model.Add(flow >= -flow_bound * row[endpoint])
+            net[i].append(flow)
+            net[j].append(-flow)
+            model.AddHint(flow, hints.get((i, j), 0) - hints.get((j, i), 0))
+        for i in range(n):
+            injected = model.NewIntVar(0, group_bound, f"regional_injected_{k}_{i}")
+            model.Add(injected <= group_bound * roots[i])
+            model.Add(sum(net[i]) == injected - row[i])
+            model.AddHint(row[i], int(i in selected_set))
+            model.AddHint(roots[i], int(i == root_local))
+            model.AddHint(injected, len(selected) if i == root_local else 0)
+        model.AddHint(count, len(selected))
+
+    objective = sum(int(local_u[i]) * row[i] for row in x for i in range(n))
+    baseline = int(u[seed_nodes].sum())
+    model.Add(objective >= baseline)
+    model.Maximize(objective)
+    reason = cancellation()
+    remaining_seconds = deadline - time.monotonic()
+    if reason or remaining_seconds <= 0:
+        return seeds, reason or "UNKNOWN"
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = remaining_seconds
+    solver.parameters.num_search_workers = max(1, int(workers))
+    done = threading.Event()
+    interrupted = []
+
+    def watch():
+        while not done.wait(0.1):
+            reason = cancellation()
+            if reason:
+                interrupted.append(reason)
+                solver.StopSearch()
+                return
+
+    watcher = threading.Thread(target=watch, daemon=True)
+    watcher.start()
+    try:
+        status = solver.Solve(model)
+    finally:
+        done.set()
+        watcher.join()
+    status_name = interrupted[0] if interrupted else solver.StatusName(status)
+    if status not in (cp_model.FEASIBLE, cp_model.OPTIMAL):
+        return seeds, status_name
+    candidate = [[nodes[i] for i in range(n) if solver.BooleanValue(row[i])] for row in x]
+    flat = [v for unit in candidate for v in unit]
+    if (len(flat) != len(set(flat)) or int(u[flat].sum()) < baseline
+            or not all(component_ok(unit, u, E, P, tau, pop_thresh, nb,
+                                    max_nodes=max_nodes,
+                                    exact_nodes=exact_nodes)
+                       and bool(set(unit) & set(seed))
+                       for unit, seed in zip(candidate, seeds))):
+        return seeds, "INVALID_RESULT"
+    return candidate, status_name
+
+
+def _regional_exchange_pass(assignments, nb, u, E, P, tau, pop_thresh,
+                            seconds, workers, *, max_nodes=None, exact_nodes=None,
+                            stop_path=None, skip_path=None, log=False,
+                            exchange_state=None, eligible_ids=None,
+                            stop_after_gain=False, stage="REGIONAL_EXCHANGE"):
+    """Share four neighborhood attempts and at most 180s across build stages.
+
+    Each solve receives at most 60s. Only strict total gains are committed;
+    other ASUs remain fixed. Rebuild neighborhoods after each accepted exchange.
+    """
+    current = assignments.copy()
+    state = exchange_state if exchange_state is not None else _RegionalExchangeState(seconds)
+    started = time.monotonic()
+    deadline = started + min(state.remaining_seconds, max(0.0, float(seconds)))
+    try:
+        while state.attempt_count < 4:
+            if time.monotonic() >= deadline or _stop_requested(stop_path):
+                break
+            if _stop_requested(skip_path):
+                _consume_flag(skip_path)
+                break
+            chosen = None
+            # Give distinct small neighborhoods a look before widening to two
+            # hops. Identical narrow/wide windows share the attempt history.
+            for halo_hops in (1, 2):
+                for ids, nodes in _regional_exchange_windows(
+                    current, nb, u, halo_hops=halo_hops, eligible_ids=eligible_ids
+                ):
+                    units = [np.flatnonzero(current == k).tolist() for k in ids]
+                    # Identity survives provisional/final ASU relabeling.
+                    key = (tuple(sorted(tuple(unit) for unit in units)), tuple(nodes),
+                           as_fraction_tau(tau), int(pop_thresh), max_nodes, exact_nodes)
+                    if key not in state.attempted:
+                        chosen = ids, nodes, units, key
+                        break
+                if chosen is not None:
+                    break
+            if chosen is None:
+                break
+            ids, nodes, units, key = chosen
+            seconds_left = min(60.0, deadline - time.monotonic())
+            if seconds_left <= 0:
+                break
+            state.attempt_count += 1
+            if log:
+                print(f"[STAGE] {stage} attempt={state.attempt_count} asus={ids} "
+                      f"tracts={len(nodes)} seconds={seconds_left:.1f}", flush=True)
+            candidate, status = _solve_regional_exchange(
+                units, nodes, nb, u, E, P, tau, pop_thresh, seconds_left, workers,
+                max_nodes=max_nodes, exact_nodes=exact_nodes,
+                stop_path=stop_path, skip_path=skip_path,
+            )
+            if status not in ("STOPPED", "SKIPPED", "DISABLED", "INVALID_SEED", "INVALID_RESULT"):
+                state.attempted.add(key)
+            flat = [v for unit in candidate for v in unit]
+            valid = (len(candidate) == len(ids) and len(flat) == len(set(flat))
+                     and set(flat).issubset(nodes)
+                     and all(component_ok(unit, u, E, P, tau, pop_thresh, nb,
+                                          max_nodes=max_nodes, exact_nodes=exact_nodes)
+                             and bool(set(unit) & set(seed))
+                             for unit, seed in zip(candidate, units)))
+            before = sum(int(u[unit].sum()) for unit in units)
+            gain = int(u[flat].sum()) - before if valid else 0
+            if valid and gain > 0:
+                trial = current.copy()
+                trial[np.isin(trial, ids)] = -1
+                for k, unit in zip(ids, candidate):
+                    trial[unit] = k
+                current = trial
+            if log:
+                action = "accepted" if valid and gain > 0 else "retained incumbent"
+                print(f"[REGIONAL EXCHANGE] {action}: asus={ids}, gain={gain}, "
+                      f"status={status}", flush=True)
+            if (status in ("STOPPED", "SKIPPED") or _stop_requested(stop_path)
+                    or (stop_after_gain and valid and gain > 0)):
+                break
+        return current
+    finally:
+        state.remaining_seconds = max(0.0, state.remaining_seconds - (time.monotonic() - started))
+
+
+def _repair_takeover_donor(
+    donor_remaining: Sequence[int],
+    available_nodes: Sequence[int],
+    nb: List[List[int]],
+    u: np.ndarray,
+    E: np.ndarray,
+    P: np.ndarray,
+    tau: float,
+    pop_thresh: int,
+    time_limit: float,
+    workers: int,
+    *,
+    stable_values: Optional[Sequence[str]] = None,
+    rel_gap: Optional[float] = None,
+    log: bool = False,
+    solve_kwargs: Optional[Dict[str, object]] = None,
+) -> List[int]:
+    """Preserve all donor survivors first, then salvage a qualifying subset.
+
+    The donor may use only its surviving tracts and currently unassigned nodes.
+    Forcing the survivors lets the solve reconnect a split donor or add enough
+    population/rate capacity to make it qualify again. If the solve cannot
+    improve a still-valid donor, its surviving assignment is retained. Invalid
+    donors reserve half the solve budget for a variable-root partial repair.
+    """
+    donor = sorted({int(node) for node in donor_remaining})
+    if not donor:
+        return []
+
+    deadline = time.monotonic() + max(0.0, float(time_limit))
+    extra_kwargs = dict(solve_kwargs or {})
+    max_nodes = extra_kwargs.get("max_nodes")
+    exact_nodes = extra_kwargs.get("exact_nodes")
+    allowed = set(donor) | {int(node) for node in available_nodes}
+
+    def valid(nodes):
+        return (bool(set(nodes) & set(donor)) and set(nodes).issubset(allowed)
+                and component_ok(nodes, u, E, P, tau, pop_thresh, nb,
+                                 max_nodes=max_nodes, exact_nodes=exact_nodes))
+
+    donor_valid = valid(donor)
+
+    def salvage():
+        # Retain an already qualifying piece even if the search times out.
+        mask = np.zeros(len(nb), dtype=bool)
+        mask[donor] = True
+        pieces = [sorted(piece) for piece in _connected_components(nb, mask)]
+        candidates = [piece for piece in pieces if valid(piece)]
+        best = max(candidates, key=lambda nodes: (int(u[nodes].sum()), -len(nodes)), default=[])
+        seconds = deadline - time.monotonic()
+        if (seconds <= 0 or _stop_requested(extra_kwargs.get("stop_flag_path"))
+                or _stop_requested(extra_kwargs.get("skip_flag_path"))):
+            return best
+        repaired, status = _search_unassigned_asu(
+            sorted(allowed), nb, u, E, P, tau, pop_thresh,
+            seconds=seconds, workers=workers,
+            stop_path=extra_kwargs.get("stop_flag_path"),
+            skip_path=extra_kwargs.get("skip_flag_path"),
+            donor_nodes=donor, max_nodes=max_nodes, exact_nodes=exact_nodes,
+        )
+        if valid(repaired) and (not best or int(u[repaired].sum()) > int(u[best].sum())):
+            best = repaired
+        if log:
+            print(f"  donor partial salvage: {status}, retained unemployment="
+                  f"{int(u[best].sum()) if best else 0}", flush=True)
+        return best
+
+    root_global = _pick_capacity_root(donor, u, E, P, tau)
+
+    reachable = {root_global}
+    queue = [root_global]
+    head = 0
+    while head < len(queue):
+        node = queue[head]
+        head += 1
+        for neighbor in nb[node]:
+            if neighbor in allowed and neighbor not in reachable:
+                reachable.add(neighbor)
+                queue.append(neighbor)
+
+    # A forced survivor outside the root's available component makes repair
+    # impossible because no allowed connector can join the pieces.
+    if not set(donor).issubset(reachable):
+        return salvage()
+
+    sub = sorted(reachable)
+    local_index = {global_node: local_node for local_node, global_node in enumerate(sub)}
+    nb_local = [
+        sorted(
+            local_index[neighbor]
+            for neighbor in nb[global_node]
+            if neighbor in local_index
+        )
+        for global_node in sub
+    ]
+    donor_local = sorted(local_index[node] for node in donor)
+    root_local = int(local_index[root_global])
+    stable = (
+        [str(stable_values[node]) for node in sub]
+        if stable_values is not None
+        else [str(node).zfill(12) for node in sub]
+    )
+    stable_order = sorted(range(len(sub)), key=lambda node: (stable[node], node))
+    tie_break_rank = [0] * len(sub)
+    for rank, local_node in enumerate(stable_order):
+        tie_break_rank[local_node] = rank
+
+    remaining = max(0.0, deadline - time.monotonic())
+    if remaining <= 0:
+        return donor if donor_valid else salvage()
+    result = solve_one_asu_cpsat(
+        nb_local=nb_local,
+        u_g=u[sub],
+        E_g=E[sub],
+        P_g=P[sub],
+        tau=tau,
+        pop_thresh=pop_thresh,
+        root_local=root_local,
+        time_limit=remaining if donor_valid else remaining / 2.0,
+        workers=workers,
+        rel_gap=rel_gap,
+        log=log,
+        hint=donor_local,
+        hint_obj=int(u[donor].sum()) if donor_valid else None,
+        forced_selected=donor_local,
+        tie_break_rank=tie_break_rank,
+        **extra_kwargs,
+    )
+    if result is None:
+        return donor if donor_valid else salvage()
+
+    repaired = sorted(sub[local_node] for local_node in result.sel_idx_local)
+    if valid(repaired) and set(donor).issubset(repaired):
+        if donor_valid and int(u[repaired].sum()) < int(u[donor].sum()):
+            return donor
+        return repaired
+    return donor if donor_valid else salvage()
+
+
 def solve_asu_graph_cut_only(
     nb_local: List[List[int]],
     u_g: np.ndarray,
@@ -6089,6 +6863,8 @@ def solve_asu_graph_cut_only(
 
     nb_c, u_c, E_c, P_c, expand_c, node_map_c = contract_high_ur_nodes(nb_local, u_g, E_g, P_g, tau)
     nb_local_orig, u_g_orig, root_local_orig = nb_local, u_g, root_local
+    E_g_orig, P_g_orig = E_g, P_g
+    required_orig = sorted({int(root_local)} | set(forced_selected or []))
     nb_local, u_g, E_g, P_g = nb_c, u_c, E_c, P_c
     N = len(nb_local)
     root_local = int(node_map_c[root_local_orig])
@@ -6097,6 +6873,9 @@ def solve_asu_graph_cut_only(
         if not sel:
             return None
         orig = sorted({v for ri in sel for v in expand_c[ri]})
+        if not component_ok(orig, u_g_orig, E_g_orig, P_g_orig, tau, pop_thresh,
+                            nb_local_orig, required=required_orig, max_nodes=max_nodes):
+            raise ValueError("Graph-cut solve returned an invalid expanded ASU")
         return CpsatResult(orig, root_local_orig, int(u_g_orig[orig].sum()), status)
 
     forced_set = {int(node_map_c[int(v)]) for v in (forced_selected or [])}
@@ -6125,10 +6904,10 @@ def solve_asu_graph_cut_only(
         candidate_hint = sorted({
             int(node_map_c[int(v)]) for v in hint if 0 <= int(v) < len(node_map_c)
         })
-        if (
-            forced_set.issubset(candidate_hint)
-            and (max_nodes is None or len(candidate_hint) <= int(max_nodes))
-            and component_ok(candidate_hint, u_g, E_g, P_g, tau, pop_thresh, nb_local)
+        expanded_hint = sorted({v for ri in candidate_hint for v in expand_c[ri]})
+        if component_ok(
+            expanded_hint, u_g_orig, E_g_orig, P_g_orig, tau, pop_thresh,
+            nb_local_orig, required=required_orig, max_nodes=max_nodes,
         ):
             hint_c = candidate_hint
 
@@ -6173,14 +6952,11 @@ def solve_asu_graph_cut_only(
                 model.Add(x[node] == 0)
 
     num, den = as_fraction_tau(tau)
-    pop_expr = sum(int(P_g[i]) * x[i] for i in range(N))
-    model.Add(pop_expr >= int(pop_thresh))
-    if max_nodes is not None:
-        size_c = [len(grp) for grp in expand_c]
-        model.Add(sum(size_c[i] * x[i] for i in range(N)) <= int(max_nodes))
-    lhs = sum(int(den) * int(u_g[i]) * x[i] for i in range(N)) \
-        - sum(int(num) * int(E_g[i]) * x[i] for i in range(N))
-    model.Add(lhs >= 0)
+    q_surplus = np.asarray(den * u_g - num * E_g, dtype=np.int64)
+    pop_expr, lhs = _add_asu_feasibility_constraints(
+        model, x, u_g, E_g, P_g, tau, pop_thresh,
+        tract_counts=[len(grp) for grp in expand_c], max_nodes=max_nodes,
+    )
 
     obj_expr = sum(int(u_g[i]) * x[i] for i in range(N))
     model.Maximize(obj_expr)
@@ -7244,6 +8020,14 @@ def build_many_asus_cpsat(
     # seed's tracts have been through a failed harvest+expand cycle, never
     # re-admit that exact tract set as a standalone seed again this build.
     poisoned_seeds: Set[Tuple[int, ...]] = set()
+    # Graph, economics, and solver settings are immutable within this build.
+    optimal_territories: Dict[Tuple, Tuple[int, ...]] = {}
+    polish_time_limit = (
+        standalone_expansion_time_limit
+        if final_asu_polish_time_limit is None
+        else float(final_asu_polish_time_limit)
+    )
+    regional_exchange_state = _RegionalExchangeState(polish_time_limit)
     while k < max_asus:
         if _stop_requested(stop_flag_path):
             if verbose:
@@ -7285,16 +8069,8 @@ def build_many_asus_cpsat(
         for ci, component in enumerate(components):
             comp_id[component] = ci
             comp_qualifies[ci] = can_hit_tau(u[component], E[component], P[component], [], tau, pop_thresh)
-        seed_qualifies = comp_qualifies[comp_id[cand_seeds]]
-
-        # Prioritize seeds whose component already qualifies as a standalone ASU,
-        # then UR (descending), then population (descending).
-        order = np.lexsort((
-            -df.loc[cand_seeds, "tract_pop2024"].to_numpy(),
-            -UR[cand_seeds],
-            -seed_qualifies.astype(np.int8),
-        ))
-        seed_pool = cand_seeds[order]
+        # Visit eligible seeds in the same capacity order used for every root.
+        seed_pool = _capacity_root_order(cand_seeds, u, E, P, tau)
 
         # ---- Select up to batch_size disjoint feasible windows ----
         reserved = np.zeros(n, dtype=bool)
@@ -7356,8 +8132,8 @@ def build_many_asus_cpsat(
                 continue
 
             # If s's own component already qualifies as a standalone ASU, keep the
-            # root inside it rather than letting a higher-UR tract elsewhere in the
-            # (much larger, under full_graph_window) window win the argmax below.
+            # root inside it rather than letting a higher-capacity tract elsewhere
+            # in the (much larger, under full_graph_window) window become the root.
             cand_root = cand
             if comp_qualifies[comp_id[s]]:
                 same_comp_local = np.fromiter(
@@ -7367,12 +8143,7 @@ def build_many_asus_cpsat(
                 if restricted.size > 0:
                     cand_root = restricted
 
-            top = cand_root[np.argmax(u_g[cand_root] / np.maximum(u_g[cand_root] + E_g[cand_root], 1e-12))]
-            tie = np.where(
-                (u_g / np.maximum(u_g + E_g, 1e-12)) == (u_g[top] / max(u_g[top] + E_g[top], 1e-12))
-            )[0]
-            tie = np.intersect1d(tie, cand_root)
-            root_local = int(tie[np.argmax(P_g[tie])]) if len(tie) > 1 else int(top)
+            root_local = _pick_capacity_root(cand_root, u_g, E_g, P_g, tau)
 
             if "geoid" in df.columns:
                 stable_values = [str(df.iloc[int(g)]["geoid"]) for g in sub]
@@ -7548,17 +8319,23 @@ def build_many_asus_cpsat(
                     seed_local = sorted(
                         local_index[node] for node in seed_global
                     )
-                    root_expansion = max(
-                        seed_local,
-                        key=lambda node: (
-                            u_expansion[node]
-                            / max(
-                                u_expansion[node] + E_expansion[node], 1e-12
-                            ),
-                            P_expansion[node],
-                            -node,
-                        ),
+                    root_expansion = _pick_capacity_root(
+                        seed_local, u_expansion, E_expansion, P_expansion, tau
                     )
+                    territory_key = (
+                        tuple(sorted(territory_global)),
+                        int(territory_global[root_expansion]), as_fraction_tau(tau),
+                        int(pop_thresh), max_nodes_per_asu, exact_nodes_per_asu,
+                    )
+                    cached = optimal_territories.get(territory_key)
+                    if cached is not None:
+                        if not seed_feasible or int(u[list(cached)].sum()) >= int(u[seed_global].sum()):
+                            if verbose:
+                                print(f"  [EXPAND] reused proven-optimal territory: "
+                                      f"{len(territory_global)} tracts", flush=True)
+                            return list(cached), "OPTIMAL"
+                        # A stronger feasible seed contradicts the certificate.
+                        optimal_territories.pop(territory_key)
 
                     if "geoid" in df.columns:
                         stable_values = [
@@ -7645,12 +8422,10 @@ def build_many_asus_cpsat(
                     )
                     expanded_valid = (
                         component_ok(
-                            expanded_global, u, E, P, tau, pop_thresh, nb
+                            expanded_global, u, E, P, tau, pop_thresh, nb,
+                            max_nodes=max_nodes_per_asu, exact_nodes=exact_nodes_per_asu,
                         )
-                        and (
-                            max_nodes_per_asu is None
-                            or len(expanded_global) <= max_nodes_per_asu
-                        )
+                        and territory_global[root_expansion] in expanded_global
                     )
                     if not expanded_valid:
                         return seed_global, "SEED FALLBACK: INVALID RESULT"
@@ -7659,6 +8434,8 @@ def build_many_asus_cpsat(
                     # unemployment to satisfy the rate/population constraints.
                     if seed_feasible and int(u[expanded_global].sum()) < seed_objective:
                         return seed_global, "SEED FALLBACK: OBJECTIVE REGRESSION"
+                    if result.status == "OPTIMAL" and (rel_gap is None or rel_gap == 0):
+                        optimal_territories[territory_key] = tuple(expanded_global)
                     return expanded_global, result.status
 
                 if len(round_seeds) > 1:
@@ -8066,7 +8843,7 @@ def build_many_asus_cpsat(
                     # Under full_graph_window every remaining seed shares this
                     # exact same window (nb_local/u_g/E_g/P_g unchanged), so
                     # marking just this seed tried and looping back to try the
-                    # next-highest-UR seed would re-pay the full cut-pass +
+                    # next-highest-capacity seed would re-pay the full cut-pass +
                     # exact-solve cost against an identical graph, only with a
                     # different forced root -- with no cheap way to predict
                     # which root (if any) would succeed. Stop instead of
@@ -8286,10 +9063,7 @@ def build_many_asus_cpsat(
                 u_g, E_g, P_g = u[sub], E[sub], P[sub]
 
                 group_local = [local_index[int(t)] for t in group_tracts]
-                root_local = max(
-                    group_local,
-                    key=lambda i: (u_g[i] / max(u_g[i] + E_g[i], 1e-12), P_g[i]),
-                )
+                root_local = _pick_capacity_root(group_local, u_g, E_g, P_g, tau)
 
                 if "geoid" in df.columns:
                     stable_values = [str(df.iloc[int(g)]["geoid"]) for g in sub]
@@ -8383,7 +9157,6 @@ def build_many_asus_cpsat(
     # quantity used for the UR constraint) as root each round, and stops once
     # no remaining tract has positive surplus left.
     if use_capacity_sweep and exact_nodes_per_asu is None and k < max_asus and not _stop_requested(stop_flag_path):
-        q_surplus_all = den * u.astype(np.int64) - num * E.astype(np.int64)
         swept_tried = np.zeros(n, dtype=bool)
         sweep_round = 0
         while k < max_asus:
@@ -8395,11 +9168,9 @@ def build_many_asus_cpsat(
             cand_idx = np.where(remaining & ~swept_tried)[0]
             if cand_idx.size == 0:
                 break
-            q_cand = q_surplus_all[cand_idx]
-            best_pos = int(np.argmax(q_cand))
-            if q_cand[best_pos] <= 0:
+            root_global = _pick_capacity_root(cand_idx, u, E, P, tau)
+            if den * int(u[root_global]) - num * int(E[root_global]) <= 0:
                 break
-            root_global = int(cand_idx[best_pos])
 
             allowed_idx = np.where(remaining)[0]
             r = int(r_start)
@@ -8541,11 +9312,6 @@ def build_many_asus_cpsat(
         if verbose and sweep_round:
             print(f"\n[SWEEP] finished: {sweep_round} window(s) tried, {k} total ASU(s) so far", flush=True)
 
-    polish_time_limit = (
-        standalone_expansion_time_limit
-        if final_asu_polish_time_limit is None
-        else float(final_asu_polish_time_limit)
-    )
     polish_enabled = (
         harvest_connectivity_free_asus
         and polish_time_limit > 0
@@ -8553,6 +9319,9 @@ def build_many_asus_cpsat(
         and exact_nodes_per_asu is None
     )
     polish_max_nodes = None if combine_capped else max_nodes_per_asu
+    # Per-run only: graph, economic data and solve settings are immutable here.
+    # Merges elsewhere need not repeat an identical reachable polish problem.
+    polish_attempts: set = set()
 
     def _polish_one_asu(
         asu_number: int,
@@ -8592,14 +9361,7 @@ def build_many_asus_cpsat(
                 )
             return True
 
-        root_global = max(
-            current_global,
-            key=lambda node: (
-                u[node] / max(u[node] + E[node], 1e-12),
-                P[node],
-                -node,
-            ),
-        )
+        root_global = _pick_capacity_root(current_global, u, E, P, tau)
 
         current_set = set(current_global)
         allowed_set = current_set | set(np.where(remaining)[0].astype(int).tolist())
@@ -8627,6 +9389,15 @@ def build_many_asus_cpsat(
 
         sub = sorted(reachable)
         filtered_unreachable = len(allowed_set) - len(sub)
+        attempt_key = _polish_attempt_key(
+            root_global, current_global, sub, tau, pop_thresh, polish_max_nodes
+        )
+        if attempt_key in polish_attempts:
+            if verbose:
+                print(f"[FINAL POLISH CACHE] ASU {asu_number}: unchanged root, "
+                      "incumbent and reachable window; skipping repeated attempt",
+                      flush=True)
+            return True
 
         local_index = {
             global_node: local_node
@@ -8748,6 +9519,9 @@ def build_many_asus_cpsat(
                 )
             return True
 
+        if (result.status not in ("STOPPED_FEASIBLE", "SKIPPED_FEASIBLE")
+                and not _stop_requested(stop_flag_path)):
+            polish_attempts.add(attempt_key)
         current_set = set(current_global)
         polished_set = set(polished_global)
         dropped = current_set - polished_set
@@ -8776,7 +9550,7 @@ def build_many_asus_cpsat(
             total_polish_unemp = int(u[np.where(asu_id > 0)[0]].sum())
             polish_ids.sort(
                 key=lambda asu_number: (
-                    -int(np.sum(asu_id == asu_number)),
+                    -int(u[asu_id == asu_number].sum()),
                     asu_number,
                 )
             )
@@ -8788,7 +9562,8 @@ def build_many_asus_cpsat(
                 )
                 print(
                     f"\n[FINAL POLISH] round {polish_round}: "
-                    f"{len(polish_ids)} ASU(s), each seeing all currently "
+                    f"{len(polish_ids)} ASU(s), most unemployment first, "
+                    "each seeing all currently "
                     f"unassigned tracts ({polish_time_limit:.1f}s each); "
                     f"total unemployment currently captured={total_polish_unemp}",
                     flush=True,
@@ -8846,13 +9621,48 @@ def build_many_asus_cpsat(
                 remaining[nodes] = False
             _emit_progress("FINAL_POLISH_MERGE")
 
-            if verbose:
-                print(
-                    f"[FINAL POLISH MERGE] round {polish_round}: "
-                    f"{len(committed_ids)} ASU(s) -> {len(merged_units)} "
-                    "transitive touching group(s); rerunning final polish",
-                    flush=True,
-                )
+                if verbose:
+                    print(
+                        f"[STAGE] FINAL_POLISH_MERGE round={polish_round} "
+                        f"checked={polish_position}/{len(polish_ids)} "
+                        f"after_asu={asu_number} merges={merge_count} "
+                        f"asus_before={len(committed_ids)} "
+                        f"asus_after={len(merged_units)} action=restart",
+                        flush=True,
+                    )
+                    print(
+                        f"[FINAL POLISH MERGE] round {polish_round}, "
+                        f"immediately after ASU {asu_number}: "
+                        f"{len(committed_ids)} ASU(s) -> {len(merged_units)} "
+                        "transitive touching group(s); restarting final polish",
+                        flush=True,
+                    )
+                restart_after_merge = True
+                break
+
+            if (
+                not polish_completed
+                or not merge_adjacent
+                or merge_sanity_failed
+            ):
+                break
+            if restart_after_merge:
+                continue
+            break
+
+    # Joint regional exchanges account for donor feasibility during selection,
+    # before the larger takeover's sequential donor-repair attempt.
+    if polish_time_limit > 0 and not _stop_requested(stop_flag_path):
+        exchanged = _regional_exchange_pass(
+            asu_id, nb, u, E, P, tau, pop_thresh, polish_time_limit, workers,
+            max_nodes=polish_max_nodes, exact_nodes=exact_nodes_per_asu,
+            stop_path=stop_flag_path, skip_path=skip_flag_path, log=verbose,
+            exchange_state=regional_exchange_state,
+        )
+        if not np.array_equal(exchanged, asu_id):
+            asu_id = exchanged
+            remaining = asu_id <= 0
+            _emit_progress("REGIONAL_EXCHANGE")
 
     # ---- Single-ASU full-visibility takeover pass ----
     # After polish/merge settles, let the single biggest (by unemployment
@@ -8878,14 +9688,7 @@ def build_many_asus_cpsat(
             total_before = int(u[np.where(asu_id > 0)[0]].sum())
             if component_ok(current_global, u, E, P, tau, pop_thresh, nb):
                 current_objective = int(u[current_global].sum())
-                root_local = max(
-                    current_global,
-                    key=lambda node: (
-                        u[node] / max(u[node] + E[node], 1e-12),
-                        P[node],
-                        -node,
-                    ),
-                )
+                root_local = _pick_capacity_root(current_global, u, E, P, tau)
                 if "geoid" in df.columns:
                     stable_values = [str(g) for g in df["geoid"].tolist()]
                 else:
