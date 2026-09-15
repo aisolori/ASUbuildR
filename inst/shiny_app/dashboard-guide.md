@@ -299,6 +299,9 @@ on the optional joint-expansion checkbox or the statewide graph-cuts checkbox.
 The pre-pass uses at most eight rounds, 60 seconds, and 15% of the remaining
 joint budget; it does not add time to that budget. Only validated connected
 solutions are retained. Cuts carry into the final exact flow model.
+Finite usable upper bounds reported by the pre-pass are also carried forward
+as explicit objective constraints (conservatively rounded upward). The bound
+comes from the solver's bound, never a disconnected incumbent's objective.
 The log uses `PARTITION_TOUCHING_JOINT_MODEL` (`graph_cuts=True`),
 `PARTITION_TOUCHING_JOINT_CUT_PASS`, `_CUT_ROUND`, `_CUT_COMPLETE`, and `_FLOW`.
 
@@ -311,6 +314,18 @@ memberships, reachable tracts, or budgets allow another attempt. A zero budget
 disables that check. Large touching clusters can cost more than single-ASU
 expansions. Ordinary individual expansion/polish roots remain fixed within
 each solve; **roots move in the touching joint solve**.
+
+**Skip during a touching solve** retains any eligible improvement, then defers
+that cluster until the other queued ASUs/candidate seeds have had a turn.
+The deferral survives boundary changes and round restarts; the log reports
+`DEFERRED_SKIP`. If there are no other groups, it stays deferred until a
+different ASU gets a turn. It does not immediately retry the same cluster.
+
+**Stop during expansion** retains valid current results and ends expansion
+without another optimization round. The completion log reports `outcome=stopped`,
+attempted and unattempted seed counts, and unresolved seeds. Unprocessed weak
+seeds are not reported as failed repairs or proven infeasible. The final map
+is a partial result, not a converged run.
 
 Live incumbent previews do not interrupt a solve to merge ASUs. Expansion,
 main-build, and polishing solves finish under their normal stopping conditions

@@ -6834,7 +6834,7 @@ def _joint_connectivity_cut_pass(model, x, root_rows, nb, u,
                                  fallback, valid_candidate, deadline, workers,
                                  cancellation, *, log=False, report=None,
                                  max_rounds=8, cut_limit=1024,
-                                 stage_prefix="STATEWIDE_JOINT"):
+                                 stage_prefix="STATEWIDE_JOINT", objective=None):
     """Solve/add root-aware cuts before flows; never publish disconnected groups.
 
     For v in C: x[v] <= sum(root[C]) + sum(x[boundary(C)]). A connected
@@ -6845,6 +6845,7 @@ def _joint_connectivity_cut_pass(model, x, root_rows, nb, u,
     best = [list(unit) for unit in fallback]
     best_obj = sum(int(u[unit].sum()) for unit in best)
     seen, rows, rounds, status_name = set(), 0, 0, "DISABLED"
+    upper_bound = None
     if log:
         print(f"[STAGE] {stage_prefix}_CUT_PASS groups={len(x)} "
               f"baseline_unemp={best_obj} time_limit={max(0, deadline-started):.3f}s "
@@ -6884,6 +6885,16 @@ def _joint_connectivity_cut_pass(model, x, root_rows, nb, u,
         groups = [[i for i, var in enumerate(row) if scout.BooleanValue(var)] for row in x]
         connected = valid_candidate(groups)
         value = sum(int(u[unit].sum()) for unit in groups)
+        # This is an upper bound on the relaxation, hence also on every
+        # connected solution. Never substitute the relaxed incumbent value.
+        # Round upward conservatively; ignore unusable/default response bounds.
+        bound = scout.BestObjectiveBound()
+        if (objective is not None and math.isfinite(bound)
+                and max(value, best_obj) <= bound < 2**53):
+            candidate_bound = math.ceil(bound)
+            if upper_bound is None or candidate_bound < upper_bound:
+                upper_bound = candidate_bound
+                model.Add(objective <= upper_bound)
         if connected and value >= best_obj:
             best, best_obj = groups, value
             if report is not None:
@@ -6915,12 +6926,14 @@ def _joint_connectivity_cut_pass(model, x, root_rows, nb, u,
             print(f"[STAGE] {stage_prefix}_CUT_ROUND round={round_number} "
                   f"status={status_name} relaxed_unemp={value} connected={connected} "
                   f"detached_components={detached} cuts_added={added} cuts_total={rows} "
-                  f"valid_unemp={best_obj} elapsed={time.monotonic()-started:.3f}s", flush=True)
+                  f"valid_unemp={best_obj} upper_bound={upper_bound} "
+                  f"elapsed={time.monotonic()-started:.3f}s", flush=True)
         if interrupted or connected or not added:
             break
     if log:
         print(f"[STAGE] {stage_prefix}_CUT_COMPLETE status={status_name} "
               f"rounds={rounds} cuts={rows} valid_unemp={best_obj} "
+              f"upper_bound={upper_bound} bound_carried_to_flow={upper_bound is not None} "
               f"elapsed={time.monotonic()-started:.3f}s", flush=True)
     return best, best_obj, status_name
 
@@ -6948,11 +6961,39 @@ def _joint_assignment_hints(model, x, roots, active, counts, selected_any,
             model.AddHint(prefix, int(visited))
 
 
+class _TouchingJointDeferrals:
+    """A skipped cluster waits for its peers, independent of labels/windows."""
+
+    def __init__(self):
+        self.pending = []
+
+    def defer(self, members, peers):
+        members = set(members)
+        waiting = [set(unit) for unit in peers if unit and members.isdisjoint(unit)]
+        self.pending.append((members, waiting))
+
+    def blocks(self, members):
+        return any(not members.isdisjoint(cluster) for cluster, _ in self.pending)
+
+    def note_turn(self, units):
+        pending = []
+        for cluster, waiting in self.pending:
+            seen = {v for unit in units if cluster.isdisjoint(unit) for v in unit}
+            if not seen:
+                pending.append((cluster, waiting))
+                continue
+            # With no peers, keep it deferred until a different ASU gets a turn.
+            remaining = [unit for unit in waiting if unit.isdisjoint(seen)]
+            if remaining:
+                pending.append((cluster, remaining))
+        self.pending = pending
+
+
 def _reoptimize_touching_asu_units(
     units, available_nodes, nb, u, E, P, tau, pop_thresh, seconds, workers, *,
     max_nodes=None, exact_nodes=None, stop_path=None, skip_path=None,
     attempted=None, log=False, rel_gap=None, incumbent_stall_seconds=None,
-    source="partition", preview_factory=None,
+    source="partition", preview_factory=None, deferrals=None, peer_units=None,
 ):
     """Reoptimize one touching cluster; never replace a failed solve by a union.
 
@@ -6999,6 +7040,12 @@ def _reoptimize_touching_asu_units(
             break
         seeds = [original[i] for i in cluster]
         seed_set = {v for unit in seeds for v in unit}
+        if deferrals is not None and deferrals.blocks(seed_set):
+            if log:
+                print(f"[STAGE] PARTITION_TOUCHING_JOINT_COMPLETE source={source} "
+                      f"status=DEFERRED_SKIP accepted=0 groups={len(seeds)} "
+                      "reason=waiting_for_other_asus", flush=True)
+            continue
         allowed = free | seed_set
         reached, stack = set(seed_set), list(seed_set)
         while stack:
@@ -7046,6 +7093,11 @@ def _reoptimize_touching_asu_units(
         active = sum(bool(unit) for unit in candidate) if valid else len(seeds)
         accepted = valid and (objective > baseline or
                               (objective == baseline and active < len(seeds)))
+        if deferrals is not None:
+            deferrals.note_turn(seeds)
+            if status == "SKIPPED":
+                deferrals.defer(seed_set | (set(selected) if accepted else set()),
+                                original if peer_units is None else peer_units)
         if status not in ("STOPPED", "SKIPPED"):
             attempted.add(signature)
         if log:
@@ -7306,7 +7358,7 @@ def _solve_regional_exchange(units, nodes, nb, u, E, P, tau, pop_thresh,
             model, x, root_rows, local_nb, local_u, hint_units,
             valid_local_candidate, time.monotonic() + min(60.0, .15 * remaining),
             workers, cancellation, log=log, report=incumbent_report_callback,
-            stage_prefix=stage_prefix)
+            stage_prefix=stage_prefix, objective=objective)
         if best_obj > baseline:
             fallback = [[nodes[i] for i in group] for group in best]
             baseline = best_obj
@@ -9256,8 +9308,9 @@ def build_many_asus_cpsat(
         )
 
     touching_attempts = set()
+    touching_deferrals = _TouchingJointDeferrals()
 
-    def _resolve_touching_units(units, source, seconds, protected_nodes=()):
+    def _resolve_touching_units(units, source, seconds, protected_nodes=(), peer_units=None):
         if not merge_adjacent:
             return units, 0
         if not harvest_connectivity_free_asus:
@@ -9278,6 +9331,7 @@ def build_many_asus_cpsat(
                 attempted=touching_attempts, log=verbose, rel_gap=rel_gap,
                 incumbent_stall_seconds=incumbent_stall_seconds,
                 source=source, preview_factory=preview_factory,
+                deferrals=touching_deferrals, peer_units=peer_units,
             )
         finally:
             _clear_incumbent_previews()
@@ -9537,8 +9591,33 @@ def build_many_asus_cpsat(
             expansion_round = 0
             commit_seeds = active_units
             final_statuses = ["SEED ONLY"] * len(active_units)
+            expansion_started = time.monotonic()
+
+            def _retain_stopped_expansion(candidates, attempted, scheduled, joint_updates=0):
+                nonlocal active_units, commit_seeds, final_statuses
+                valid = [unit for unit in candidates if component_ok(
+                    unit, u, E, P, tau, pop_thresh, nb,
+                    max_nodes=max_nodes_per_asu, exact_nodes=exact_nodes_per_asu)]
+                # Invalid pending seeds were never established ASUs. Do not
+                # poison them or describe interruption as proof of infeasibility.
+                active_units = valid
+                commit_seeds = valid
+                final_statuses = ["STOPPED: RETAINED"] * len(valid)
+                if verbose:
+                    print(f"[STAGE] PARTITION_EXPANSION_COMPLETE round={expansion_round} "
+                          f"outcome=stopped scheduled={scheduled} attempted={attempted} "
+                          f"unattempted={scheduled - attempted} valid={len(valid)} "
+                          f"unresolved_seeds={len(candidates) - len(valid)} "
+                          f"joint_updates={joint_updates} output_groups={len(valid)} "
+                          f"retained_unemp={sum(int(u[unit].sum()) for unit in valid)} "
+                          f"elapsed={time.monotonic() - expansion_started:.3f}s", flush=True)
+
             while True:
+                if _stop_requested(stop_flag_path):
+                    _retain_stopped_expansion(active_units, 0, len(active_units))
+                    break
                 expansion_round += 1
+                expansion_attempted_indices = set()
                 if joint_partition_expansion:
                     active_units = sorted(active_units, key=_partition_seed_key)
                 round_seeds = active_units
@@ -9605,6 +9684,7 @@ def build_many_asus_cpsat(
                     ):
                         return seed_global, "SEED ONLY"
 
+                    expansion_attempted_indices.add(unit_index)
                     local_index = {
                         global_node: local_node
                         for local_node, global_node in enumerate(territory_global)
@@ -9750,7 +9830,10 @@ def build_many_asus_cpsat(
                 immediate_merged_units: Optional[List[List[int]]] = None
                 immediate_merge_count = 0
                 for batch_number, batch in enumerate(batches, 1):
+                    if _stop_requested(stop_flag_path):
+                        break
                     if joint_partition_expansion:
+                        expansion_attempted_indices.update(batch)
                         batch_seeds = [round_seeds[i] for i in batch]
                         batch_nodes = sorted({v for i in batch for v in territories[i]})
                         batch_started = time.monotonic()
@@ -9792,6 +9875,7 @@ def build_many_asus_cpsat(
                                   f"elapsed={time.monotonic() - batch_started:.3f}s", flush=True)
                     else:
                         expanded_results.append(_expand_standalone(batch[0]))
+                    touching_deferrals.note_turn([round_seeds[i] for i in batch])
                     if (
                         not merge_adjacent
                         or _stop_requested(stop_flag_path)
@@ -9824,6 +9908,7 @@ def build_many_asus_cpsat(
                             "expansion", standalone_expansion_time_limit,
                             protected_nodes=[v for unit in protected_units + pending_weak_units
                                              for v in unit],
+                            peer_units=round_seeds,
                         )
                         if len(provisional_valid_units) > 1
                         else (provisional_valid_units, 0)
@@ -9853,6 +9938,14 @@ def build_many_asus_cpsat(
 
                 _clear_incumbent_previews()
                 attempted_statuses = [status for _, status in expanded_results]
+                if _stop_requested(stop_flag_path):
+                    retained = (immediate_merged_units if immediate_merged_units is not None
+                                else [unit for unit, _ in expanded_results]
+                                + round_seeds[len(expanded_results):])
+                    _retain_stopped_expansion(
+                        retained, len(expansion_attempted_indices), attempted_seed_count,
+                        immediate_merge_count)
+                    break
                 if immediate_merged_units is not None:
                     # Retire only attempted seeds whose expansion failed.
                     # Unattempted weak seeds were carried into
@@ -9946,6 +10039,11 @@ def build_many_asus_cpsat(
                     expanded_units, "expansion_round", standalone_expansion_time_limit,
                     protected_nodes=[v for unit in protected_units for v in unit],
                 ) if should_merge else (expanded_units, 0)
+                if _stop_requested(stop_flag_path):
+                    _retain_stopped_expansion(
+                        merged_units, len(expansion_attempted_indices), attempted_seed_count,
+                        merge_count)
+                    break
                 round_gain = (
                     sum(int(u[nodes].sum()) for nodes in expanded_units)
                     - sum(int(u[nodes].sum()) for nodes in round_seeds
@@ -10101,6 +10199,9 @@ def build_many_asus_cpsat(
                 ):
                     pass
                 continue
+
+        if _stop_requested(stop_flag_path):
+            break
 
         # Under a per-ASU cap, a window can fail for structural reasons that are
         # a property of the (unchanged) remaining graph, not of which seed
@@ -10541,6 +10642,7 @@ def build_many_asus_cpsat(
             remaining[S_final] = False
             tried[S_final] = False
             _emit_progress("MAIN_COMMIT")
+            touching_deferrals.note_turn([S_final])
 
             if verbose:
                 su, sE, sP = int(u[S_final].sum()), int(E[S_final].sum()), int(P[S_final].sum())
@@ -10905,6 +11007,7 @@ def build_many_asus_cpsat(
             asu_id[S_final] = k
             remaining[S_final] = False
             _emit_progress("CAPACITY_SWEEP")
+            touching_deferrals.note_turn([S_final])
             if verbose:
                 su, sE, sP = int(u[S_final].sum()), int(E[S_final].sum()), int(P[S_final].sum())
                 ur_value = 100.0 * ur_of(su, sE)
@@ -11253,6 +11356,7 @@ def build_many_asus_cpsat(
                         print("[STAGE] FINAL_POLISH_RECHECK_LIMIT reason=time_budget", flush=True)
                     return
                 attempt_started = time.monotonic()
+                turn_nodes = np.flatnonzero(asu_id == asu_number).tolist()
                 completed = _polish_one_asu(
                     asu_number,
                     polish_position,
@@ -11267,6 +11371,7 @@ def build_many_asus_cpsat(
                 if not completed:
                     polish_completed = False
                     break
+                touching_deferrals.note_turn([turn_nodes])
                 if not merge_adjacent:
                     continue
 

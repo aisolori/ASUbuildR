@@ -97,6 +97,38 @@ class TouchingJointTest(unittest.TestCase):
         _, solve = self.run_case([[0], [1]], [3, 4, 5, 6])
         self.assertEqual(solve.call_args.args[1], [0, 1])
 
+    def test_skipped_improvement_defers_changed_cluster_until_all_peers_get_turn(self):
+        state = solver._TouchingJointDeferrals()
+        units = [[0], [1], [4], [6]]
+        (updated, changes), _ = self.run_case(
+            units, [2], ([[0], [1, 2]], "SKIPPED"), deferrals=state,
+            peer_units=units + [[8]], n=9)
+        self.assertEqual(changes, 1)
+        self.assertEqual(updated, [[0], [1, 2], [4], [6]])
+        for turns in ([[0], [1, 2]], [[4]], [[6]]):
+            state.note_turn(turns)
+            _, solve = self.run_case(updated, [3, 5], deferrals=state, n=9)
+            solve.assert_not_called()
+        state.note_turn([[8]])  # Includes weak/pending seeds, not only valid ASUs.
+        _, solve = self.run_case(updated, [3, 5], deferrals=state, n=9)
+        solve.assert_called_once()
+
+    def test_skip_without_gain_or_peers_does_not_immediately_retry(self):
+        state = solver._TouchingJointDeferrals()
+        self.run_case([[0], [1]], [2], ([[0], [1]], "SKIPPED"), deferrals=state)
+        state.note_turn([[0], [1]])
+        _, solve = self.run_case([[0], [1]], [2, 3], deferrals=state)
+        solve.assert_not_called()
+        state.note_turn([[5]])
+        _, solve = self.run_case([[0], [1]], [2, 3], deferrals=state)
+        solve.assert_called_once()
+
+    def test_joint_peer_batch_counts_other_groups_even_with_cluster_member(self):
+        state = solver._TouchingJointDeferrals()
+        state.defer({0, 1}, [[0], [1], [4], [6]])
+        state.note_turn([[0], [4], [6]])
+        self.assertFalse(state.blocks({0, 1}))
+
     def test_more_than_three_touching_groups_use_one_model(self):
         units = [[0], [1], [2], [3]]
         _, solve = self.run_case(units, [4, 5, 6])
@@ -161,7 +193,7 @@ class TouchingJointTest(unittest.TestCase):
         self.assertFalse(has_flow(models[0]))
         self.assertTrue(has_flow(models[-1]))
         self.assertTrue(all(0 < limit <= .75 for limit in limits[:-1]))
-        self.assertTrue(0 < limits[-1] < 5)
+        self.assertTrue(0 < limits[-1] <= 5)
         for i, row in enumerate(cut_models[0].Proto().constraints):
             self.assertEqual(str(row), str(models[-1].Proto().constraints[i]))
         log = output.getvalue()

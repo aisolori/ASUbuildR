@@ -2023,7 +2023,7 @@ shiny::observeEvent(input$skip_asu, {
   shiny::req(!is.null(kf), isTRUE(cpsat_running()))
   if (!file.exists(kf)) file.create(kf)
   cpsat_stage_text("skip current asu requested")
-  append_cpsat_log("[run] Skip requested by user; committing current ASU's incumbent and moving to the next one…")
+  append_cpsat_log("[run] Skip requested; ending the current solve and retaining eligible incumbent improvements. Touching clusters wait for other queued ASUs before retrying.")
 })
 
 # Add this observer to handle closing the log manually

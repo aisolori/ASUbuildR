@@ -124,6 +124,14 @@ class StatewideGraphCutsTest(unittest.TestCase):
             self.assertEqual(self.check_assignment(templates[0], [group]), solver.cp_model.OPTIMAL)
         self.assertIn("connected=False", output.getvalue())
         self.assertIn("STATEWIDE_JOINT_FLOW", output.getvalue())
+        self.assertIn("bound_carried_to_flow=True", output.getvalue())
+        # The final model explicitly retains the pre-pass upper bound, rather
+        # than forcing its fresh solver to rediscover it from the graph cuts.
+        objective_coeffs = dict(zip(models[-1].Proto().objective.vars,
+                                    [-c for c in models[-1].Proto().objective.coeffs]))
+        upper_rows = [list(row.linear.domain)[-1] for row in models[-1].Proto().constraints
+                      if dict(zip(row.linear.vars, row.linear.coeffs)) == objective_coeffs]
+        self.assertIn(101, upper_rows)
         # Improved connected pre-pass incumbent supplies consistent complete hints.
         final = models[-1]
         hints = final.Proto().solution_hint
@@ -157,8 +165,21 @@ class StatewideGraphCutsTest(unittest.TestCase):
                              msg=f"seeds={seeds}, consolidate={consolidate}, tighten={tighten}")
 
     def test_every_prepass_and_flow_solve_uses_portfolio_and_shared_budget(self):
-        with patch.object(solver, "_configure_asu_solver_portfolio",
-                          wraps=solver._configure_asu_solver_portfolio) as configure:
+        clock = solver.time.monotonic
+        cut_pass = solver._joint_connectivity_cut_pass
+        elapsed = [0.0]
+
+        def timed_pass(*args, **kwargs):
+            result = cut_pass(*args, **kwargs)
+            # Tiny models may finish within one Windows clock tick. Simulate
+            # measurable pre-pass work so budget subtraction is deterministic.
+            elapsed[0] += .25
+            return result
+
+        with (patch.object(solver.time, "monotonic", side_effect=lambda: clock() + elapsed[0]),
+              patch.object(solver, "_joint_connectivity_cut_pass", side_effect=timed_pass),
+              patch.object(solver, "_configure_asu_solver_portfolio",
+                           wraps=solver._configure_asu_solver_portfolio) as configure):
             _, models, _ = self.solve([[1], [0]], [10, 1], [0, 0], [10000]*2,
                                       [[0], []], use_joint_cuts=True,
                                       relaxed_selection_hint=[0, 1])
@@ -167,7 +188,7 @@ class StatewideGraphCutsTest(unittest.TestCase):
         limits = [call.args[0].max_time_in_seconds for call in configure.call_args_list]
         self.assertGreater(len(limits), 1)
         self.assertTrue(all(0 < limit <= .75 for limit in limits[:-1]))
-        self.assertTrue(0 < limits[-1] < 5)
+        self.assertTrue(0 < limits[-1] <= 4.75)
 
     def test_connected_prepass_improvement_survives_unknown_flow_solve(self):
         real_solve = solver.cp_model.CpSolver.Solve
@@ -227,6 +248,40 @@ class StatewideGraphCutsTest(unittest.TestCase):
             _, models, _ = self.solve([[1], [0]], [10, 1], [0, 0], [10000]*2,
                                       [[0], []], use_joint_cuts=False)
         self.assertEqual(len(models), 1)
+
+    def test_prepass_uses_reported_upper_bound_not_incumbent_and_rounds_up(self):
+        for reported, expected in ((35.25, 36), (35.0, 35), (29.0, None),
+                                   (float("nan"), None), (float("inf"), None),
+                                   (float(2**53), None)):
+            with self.subTest(reported=reported):
+                model = solver.cp_model.CpModel()
+                row = [model.NewBoolVar("a"), model.NewBoolVar("b")]
+                model.Add(row[0] == 1)
+                objective = 10 * row[0] + 20 * row[1]
+                model.Maximize(objective)
+                with patch.object(solver.cp_model.CpSolver, "BestObjectiveBound", return_value=reported):
+                    _, best, _ = solver._joint_connectivity_cut_pass(
+                        model, [row], [row], [[1], [0]], np.array([10, 20]),
+                        [[0]], lambda groups: True, time.monotonic()+2, 2,
+                        lambda: None, objective=objective)
+                self.assertEqual(best, 30)
+                self.assertEqual(len(model.Proto().constraints), 1 if expected is None else 2)
+                if expected is not None:
+                    constraints = model.Proto().constraints
+                    self.assertEqual(list(constraints[len(constraints)-1].linear.domain)[-1], expected)
+
+    def test_unknown_prepass_does_not_import_default_zero_bound(self):
+        model = solver.cp_model.CpModel()
+        row = [model.NewBoolVar("a")]
+        model.Maximize(10 * row[0])
+        with (patch.object(solver.cp_model.CpSolver, "Solve", return_value=solver.cp_model.UNKNOWN),
+              patch.object(solver.cp_model.CpSolver, "BestObjectiveBound", return_value=0) as bound):
+            groups, best, status = solver._joint_connectivity_cut_pass(
+                model, [row], [row], [[]], np.array([10]), [[0]], lambda groups: True,
+                time.monotonic()+2, 2, lambda: None, objective=10 * row[0])
+        bound.assert_not_called()
+        self.assertEqual((groups, best, status), ([[0]], 10, "UNKNOWN"))
+        self.assertEqual(len(model.Proto().constraints), 0)
 
 
 if __name__ == "__main__":
