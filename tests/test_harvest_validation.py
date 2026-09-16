@@ -42,8 +42,10 @@ class HarvestValidationTest(unittest.TestCase):
                          side_effect=territories),
             patch.object(solver, "solve_one_asu_cpsat", return_value=solve_result) as solve,
             patch.object(solver, "_solve_regional_exchange", side_effect=joint) as merge,
+            # These tests isolate harvest validation; safe-union behavior has
+            # dedicated coverage in test_touching_joint.
             patch.object(solver, "_merge_touching_asu_units",
-                         side_effect=AssertionError("partition must not auto-merge")),
+                         side_effect=lambda units, *args, **kwargs: (units, 0)),
             contextlib.redirect_stdout(log),
         ):
             neighbors = [

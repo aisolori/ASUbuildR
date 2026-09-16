@@ -49,7 +49,6 @@ class LateStageMergeTest(unittest.TestCase):
             hint_source="test", n_contracted=6, root_component=[0],
         )
         events, callbacks = [], []
-        exchanged_once = False
         screened = 0
 
         def screen(*args, **kwargs):
@@ -88,16 +87,6 @@ class LateStageMergeTest(unittest.TestCase):
                 return solver.CpsatResult([0, 1, 2], 0, 22, "FEASIBLE")
             return None
 
-        def exchange(assignments, *args, **kwargs):
-            nonlocal exchanged_once
-            self.assertTrue(kwargs["stop_after_gain"])
-            events.append(("exchange", tuple(assignments)))
-            changed = assignments.copy()
-            if mode == "exchange" and not exchanged_once:
-                changed[1:3] = changed[0]
-                exchanged_once = True
-            return changed
-
         def residual(nodes, *args, **kwargs):
             events.append(("residual", tuple(nodes)))
             if mode == "residual" and 1 in nodes:
@@ -121,10 +110,14 @@ class LateStageMergeTest(unittest.TestCase):
             patch.object(solver, "_partition_standalone_expansion_territories",
                          side_effect=lambda seeds, *a, **kw: [list(s) for s in seeds]),
             patch.object(solver, "solve_one_asu_cpsat", side_effect=solve),
-            patch.object(solver, "_regional_exchange_pass", side_effect=exchange),
+            patch.object(
+                solver, "_regional_exchange_pass",
+                side_effect=AssertionError("post-polish regional exchange must be skipped"),
+            ),
             patch.object(solver, "_solve_regional_exchange", side_effect=joint),
+            # Keep this harness focused on the controlled late joint result.
             patch.object(solver, "_merge_touching_asu_units",
-                         side_effect=AssertionError("partition must not auto-merge")),
+                         side_effect=lambda units, *args, **kwargs: (units, 0)),
             patch.object(solver, "_search_unassigned_asu", side_effect=residual),
             contextlib.redirect_stdout(log),
         ):
@@ -163,17 +156,16 @@ class LateStageMergeTest(unittest.TestCase):
         self.assertIn("incumbent_merge_check=disabled merge_check=after_solve", log)
         self.assertLess(events.index(("takeover", (0,))),
                         events.index(("polish", (0, 1, 2, 3))))
-        self.assertIn("PARTITION_TOUCHING_JOINT source=SINGLE_ASU_TAKEOVER_MERGE", log)
+        self.assertIn("PARTITION_TOUCHING_JOINT source=FINAL_POLISH_JOINT", log)
+        self.assertNotIn("PARTITION_TOUCHING_JOINT source=SINGLE_ASU_TAKEOVER_MERGE", log)
         self.assertIn("groups_before=2 groups_after=1", log)
 
-    def test_exchange_settles_merge_before_next_exchange(self):
+    def test_post_polish_regional_exchange_is_skipped(self):
         result, events, _, log = self.run_build("exchange")
-        self.assertEqual(result["asu_id"], [1, 1, 1, 1, -1, -1])
-        exchanges = [i for i, event in enumerate(events) if event[0] == "exchange"]
-        restarted = events.index(("polish", (0, 1, 2, 3)))
-        self.assertLess(exchanges[0], restarted)
-        self.assertLess(restarted, exchanges[1])
-        self.assertIn("PARTITION_TOUCHING_JOINT source=REGIONAL_EXCHANGE_MERGE", log)
+        self.assertEqual(result["asu_id"], [1, -1, -1, 2, -1, -1])
+        self.assertFalse(any(event[0] == "exchange" for event in events))
+        self.assertNotIn("[STAGE] REGIONAL_EXCHANGE", log)
+        self.assertNotIn("source=REGIONAL_EXCHANGE_MERGE", log)
 
     def test_residual_merge_rebuilds_queue_after_polishing(self):
         result, events, _, log = self.run_build("residual")
@@ -182,8 +174,9 @@ class LateStageMergeTest(unittest.TestCase):
                          [(1, 2), (5,)])
         self.assertIn(("polish", (0, 1)), events)
         self.assertIn(("polish", (0, 1, 2, 3)), events)
-        self.assertIn("PARTITION_TOUCHING_JOINT source=FINAL_RESIDUAL_MERGE", log)
-        self.assertIn("PARTITION_TOUCHING_JOINT source=FINAL_POLISH_MERGE", log)
+        self.assertIn("PARTITION_TOUCHING_JOINT source=FINAL_POLISH_JOINT", log)
+        self.assertNotIn("PARTITION_TOUCHING_JOINT source=FINAL_RESIDUAL_MERGE", log)
+        self.assertNotIn("PARTITION_TOUCHING_JOINT source=FINAL_POLISH_MERGE", log)
         self.assertTrue(result["residual_check"]["exhausted"])
 
     def test_late_merge_respects_tract_limit(self):

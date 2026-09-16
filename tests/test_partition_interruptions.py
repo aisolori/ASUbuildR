@@ -61,6 +61,8 @@ class PartitionInterruptionsTest(unittest.TestCase):
                   patch.object(solver, "_partition_standalone_expansion_territories", side_effect=territories),
                   patch.object(solver, "solve_one_asu_cpsat", side_effect=single),
                   patch.object(solver, "_solve_regional_exchange", side_effect=joint),
+                  patch.object(solver, "_merge_touching_asu_units",
+                               side_effect=lambda units, *args, **kwargs: (units, 0)),
                   patch.object(solver._TouchingJointDeferrals, "note_turn", new=note_turn),
                   contextlib.redirect_stdout(output)):
                 result = solver.build_many_asus_cpsat(

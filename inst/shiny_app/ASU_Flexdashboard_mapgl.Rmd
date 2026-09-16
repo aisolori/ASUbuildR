@@ -524,6 +524,22 @@ excel_names <- c("record",
                  "tract_ASU_urate")
 
 #-------- Map Rendering Helpers --------------------------------
+# Stable ASU colors. Gray is reserved for unassigned tracts, so do not add
+# neutral colors to this palette. The first seven entries preserve the colors
+# previously supplied by RColorBrewer's Accent palette; its gray eighth entry
+# is intentionally replaced with teal.
+ASU_COLORS <- c(
+  "#7FC97F", "#BEAED4", "#FDC086", "#FFFF99", "#386CB0",
+  "#F0027F", "#BF5B17", "#00A6A6", "#E41A1C", "#984EA3",
+  "#4DAF4A", "#FF7F00", "#A65628", "#1F78B4", "#E7298A",
+  "#66A61E", "#7570B3", "#D95F02", "#1B9E77", "#C51B7D"
+)
+
+asu_palette <- function(n) {
+  n <- max(0L, as.integer(n))
+  if (n == 0L) character(0) else rep_len(ASU_COLORS, n)
+}
+
 # Helper function to calculate color scheme (used for full layer rebuilds)
 calculate_color_scheme <- function(data) {
   number_asus <- max(data$asunum, na.rm = TRUE)
@@ -532,11 +548,11 @@ calculate_color_scheme <- function(data) {
   if (number_categories == 1) {
     asu_breaks <- 1
     actual_categories <- 1
-    brewer_pal <- "#7FC97F"
+    brewer_pal <- asu_palette(1L)
   } else {
     asu_breaks <- seq(from = 1, to = number_asus, length.out = number_categories)
     actual_categories <- max(3, number_categories)
-    full_brewer_pal <- RColorBrewer::brewer.pal(actual_categories, "Accent")
+    full_brewer_pal <- asu_palette(actual_categories)
     brewer_pal <- full_brewer_pal[1:number_categories]
   }
   
@@ -551,15 +567,10 @@ calculate_tract_colors <- function(data) {
   n_asu <- suppressWarnings(max(data$asunum, na.rm = TRUE))
   n_asu <- if (is.finite(n_asu) && n_asu > 0L) as.integer(n_asu) else 1L
 
-  if (n_asu == 1L) {
-    pal <- "#7FC97F"
-  } else {
-    n_cat <- min(max(n_asu, 3L), 8L)
-    pal <- RColorBrewer::brewer.pal(n_cat, "Accent")
-  }
+  pal <- asu_palette(n_asu)
 
-  # pal_ext[1] = grey (asunum 0), pal_ext[2..] = palette colors for asunum 1..n
-  pal_ext <- c("#E0E0E0", rep_len(pal, n_asu))
+  # pal_ext[1] = unassigned gray (asunum 0); the remaining colors are ASUs 1..n.
+  pal_ext <- c("#E0E0E0", pal)
   idx <- as.integer(data$asunum) + 1L   # asunum 0 -> index 1, asunum 1 -> index 2, …
   idx[is.na(idx) | idx < 1L | idx > length(pal_ext)] <- 1L
 
@@ -1182,17 +1193,16 @@ palette_logic <- function(n_asu) {
       fill = mapgl::step_expr(
         column = "asunum",
         base = "#E0E0E0",
-        stops = "#7FC97F",
+        stops = asu_palette(1L),
         values = 1,
         na_color = "#E0E0E0"
       ),
       legend_vals = 1,
-      legend_cols = "#7FC97F"
+      legend_cols = asu_palette(1L)
     )
   } else {
-    pal <- RColorBrewer::brewer.pal(min(max(n_asu, 3L), 8L), "Accent")
     legend_vals <- seq_len(n_asu)
-    legend_cols <- rep_len(pal, n_asu)
+    legend_cols <- asu_palette(n_asu)
 
     list(
       fill = mapgl::match_expr(
@@ -1526,7 +1536,7 @@ kwargs = dict(
     use_global_capacity_cardinality_bound=True,
     use_bridge_subtree_pruning=True,
     use_connectivity_free_repair=True,
-    connectivity_free_time_limit=60.0,
+    connectivity_free_time_limit=120.0,
     harvest_connectivity_free_asus=%s,
     partition_seed_strategy='%s',
     final_consolidation=%s,
@@ -1540,7 +1550,7 @@ kwargs = dict(
     statewide_tighten_model=%s,
     statewide_graph_cuts=%s,
     use_graph_cut_repair=True,
-    graph_cut_repair_time_limit=60,
+    graph_cut_repair_time_limit=120,
     standalone_expansion_time_limit=1800,
     incumbent_stall_seconds=%d,
     expansion_incumbent_stall_seconds=%d,

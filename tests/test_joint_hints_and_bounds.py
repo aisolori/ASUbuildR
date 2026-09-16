@@ -79,7 +79,102 @@ class JointHintsAndBoundsTest(unittest.TestCase):
         self.assertEqual(variables["regional_0_2"], [0, 0])  # Cannot reach seed.
         self.assertEqual(variables["regional_1_4"], [0, 0])  # Too little population.
         self.assertEqual(variables["regional_flow_0_0_1"], [-1, 1])
-        self.assertEqual(variables["regional_flow_0_2_3"], [0, 0])
+        # Dead-component flow variables are omitted, rather than constructed
+        # with a zero domain and left for presolve to remove.
+        self.assertNotIn("regional_flow_0_2_3", variables)
+
+    def test_joint_floor_fixes_conditionally_unaffordable_tracts_and_flows(self):
+        groups, model = self.capture(
+            [[1], [0, 2], [1]], [100, 1, 100], [0, 1000, 0], [10000] * 3,
+            [[0], [2]], tighten_model=True,
+        )
+        self.assertEqual(groups, [[0], [2]])
+        variables = {v.name: list(v.domain) for v in model.Proto().variables}
+        self.assertEqual(variables["regional_0_1"], [0, 0])
+        self.assertEqual(variables["regional_1_1"], [0, 0])
+        self.assertNotIn("regional_root_0_prefix_1", variables)
+        self.assertNotIn("regional_root_1_prefix_1", variables)
+        self.assertFalse(any(name.startswith("regional_flow_") for name in variables))
+        self.assertFalse(any(name.endswith("_1") and "regional_injected" in name
+                             for name in variables))
+
+    def test_joint_objective_has_aggregate_lagrangian_rate_bound(self):
+        u, emp = [10, 1, 100, 1], [0, 1000, 0, 0]
+        groups, model = self.capture(
+            [[], [], [], []], u, emp, [10000] * 4, [[], []],
+            tighten_model=True,
+        )
+        num, den = solver.as_fraction_tau(.2)
+        q = den * np.array(u, dtype=np.int64) - num * np.array(emp, dtype=np.int64)
+        expected = solver._lagrangian_objective_bound(u, q, set())
+        variables = {v.name: list(v.domain) for v in model.Proto().variables}
+        self.assertEqual(expected, 111)
+        self.assertEqual(variables['regional_objective_unemployment'], [0, expected])
+        self.assertEqual(sum(u[i] for group in groups for i in group), 110)
+
+    def test_joint_objective_combines_rate_and_total_tract_count_bounds(self):
+        u = [100, 90, 80, 70]
+        groups, model = self.capture(
+            [[1], [0, 2], [1, 3], [2]], u, [0] * 4, [10000] * 4,
+            [[0], [1]], tighten_model=True, max_nodes=1,
+        )
+        variables = {v.name: list(v.domain) for v in model.Proto().variables}
+        self.assertEqual(sum(u[i] for group in groups for i in group), 190)
+        self.assertEqual(variables['regional_objective_unemployment'], [190, 190])
+
+    def test_joint_hint_banks_safe_surplus_then_spends_it_on_deficit_tract(self):
+        # At tau=.1, q=9u-e. Tract 2 cannot join tract 0 directly
+        # (q=-40), but tract 1 first contributes q=45.
+        groups, model = self.capture(
+            [[1], [0, 2], [1], []],
+            [10, 5, 20, 10], [40, 0, 100, 40], [10000] * 4,
+            [[0], [3]], tighten_model=True,
+        )
+        self.assertEqual(groups, [[0, 1, 2], [3]])
+        proto = model.Proto()
+        hints = {proto.variables[i].name: value for i, value in
+                 zip(proto.solution_hint.vars, proto.solution_hint.values)}
+        self.assertEqual(hints['regional_0_1'], 1)
+        self.assertEqual(hints['regional_0_2'], 1)
+        variables = {v.name: list(v.domain) for v in proto.variables}
+        self.assertEqual(variables['regional_objective_unemployment'], [45, 45])
+
+    def test_joint_model_caps_globally_affordable_deficit_tract_count(self):
+        # At tau=.2, q=4u-e: the q=40 supply tract can fund at most one
+        # of the two q=-30 deficit tracts, even across separate group slots.
+        _, model = self.capture(
+            [[], [], []], [10, 10, 10], [0, 70, 70], [10000] * 3,
+            [[], []], tighten_model=True,
+        )
+        proto = model.Proto()
+        positions = {v.name: i for i, v in enumerate(proto.variables)}
+        deficit_vars = {
+            positions[f'regional_{k}_{i}'] for k in range(2) for i in (1, 2)
+        }
+        global_rows = [
+            row for row in proto.constraints
+            if set(row.linear.vars) == deficit_vars
+            and set(row.linear.coeffs) == {1}
+            and list(row.linear.domain)[-1] == 1
+        ]
+        self.assertEqual(len(global_rows), 1)
+
+    def test_closed_objective_gap_turns_consolidation_into_feasibility_proof(self):
+        groups, model = self.capture(
+            [[1], [0]], [10, 10], [0, 0], [10000, 10000], [[0], [1]],
+            tighten_model=True, allow_seed_consolidation=True,
+        )
+        self.assertEqual(sum(bool(group) for group in groups), 1)
+        self.assertEqual(sum(10 for group in groups for _ in group), 20)
+        positions = {v.name: i for i, v in enumerate(model.Proto().variables)}
+        active_vars = {positions["regional_active_0"], positions["regional_active_1"]}
+        active_caps = [
+            list(row.linear.domain)[-1]
+            for row in model.Proto().constraints
+            if set(row.linear.vars) == active_vars
+            and list(row.linear.coeffs) == [1, 1]
+        ]
+        self.assertIn(1, active_caps)
 
     def test_mandatory_groups_reserve_population_derived_minimum_counts(self):
         nb = [[j for j in (i-1, i+1) if 0 <= j < 6] for i in range(6)]
@@ -103,6 +198,9 @@ class JointHintsAndBoundsTest(unittest.TestCase):
             _, template = self.capture(nb, u, emp, pop, seeds, tighten_model=True, **options)
             template.ClearHints()
             positions = {v.name: i for i, v in enumerate(template.Proto().variables)}
+            objective_floor = template.Proto().variables[
+                positions["regional_objective_unemployment"]
+            ].domain[0]
             valid = lambda group: solver.component_ok(group, *arrays, .2, 10000, nb, **options)
             mandatory = [valid(seed) for seed in seeds]
             baseline = sum(sum(u[i] for i in seed) for seed, required in zip(seeds, mandatory) if required)
@@ -113,7 +211,7 @@ class JointHintsAndBoundsTest(unittest.TestCase):
                            (not seed or bool(set(seed) & set(group))))
                            for group, required, seed in zip(groups, mandatory, seeds)):
                     continue
-                if sum(u[i] for group in groups for i in group) < baseline:
+                if sum(u[i] for group in groups for i in group) < max(baseline, objective_floor):
                     continue
                 # Empty seed slots are interchangeable; canonicalize their roots.
                 free = sorted((groups[k] for k, seed in enumerate(seeds) if not seed),

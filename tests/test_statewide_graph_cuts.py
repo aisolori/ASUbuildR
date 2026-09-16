@@ -283,6 +283,47 @@ class StatewideGraphCutsTest(unittest.TestCase):
         self.assertEqual((groups, best, status), ([[0]], 10, "UNKNOWN"))
         self.assertEqual(len(model.Proto().constraints), 0)
 
+    def test_cut_pass_stops_after_five_rounds_without_valid_unemp_improvement(self):
+        model = solver.cp_model.CpModel()
+        row = [model.NewBoolVar(f"x_{i}") for i in range(8)]
+        roots = [model.NewBoolVar(f"root_{i}") for i in range(8)]
+        selections = [{0, i} for i in range(2, 8)]
+        created = []
+
+        class FakeSolver:
+            def __init__(self):
+                self.parameters = type("Parameters", (), {})()
+                self.selection = selections[len(created)]
+                created.append(self)
+
+            def Solve(self, unused_model):
+                return solver.cp_model.FEASIBLE
+
+            def StatusName(self, unused_status):
+                return "FEASIBLE"
+
+            def BooleanValue(self, var):
+                prefix, index = var.name.split("_")
+                return int(index) in (self.selection if prefix == "x" else {0})
+
+            def BestObjectiveBound(self):
+                return 100
+
+        output = io.StringIO()
+        with (patch.object(solver.cp_model, "CpSolver", FakeSolver),
+              patch.object(solver, "_configure_asu_solver_portfolio"),
+              contextlib.redirect_stdout(output)):
+            groups, best, status = solver._joint_connectivity_cut_pass(
+                model, [row], [roots],
+                [[1], [0, 2], [1, 3], [2, 4], [3, 5], [4, 6], [5, 7], [6]],
+                np.ones(8, dtype=int), [[0]], lambda groups: False,
+                time.monotonic()+20, 2, lambda: None, log=True)
+
+        self.assertEqual((groups, best, status), ([[0]], 1, "FEASIBLE"))
+        self.assertEqual(len(created), 5)
+        self.assertIn("valid_unemp_stall=5/5", output.getvalue())
+        self.assertIn("stop_reason=VALID_UNEMP_STALL", output.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

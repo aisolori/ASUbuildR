@@ -1,4 +1,4 @@
-"""Touching partition neighborhoods are jointly optimized, never auto-unioned."""
+"""Touching neighborhoods prefer safe union, then bounded joint optimization."""
 import contextlib
 import io
 from pathlib import Path
@@ -19,6 +19,68 @@ def chain(n):
 
 
 class TouchingJointTest(unittest.TestCase):
+    def test_attempt_cache_retries_stronger_search_and_reuses_proofs(self):
+        cache = solver._TouchingJointAttemptCache()
+        key = (((0,), (1,)), (0, 1, 2), None, None, .2, 10000, None)
+        cache.remember(key, 5, False, "CUT_DEFERRED")
+        self.assertEqual(cache.should_skip(key, 5, False), (True, "budget"))
+        self.assertEqual(cache.should_skip(key, 10, False), (False, None))
+        self.assertEqual(cache.should_skip(key, 5, True), (False, None))
+        cache.remember(key, 10, True, "UNKNOWN")
+        self.assertEqual(cache.should_skip(key, 5, True), (True, "budget"))
+
+        proved_key = (((3,), (4,)), (3, 4), None, None, .2, 10000, None)
+        cache.remember(proved_key, 1, False, "OPTIMAL")
+        self.assertEqual(cache.should_skip(proved_key, 100, True), (True, "proved"))
+
+    def test_cut_only_policy_returns_valid_incumbent_without_flow_solve(self):
+        def cut_pass(model, x, roots, nb, u, fallback, *args, **kwargs):
+            return fallback, sum(int(u[unit].sum()) for unit in fallback), "FEASIBLE"
+
+        output = io.StringIO()
+        with (patch.object(solver, "_joint_connectivity_cut_pass", side_effect=cut_pass),
+              patch.object(solver.cp_model.CpSolver, "Solve",
+                           side_effect=AssertionError("flow solve must be deferred")),
+              contextlib.redirect_stdout(output)):
+            groups, status = solver._solve_regional_exchange(
+                [[0], [1]], [0, 1, 2], chain(3), np.full(3, 10),
+                np.zeros(3, dtype=int), np.full(3, 10000), .2, 10000, 5, 1,
+                use_joint_cuts=True, exact_flow_after_cuts=False, log=True,
+            )
+        self.assertEqual(groups, [[0], [1, 2]])
+        self.assertTrue(all(solver.component_ok(
+            group, np.full(3, 10), np.zeros(3, dtype=int),
+            np.full(3, 10000), .2, 10000, chain(3),
+        ) for group in groups))
+        self.assertEqual(status, "CUT_DEFERRED")
+        self.assertIn("FLOW_DEFERRED", output.getvalue())
+
+    def test_large_touching_component_tries_only_one_pair(self):
+        units = [[0], [1], [2], [3]]
+        _, solve = self.run_case(
+            units, [4, 5, 6], max_cluster_groups=2, max_cluster_attempts=1,
+        )
+        solve.assert_called_once()
+        self.assertEqual(len(solve.call_args.args[0]), 2)
+
+    def test_build_safe_union_avoids_joint_model(self):
+        frame = pd.DataFrame(dict(
+            geoid=["0", "1"], tract_ASU_unemp=[10, 10],
+            tract_ASU_emp=[0, 0], tract_pop2024=[10000, 10000],
+        ))
+        with patch.object(
+            solver, "_solve_regional_exchange",
+            side_effect=AssertionError("safe union must precede the joint model"),
+        ):
+            result = solver.build_many_asus_cpsat(
+                frame, chain(2), .1, 10000, max_asus=2,
+                initial_asu_id=[1, 2], harvest_connectivity_free_asus=True,
+                standalone_expansion_time_limit=0, final_asu_polish_time_limit=0,
+                final_consolidation=False, workers=1, verbose=False,
+            )
+        self.assertEqual(result["n_asu"], 1)
+        self.assertEqual(result["asu_id"], [1, 1])
+
     def test_polish_peers_finish_before_changed_cluster_retries(self):
         frame = pd.DataFrame(dict(geoid=list(map(str, range(6))),
                                   tract_ASU_unemp=[20, 10, 1, 0, 5, 0],
@@ -40,6 +102,8 @@ class TouchingJointTest(unittest.TestCase):
                     if hint else None)
         with (patch.object(solver, '_reoptimize_touching_asu_units', side_effect=touching),
               patch.object(solver, '_solve_regional_exchange', side_effect=joint),
+              patch.object(solver, '_merge_touching_asu_units',
+                           side_effect=lambda units, *args, **kwargs: (units, 0)),
               patch.object(solver, 'solve_one_asu_cpsat', side_effect=single),
               patch.object(solver, '_regional_exchange_pass', side_effect=lambda a, *args, **kw: a.copy()),
               patch.object(solver, '_search_unassigned_asu', return_value=([], 'INFEASIBLE'))):
@@ -88,7 +152,9 @@ class TouchingJointTest(unittest.TestCase):
         def touching(units, *args, **kwargs):
             calls.append((kwargs["source"], kwargs["incumbent_stall_seconds"]))
             return units, 0
-        with patch.object(solver, "_reoptimize_touching_asu_units", side_effect=touching):
+        with (patch.object(solver, "_reoptimize_touching_asu_units", side_effect=touching),
+              patch.object(solver, "_merge_touching_asu_units",
+                           side_effect=lambda units, *args, **kwargs: (units, 0))):
             solver.build_many_asus_cpsat(
                 frame, chain(2), .1, 10000, max_asus=2, initial_asu_id=[1, 2],
                 harvest_connectivity_free_asus=True, workers=1, verbose=False,
@@ -243,10 +309,12 @@ class TouchingJointTest(unittest.TestCase):
         self.assertEqual(sum(int(u[group].sum()) for group in groups), 40)
         self.assertTrue(all(solver.component_ok(group, u, emp, pop, .2, 10000,
                                                chain(5), max_nodes=2) for group in groups))
-        self.assertGreaterEqual(configure.call_count, 2)
+        # A connected optimum of the cut model now proves the exact model, so
+        # this case needs only the configured cut-pass solver and no flow solve.
+        self.assertGreaterEqual(configure.call_count, 1)
         self.assertTrue(all(call.args[1] == 2 for call in configure.call_args_list))
 
-    def test_touching_cut_stages_carry_rows_into_flow_and_share_budget(self):
+    def test_touching_connected_cut_proof_skips_redundant_flow_solve(self):
         models, limits, cut_models = [], [], []
         real_solve = solver.cp_model.CpSolver.Solve
         real_pass = solver._joint_connectivity_cut_pass
@@ -271,17 +339,16 @@ class TouchingJointTest(unittest.TestCase):
                 np.full(4, 10000), .2, 10000, 5, 2, log=True)
         self.assertEqual(updates, 1)
         self.assertEqual(sorted(v for unit in groups for v in unit), [0, 1, 2, 3])
-        self.assertGreaterEqual(len(models), 2)
+        self.assertEqual(len(models), 1)
         has_flow = lambda m: any(v.name.startswith("regional_flow_") for v in m.Proto().variables)
         self.assertFalse(has_flow(models[0]))
-        self.assertTrue(has_flow(models[-1]))
-        self.assertTrue(all(0 < limit <= .75 for limit in limits[:-1]))
-        self.assertTrue(0 < limits[-1] <= 5)
-        for i, row in enumerate(cut_models[0].Proto().constraints):
-            self.assertEqual(str(row), str(models[-1].Proto().constraints[i]))
+        self.assertTrue(all(0 < limit <= .75 for limit in limits))
+        self.assertEqual(len(cut_models), 1)
         log = output.getvalue()
-        for suffix in ("MODEL", "CUT_PASS", "CUT_ROUND", "CUT_COMPLETE", "FLOW"):
+        for suffix in ("MODEL", "CUT_PASS", "CUT_ROUND", "CUT_COMPLETE", "CUT_PROOF"):
             self.assertIn(f"[STAGE] PARTITION_TOUCHING_JOINT_{suffix} ", log)
+        self.assertNotIn("[STAGE] PARTITION_TOUCHING_JOINT_FLOW ", log)
+        self.assertIn("exact_flow_skipped=1", log)
         self.assertIn("graph_cuts=True", log)
         self.assertRegex(log, r"separator_cuts=[1-9][0-9]*")
         self.assertRegex(log, r"seed_distance_rows=[1-9][0-9]*")

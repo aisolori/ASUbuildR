@@ -104,23 +104,23 @@ class MainImmediateMergeTest(unittest.TestCase):
         self.assertIn("[STAGE] PARTITION_BUILD_MERGE", output)
         self.assertIn("action=restart", output)
 
-    def test_partition_main_commit_uses_joint_result(self):
+    def test_partition_main_commit_uses_safe_union_before_joint(self):
         result, exact, joint, output = self.run_build(partition=True)
         self.assertEqual(result["asu_id"], [1, 1, 1, 1])
         self.assertEqual(result["n_asu"], 1)
         self.assertEqual(exact.call_count, 2)
-        self.assertEqual(joint.call_args.args[0], [[0, 1], [2, 3]])
-        self.assertTrue(joint.call_args.kwargs["allow_seed_consolidation"])
-        self.assertIn("PARTITION_TOUCHING_JOINT source=main_commit", output)
+        joint.assert_not_called()
+        self.assertIn("PARTITION_TOUCHING_SAFE_UNION source=main_commit", output)
+        self.assertNotIn("PARTITION_TOUCHING_JOINT source=main_commit", output)
         self.assertNotIn("[STAGE] PARTITION_BUILD_MERGE", output)
 
-    def test_partition_main_commit_keeps_separate_nonimproving_groups(self):
+    def test_partition_main_commit_safe_union_does_not_depend_on_joint_result(self):
         result, exact, joint, output = self.run_build(partition=True, consolidate=False)
-        self.assertEqual(result["asu_id"], [1, 1, 2, 2])
-        self.assertEqual(result["n_asu"], 2)
+        self.assertEqual(result["asu_id"], [1, 1, 1, 1])
+        self.assertEqual(result["n_asu"], 1)
         self.assertEqual(exact.call_count, 2)
-        joint.assert_called_once()  # Cross-batch checks reuse the attempt cache.
-        self.assertIn("status=CACHED", output)
+        joint.assert_not_called()
+        self.assertIn("PARTITION_TOUCHING_SAFE_UNION source=main_commit", output)
 
 
 if __name__ == "__main__":

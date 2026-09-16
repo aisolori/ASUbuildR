@@ -161,19 +161,21 @@ class JointBuildTest(unittest.TestCase):
             )
         return result, events, log.getvalue(), joint_solve.call_count
 
-    def test_enabled_uses_joint_model_then_touching_joint_without_forced_merge(self):
+    def test_enabled_uses_joint_expansion_then_safe_union(self):
         result, events, log, calls = self.run_build(True, True)
-        self.assertEqual(result["asu_id"], [1, 1, 1, 2])
-        self.assertGreaterEqual(calls, 2)
+        self.assertEqual(result["asu_id"], [1, 1, 1, 1])
+        # Safe union changes the active seed set, so expansion gets one fresh
+        # single-group round; neither call is a touching exact-flow fallback.
+        self.assertEqual(calls, 2)
         kinds = [event[0] for event in events]
-        self.assertNotIn("merge", kinds)
-        self.assertEqual(kinds[:3], ["solve", "returned", "solve"])
+        self.assertIn("merge", kinds)
+        self.assertEqual(kinds[:3], ["solve", "returned", "merge"])
         self.assertIn("mode=joint solves=1 workers_per_solve=4", log)
         self.assertIn("PARTITION_JOINT_EXPANSION_COMPLETE", log)
         self.assertIn("active=2 inactive=0 unemp=17 gain=6", log)
         self.assertIn("phase=joint_expansion", log)
-        self.assertIn("PARTITION_TOUCHING_JOINT_COMPLETE", log)
-        self.assertIn("accepted=0 groups_before=2 groups_after=2", log)
+        self.assertIn("PARTITION_TOUCHING_SAFE_UNION", log)
+        self.assertNotIn("PARTITION_TOUCHING_JOINT source=expansion_round", log)
 
     def test_merging_disabled_leaves_two_valid_disjoint_asus(self):
         result, events, _, _ = self.run_build(True, False)

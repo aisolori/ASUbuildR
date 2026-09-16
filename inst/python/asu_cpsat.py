@@ -35,6 +35,7 @@ from collections import deque
 import concurrent.futures
 from functools import lru_cache
 import heapq
+import hashlib
 import json
 import math
 import os
@@ -110,7 +111,8 @@ def _pick_capacity_root(candidates, u, E, P, tau):
     return ordered[0]
 
 
-def _add_capacity_root_order(model, x, roots, u, E, P, tau, *, hint=None, prefix="root"):
+def _add_capacity_root_order(model, x, roots, u, E, P, tau, *, hint=None,
+                             prefix="root", eligible=None):
     """Make the highest-capacity selected tract the variable-root flow source.
 
     This chooses a representation of each connected selection without forcing
@@ -119,7 +121,8 @@ def _add_capacity_root_order(model, x, roots, u, E, P, tau, *, hint=None, prefix
     previous = 0
     hinted = set(hint) if hint is not None else None
     hinted_seen = False
-    for i in _capacity_root_order(range(len(x)), u, E, P, tau):
+    candidates = range(len(x)) if eligible is None else eligible
+    for i in _capacity_root_order(candidates, u, E, P, tau):
         seen = model.NewBoolVar(f"{prefix}_prefix_{i}")
         model.Add(roots[i] <= x[i])
         model.Add(seen == previous + roots[i])
@@ -1304,7 +1307,6 @@ def _asu_flow_capacity_hybrid_groups(
 
 _ASU_FULL_SUBSOLVER_PATTERN = (
     "portfolio_max_lp",
-    "portfolio_max_lp",
     "max_lp",
     "lb_tree_search",
     "objective_lb_search_max_lp",
@@ -1318,11 +1320,9 @@ _ASU_FULL_SUBSOLVER_PATTERN = (
     
     "variables_shaving_no_lp",
     "objective_shaving_max_lp",
-    "max_lp",
     "reduced_costs",
 
     "pseudo_costs",
-    "max_lp",
     "core_max_lp",
     "core",
     "objective_shaving_no_lp",
@@ -1388,20 +1388,9 @@ def _asu_full_subsolvers(
         custom_worker_name = "asu_flow_capacity_hybrid"
 
     if custom_worker_name is not None:
-        # Preserve reduced-cost and pseudo-cost search. At large budgets, use
-        # one of the duplicate max-LP slots for the custom worker instead.
-        max_lp_indices = [
-            index for index, name in enumerate(full_subsolvers)
-            if name == "max_lp"
-        ]
-        replace_index = (
-            max_lp_indices[-1]
-            if len(max_lp_indices) > 1
-            else full_subsolvers.index("portfolio_max_lp")
-            if "portfolio_max_lp" in full_subsolvers
-            else len(full_subsolvers) - 1
-        )
-        full_subsolvers[replace_index] = custom_worker_name
+        # Keep the leading general-purpose LP worker and replace the least
+        # preferred worker that fits in this budget.
+        full_subsolvers[-1] = custom_worker_name
     if use_tract_first_probing:
         for source, replacement in (
             ("asu_probe_fast", "asu_probe_fast_tract_first"),
@@ -6962,6 +6951,91 @@ def _joint_minimum_tract_count(population, pop_thresh):
     return len(population) + 1
 
 
+def _joint_capacity_grow_hint(units, seeds, nb, u, emp, pop, tau, pop_thresh,
+                              total_bound, group_bound):
+    """Grow a disjoint connected incumbent by banking exact UR surplus.
+
+    Nonnegative-surplus frontier tracts are taken before deficit tracts. A
+    deficit tract is admitted only when its group can pay its exact q cost.
+    This is deliberately an incumbent heuristic: contested frontier tracts are
+    assigned once, but the CP-SAT model remains free to choose another owner.
+    """
+    groups = [set(map(int, unit)) for unit in units]
+    original = [sorted(group) for group in groups]
+    if not groups or group_bound < 1:
+        return original, 0, 0
+
+    owner = {}
+    for k, group in enumerate(groups):
+        for node in group:
+            if node in owner:
+                return original, 0, 0
+            owner[node] = k
+    total_selected = len(owner)
+    if total_selected >= int(total_bound):
+        return original, 0, 0
+
+    num, den = as_fraction_tau(tau)
+    q = den * np.asarray(u, dtype=np.int64) - num * np.asarray(emp, dtype=np.int64)
+    slack = [int(q[list(group)].sum()) if group else 0 for group in groups]
+    population = [int(np.asarray(pop)[list(group)].sum()) if group else 0
+                  for group in groups]
+    seed_distances = [
+        _joint_seed_distances(nb, seed) if seed else None
+        for seed in seeds
+    ]
+    frontiers = [
+        {neighbor for node in group for neighbor in nb[node]
+         if neighbor not in owner}
+        for group in groups
+    ]
+    rate_safe_added = deficit_added = 0
+
+    while total_selected < int(total_bound):
+        best = None
+        for k, group in enumerate(groups):
+            if not group or len(group) >= int(group_bound):
+                continue
+            distances = seed_distances[k]
+            for node in sorted(frontiers[k]):
+                if node in owner or int(u[node]) <= 0:
+                    continue
+                if distances is not None and (
+                        distances[node] < 0 or distances[node] + 1 > int(group_bound)):
+                    continue
+                node_q = int(q[node])
+                if slack[k] + node_q < 0:
+                    continue
+                next_population = population[k] + int(pop[node])
+                if next_population < int(pop_thresh):
+                    continue
+                if node_q >= 0:
+                    key = (1, float(node_q), int(u[node]), int(pop[node]), -k, -node)
+                else:
+                    key = (0, int(u[node]) / -node_q, int(u[node]), node_q,
+                           int(pop[node]), -k, -node)
+                if best is None or key > best[0]:
+                    best = (key, k, node, node_q, next_population)
+        if best is None:
+            break
+
+        _, k, node, node_q, next_population = best
+        groups[k].add(node)
+        owner[node] = k
+        total_selected += 1
+        slack[k] += node_q
+        population[k] = next_population
+        rate_safe_added += int(node_q >= 0)
+        deficit_added += int(node_q < 0)
+        for frontier in frontiers:
+            frontier.discard(node)
+        for neighbor in nb[node]:
+            if neighbor not in owner:
+                frontiers[k].add(neighbor)
+
+    return [sorted(group) for group in groups], rate_safe_added, deficit_added
+
+
 def _joint_seed_distances(nb, seed):
     """Optimistic distance to any seed tract, not to a fixed flow root."""
     distances = [-1] * len(nb)
@@ -7034,7 +7108,7 @@ def _joint_small_separator_cuts(nb, u, q, seeds, deadline, cancelled,
 class _JointConnectivityCutCache:
     """Bounded per-run graph cuts, using global tracts and no group identities."""
 
-    def __init__(self, max_windows=8, max_cuts=256):
+    def __init__(self, max_windows=10, max_cuts=1000):
         self.max_windows = max_windows
         self.max_cuts = max_cuts
         self.windows = {}
@@ -7063,9 +7137,11 @@ class _JointConnectivityCutCache:
 def _joint_connectivity_cut_pass(model, x, root_rows, nb, u,
                                  fallback, valid_candidate, deadline, workers,
                                  cancellation, *, log=False, report=None,
-                                 max_rounds=8, cut_limit=1024,
+                                 max_rounds=50, cut_limit=5000,
+                                 valid_unemp_stall_rounds=5,
                                  stage_prefix="STATEWIDE_JOINT", objective=None,
-                                 cut_cache=None, global_nodes=None):
+                                 cut_cache=None, global_nodes=None,
+                                 proof_out=None):
     """Solve/add root-aware cuts before flows; never publish disconnected groups.
 
     For v in C: x[v] <= sum(root[C]) + sum(x[boundary(C)]). A connected
@@ -7076,6 +7152,9 @@ def _joint_connectivity_cut_pass(model, x, root_rows, nb, u,
     best = [list(unit) for unit in fallback]
     best_obj = sum(int(u[unit].sum()) for unit in best)
     seen, rows, rounds, status_name = set(), 0, 0, "DISABLED"
+    valid_unemp_stall = 0
+    stop_reason = None
+    proved_connected_optimal = False
     cached = None
     reused, stored = 0, 0
     if cut_cache is not None:
@@ -7142,6 +7221,7 @@ def _joint_connectivity_cut_pass(model, x, root_rows, nb, u,
         groups = [[i for i, var in enumerate(row) if scout.BooleanValue(var)] for row in x]
         connected = valid_candidate(groups)
         value = sum(int(u[unit].sum()) for unit in groups)
+        previous_best_obj = best_obj
         # This is an upper bound on the relaxation, hence also on every
         # connected solution. Never substitute the relaxed incumbent value.
         # Round upward conservatively; ignore unusable/default response bounds.
@@ -7156,6 +7236,14 @@ def _joint_connectivity_cut_pass(model, x, root_rows, nb, u,
             best, best_obj = groups, value
             if report is not None:
                 report([i for unit in best for i in unit], value)
+        if best_obj > previous_best_obj:
+            valid_unemp_stall = 0
+        else:
+            valid_unemp_stall += 1
+        if connected and status == cp_model.OPTIMAL:
+            # A connected optimum of the relaxation is feasible for the exact
+            # flow model and also matches its best possible objective.
+            proved_connected_optimal = True
         added, detached = 0, 0
         if not connected and not interrupted:
             for k, unit in enumerate(groups):
@@ -7188,7 +7276,12 @@ def _joint_connectivity_cut_pass(model, x, root_rows, nb, u,
                   f"status={status_name} relaxed_unemp={value} connected={connected} "
                   f"detached_components={detached} cuts_added={added} cuts_total={rows} "
                   f"valid_unemp={best_obj} upper_bound={upper_bound} "
+                  f"valid_unemp_stall={valid_unemp_stall}/{valid_unemp_stall_rounds} "
                   f"elapsed={time.monotonic()-started:.3f}s", flush=True)
+        if (valid_unemp_stall_rounds is not None
+                and valid_unemp_stall >= max(1, int(valid_unemp_stall_rounds))):
+            stop_reason = "VALID_UNEMP_STALL"
+            break
         if interrupted or connected or not added:
             break
     if log:
@@ -7197,17 +7290,22 @@ def _joint_connectivity_cut_pass(model, x, root_rows, nb, u,
                   f"new_cached_cuts={stored} cached_cuts={len(cached)}", flush=True)
         print(f"[STAGE] {stage_prefix}_CUT_COMPLETE status={status_name} "
               f"rounds={rounds} cuts={rows} valid_unemp={best_obj} "
+              f"stop_reason={stop_reason} "
               f"upper_bound={upper_bound} bound_carried_to_flow={upper_bound is not None} "
               f"elapsed={time.monotonic()-started:.3f}s", flush=True)
+    if proof_out is not None:
+        proof_out.append(proved_connected_optimal)
     return best, best_obj, status_name
 
 
 def _joint_assignment_hints(model, x, roots, active, counts, selected_any,
-                            units, u, E, P, tau):
+                            units, u, E, P, tau, objective=None):
     """Replace exploratory hints with a validated joint assignment (flows follow)."""
     model.ClearHints()
     positions = {v.name: i for i, v in enumerate(model.Proto().variables)}
     selected_all = {i for unit in units for i in unit}
+    if objective is not None:
+        model.AddHint(objective, sum(int(u[i]) for i in selected_all))
     for i, var in enumerate(selected_any):
         model.AddHint(var, int(i in selected_all))
     order = _capacity_root_order(range(len(u)), u, E, P, tau)
@@ -7221,8 +7319,10 @@ def _joint_assignment_hints(model, x, roots, active, counts, selected_any,
             model.AddHint(x[k][i], int(i in selected))
             model.AddHint(roots[k][i], int(i == root))
             visited = visited or i in selected
-            prefix = model.GetIntVarFromProtoIndex(positions[f"regional_root_{k}_prefix_{i}"])
-            model.AddHint(prefix, int(visited))
+            prefix_index = positions.get(f"regional_root_{k}_prefix_{i}")
+            if prefix_index is not None:
+                prefix = model.GetIntVarFromProtoIndex(prefix_index)
+                model.AddHint(prefix, int(visited))
 
 
 class _TouchingJointSweep:
@@ -7251,6 +7351,54 @@ class _TouchingJointSweep:
 
     def record(self, members):
         self.members.update(members)
+
+
+class _TouchingJointAttemptCache:
+    """Proof- and budget-aware cache for one build's touching neighborhoods."""
+
+    def __init__(self):
+        self.records = {}
+
+    @staticmethod
+    def fingerprint(key):
+        return hashlib.blake2b(repr(key).encode("utf-8"), digest_size=8).hexdigest()
+
+    def prior_window_jaccard(self, key):
+        nodes = set(key[1])
+        similarities = []
+        for prior in self.records:
+            if len(prior[0]) != len(key[0]):
+                continue
+            prior_nodes = set(prior[1])
+            union = nodes | prior_nodes
+            similarities.append(len(nodes & prior_nodes) / len(union) if union else 1.0)
+        return max(similarities, default=0.0)
+
+    def should_skip(self, key, seconds, exact_flow):
+        record = self.records.get(key)
+        if record is None:
+            return False, None
+        if record["proved"]:
+            return True, "proved"
+        if (record["exact_flow"] >= bool(exact_flow)
+                and record["seconds"] >= float(seconds)):
+            return True, "budget"
+        return False, None
+
+    def remember(self, key, seconds, exact_flow, status):
+        if status in ("STOPPED", "SKIPPED"):
+            return
+        candidate = {
+            "seconds": float(seconds),
+            "exact_flow": bool(exact_flow),
+            "status": str(status),
+            "proved": status in ("OPTIMAL", "INFEASIBLE"),
+        }
+        prior = self.records.get(key)
+        if (prior is None or candidate["proved"] or not prior["proved"] and (
+                candidate["exact_flow"] > prior["exact_flow"]
+                or candidate["seconds"] >= prior["seconds"])):
+            self.records[key] = candidate
 
 
 class _TouchingJointDeferrals:
@@ -7286,7 +7434,8 @@ def _reoptimize_touching_asu_units(
     max_nodes=None, exact_nodes=None, stop_path=None, skip_path=None,
     attempted=None, log=False, rel_gap=None, incumbent_stall_seconds=None,
     source="partition", preview_factory=None, deferrals=None, peer_units=None,
-    cut_cache=None, sweep=None,
+    cut_cache=None, sweep=None, exact_flow_after_cuts=True,
+    max_cluster_groups=None, max_cluster_attempts=None,
 ):
     """Reoptimize one touching cluster; never replace a failed solve by a union.
 
@@ -7309,7 +7458,7 @@ def _reoptimize_touching_asu_units(
     adjacent = [set() for _ in original]
     for node, i in owner.items():
         adjacent[i].update(owner[v] for v in nb[node] if v in owner and owner[v] != i)
-    clusters, seen = [], set()
+    connected_clusters, seen = [], set()
     for i in range(len(original)):
         if i in seen:
             continue
@@ -7322,12 +7471,22 @@ def _reoptimize_touching_asu_units(
                 seen.add(other)
                 stack.append(other)
         if len(cluster) > 1:
-            clusters.append(sorted(cluster))
+            connected_clusters.append(sorted(cluster))
+    clusters = []
+    for cluster in connected_clusters:
+        if max_cluster_groups is None or len(cluster) <= int(max_cluster_groups):
+            clusters.append(cluster)
+            continue
+        # Large touching components create K*(N+E) exact-flow models. Explore
+        # their actual touching edges as tactical pair neighborhoods instead.
+        clusters.extend(sorted({tuple(sorted((i, j))) for i in cluster
+                                for j in adjacent[i] if i < j and j in cluster}))
     clusters.sort(key=lambda cluster: (
         -sum(float((1 - tau) * u[original[i]].sum() - tau * E[original[i]].sum())
              for i in cluster), tuple(cluster)))
     free = set(map(int, available_nodes)) - set(owner)
     attempted = set() if attempted is None else attempted
+    cluster_attempts = 0
     for cluster in clusters:
         if _stop_requested(stop_path):
             break
@@ -7347,12 +7506,21 @@ def _reoptimize_touching_asu_units(
                     reached.add(v)
                     stack.append(v)
         nodes = sorted(reached)
-        signature = (tuple(sorted(tuple(unit) for unit in seeds)), tuple(nodes),
-                     max_nodes, exact_nodes, float(tau), int(pop_thresh), float(seconds))
-        if signature in attempted:
+        mathematical_key = (
+            tuple(sorted(tuple(unit) for unit in seeds)), tuple(nodes),
+            max_nodes, exact_nodes, float(tau), int(pop_thresh), rel_gap,
+        )
+        legacy_signature = mathematical_key + (float(seconds),)
+        if isinstance(attempted, _TouchingJointAttemptCache):
+            cached, cache_reason = attempted.should_skip(
+                mathematical_key, seconds, exact_flow_after_cuts)
+        else:
+            cached, cache_reason = legacy_signature in attempted, "exact"
+        if cached:
             if log:
                 print(f"[STAGE] PARTITION_TOUCHING_JOINT_COMPLETE source={source} "
-                      f"status=CACHED accepted=0 groups={len(seeds)} window={len(nodes)}",
+                      f"status=CACHED accepted=0 groups={len(seeds)} window={len(nodes)} "
+                      f"cache_reason={cache_reason}",
                       flush=True)
             continue
         if sweep is not None and sweep.blocks(seed_set):
@@ -7361,13 +7529,23 @@ def _reoptimize_touching_asu_units(
                       f"status=DEFERRED_SWEEP accepted=0 groups={len(seeds)} "
                       f"sweep={sweep.number} reason=already_attempted_this_sweep", flush=True)
             continue
+        if (max_cluster_attempts is not None
+                and cluster_attempts >= int(max_cluster_attempts)):
+            break
+        cluster_attempts += 1
         started = time.monotonic()
         baseline = sum(int(u[unit].sum()) for unit in seeds)
         if log:
+            fingerprint = (_TouchingJointAttemptCache.fingerprint(mathematical_key)
+                           if isinstance(attempted, _TouchingJointAttemptCache) else "legacy")
+            similarity = (attempted.prior_window_jaccard(mathematical_key)
+                          if isinstance(attempted, _TouchingJointAttemptCache) else 0.0)
             print(f"[STAGE] PARTITION_TOUCHING_JOINT source={source} "
                   f"groups={len(seeds)} window={len(nodes)} "
                   f"unassigned={len(reached - seed_set)} baseline_unemp={baseline} "
                   f"roots=movable consolidation=enabled graph_cuts=True "
+                  f"exact_flow={int(bool(exact_flow_after_cuts))} "
+                  f"fingerprint={fingerprint} prior_window_jaccard={similarity:.3f} "
                   f"workers={workers} seconds={seconds} "
                   f"incumbent_stall_seconds={incumbent_stall_seconds}",
                   flush=True)
@@ -7383,6 +7561,8 @@ def _reoptimize_touching_asu_units(
             log=log, rel_gap=rel_gap, incumbent_stall_seconds=incumbent_stall_seconds,
             incumbent_report_callback=preview,
             cut_cache=cut_cache,
+            accept_connected_cut_proof=True,
+            exact_flow_after_cuts=exact_flow_after_cuts,
         )
         selected = [int(v) for unit in candidate for v in unit]
         valid = (len(candidate) == len(seeds)
@@ -7403,8 +7583,11 @@ def _reoptimize_touching_asu_units(
             if status == "SKIPPED":
                 deferrals.defer(seed_set | (set(selected) if accepted else set()),
                                 original if peer_units is None else peer_units)
-        if status not in ("STOPPED", "SKIPPED"):
-            attempted.add(signature)
+        if isinstance(attempted, _TouchingJointAttemptCache):
+            attempted.remember(
+                mathematical_key, seconds, exact_flow_after_cuts, status)
+        elif status not in ("STOPPED", "SKIPPED"):
+            attempted.add(legacy_signature)
         if log:
             print(f"[STAGE] PARTITION_TOUCHING_JOINT_COMPLETE source={source} "
                   f"status={status} valid={int(bool(valid))} accepted={int(bool(accepted))} "
@@ -7429,7 +7612,9 @@ def _solve_regional_exchange(units, nodes, nb, u, E, P, tau, pop_thresh,
                               incumbent_stall_seconds=None, max_groups=3,
                               allow_unseeded_groups=False, relaxed_selection_hint=None,
                               tighten_model=False, allow_seed_consolidation=False,
-                              use_joint_cuts=False, stage_prefix=None, cut_cache=None):
+                              use_joint_cuts=False, stage_prefix=None, cut_cache=None,
+                              accept_connected_cut_proof=False,
+                              exact_flow_after_cuts=True):
     """Jointly maximize unemployment in 2/3 disjoint ASUs with movable roots.
 
     Each group retains an incumbent tract for identity, but its root can move
@@ -7464,6 +7649,7 @@ def _solve_regional_exchange(units, nodes, nb, u, E, P, tau, pop_thresh,
         return seeds, "INVALID_SEED"
     # A weak relaxed component is a candidate, never a feasible fallback.
     fallback = [seed if valid else [] for seed, valid in zip(seeds, valid_seeds)]
+    interruption_fallback = [list(unit) for unit in fallback]
     required_seeds = [valid and not allow_seed_consolidation for valid in valid_seeds]
     mandatory_groups = sum(required_seeds)
     cancelled_reason = [None]
@@ -7493,6 +7679,10 @@ def _solve_regional_exchange(units, nodes, nb, u, E, P, tau, pop_thresh,
     local_seeds = [[index[v] for v in seed] for seed in seeds]
     hint_units = [[index[v] for v in unit] for unit in fallback]
     baseline = sum(int(u[unit].sum()) for unit in fallback)
+    incumbent_baseline = baseline
+    preheuristic_units = [list(unit) for unit in hint_units]
+    heuristic_improved = False
+    heuristic_confirmed = False
 
     def valid_local_candidate(groups):
         flat = [v for group in groups for v in group]
@@ -7507,6 +7697,7 @@ def _solve_regional_exchange(units, nodes, nb, u, E, P, tau, pop_thresh,
 
     num, den = as_fraction_tau(tau)
     q = den * local_u.astype(np.int64) - num * local_e.astype(np.int64)
+    rate_objective_bound = _lagrangian_objective_bound(local_u, q, set())
     separator_cuts = []
     if use_joint_cuts:
         separator_cuts = _joint_small_separator_cuts(
@@ -7517,14 +7708,97 @@ def _solve_regional_exchange(units, nodes, nb, u, E, P, tau, pop_thresh,
         q, len(seeds), max_nodes=max_nodes, exact_nodes=exact_nodes,
         mandatory_groups=mandatory_groups,
     )
-    minimum_count = 1
+    _, deficit_indices, joint_deficit_count_bound = _surplus_knapsack_bounds(
+        q, set(), n
+    )
+    conditional_deficit_bounds = {}
+    for seed_node in {i for seed in local_seeds for i in seed}:
+        bound, _, optional_deficit_bound = _surplus_knapsack_bounds(
+            q, {seed_node}, n
+        )
+        conditional_deficit_bounds[seed_node] = (
+            -1 if bound is None else
+            optional_deficit_bound + int(q[seed_node] < 0)
+        )
+    minimum_count = (_joint_minimum_tract_count(local_p, pop_thresh)
+                     if tighten_model else 1)
+    if tighten_model:
+        group_bound = min(
+            group_bound,
+            max(0, total_bound - minimum_count * max(0, mandatory_groups - 1)),
+        )
+    if group_bound >= 1:
+        baseline_before_hint = baseline
+        grown_hint, safe_added, deficit_added = _joint_capacity_grow_hint(
+            hint_units, local_seeds, local_nb, local_u, local_e, local_p,
+            tau, pop_thresh, total_bound, group_bound,
+        )
+        grown_objective = sum(int(local_u[unit].sum()) for unit in grown_hint)
+        if grown_objective > baseline and valid_local_candidate(grown_hint):
+            hint_units = grown_hint
+            fallback = [[nodes[i] for i in unit] for unit in grown_hint]
+            baseline = grown_objective
+            heuristic_improved = True
+        if log:
+            print(f"[STAGE] {stage_prefix}_CAPACITY_HINT "
+                  f"rate_safe_added={safe_added} deficit_added={deficit_added} "
+                  f"baseline_unemp={baseline_before_hint} hint_unemp={grown_objective} "
+                  f"accepted={int(baseline > baseline_before_hint)}", flush=True)
+
+    def construction_fallback(reason):
+        if reason in ("STOPPED", "SKIPPED") and heuristic_improved and not heuristic_confirmed:
+            return interruption_fallback
+        return fallback
+
+    objective_order = sorted(range(n), key=lambda i: (-int(local_u[i]), i))
+    objective_rank = [0] * n
+    objective_prefix = [0]
+    for rank, i in enumerate(objective_order):
+        objective_rank[i] = rank
+        objective_prefix.append(objective_prefix[-1] + int(local_u[i]))
+
+    def count_objective_bound(limit, forced=None):
+        """Exact unemployment cap after retaining only a cardinality limit."""
+        limit = min(n, max(0, int(limit)))
+        if forced is None:
+            return objective_prefix[limit]
+        forced = int(forced)
+        if limit == 0:
+            return -1
+        if objective_rank[forced] < limit:
+            return objective_prefix[limit]
+        return (objective_prefix[limit] - int(local_u[objective_order[limit - 1]])
+                + int(local_u[forced]))
+
+    cardinality_objective_bound = count_objective_bound(total_bound)
+    joint_objective_bound = (rate_objective_bound if rate_objective_bound < 0 else
+                             min(rate_objective_bound, cardinality_objective_bound))
+    conditional_bounds = []
+    relaxation_fixed_zero = set()
+    if tighten_model:
+        # The disjoint union of all groups satisfies the same rate and total
+        # cardinality relaxations.  If neither relaxation can reach the
+        # incumbent while containing tract i, no improving (or tying) joint
+        # solution can contain i in any slot.  These exclusions also let the
+        # exact-flow phase omit dead nodes and edges altogether.
+        rate_conditionals = _lagrangian_conditional_bounds(local_u, q, set())
+        conditional_bounds = [
+            min(rate_bound, count_objective_bound(total_bound, i))
+            if rate_bound >= 0 else -1
+            for i, rate_bound in enumerate(rate_conditionals)
+        ]
+        relaxation_fixed_zero = {
+            i for i, bound in enumerate(conditional_bounds) if bound < baseline
+        }
     components = [list(range(n))]
     component_of = [0] * n
     allowed_components = [set([0]) for _ in seeds]
     if tighten_model:
-        minimum_count = _joint_minimum_tract_count(local_p, pop_thresh)
-        group_bound = min(group_bound, max(0, total_bound - minimum_count * max(0, mandatory_groups-1)))
-        components = _connected_components(local_nb, np.ones(n, dtype=bool))
+        available = np.ones(n, dtype=bool)
+        if relaxation_fixed_zero:
+            available[sorted(relaxation_fixed_zero)] = False
+        components = _connected_components(local_nb, available)
+        component_of = [-1] * n
         viable = set()
         for c, component in enumerate(components):
             for i in component:
@@ -7533,7 +7807,8 @@ def _solve_regional_exchange(units, nodes, nb, u, E, P, tau, pop_thresh,
                     and sum(max(0, int(local_p[i])) for i in component) >= int(pop_thresh)):
                 viable.add(c)
         allowed_components = [
-            viable & {component_of[index[v]] for v in seed} if seed else viable.copy()
+            viable & {component_of[index[v]] for v in seed
+                      if component_of[index[v]] >= 0} if seed else viable.copy()
             for seed in seeds
         ]
     if group_bound < 1:
@@ -7541,22 +7816,26 @@ def _solve_regional_exchange(units, nodes, nb, u, E, P, tau, pop_thresh,
     flow_bound = group_bound - 1
     model = cp_model.CpModel()
     x = []
+    assignment_allowed = []
     for k in range(len(seeds)):
         row = []
+        allowed = []
         for i in range(n):
             if i % 256 == 0:
                 reason = cancellation()
                 if reason or time.monotonic() >= deadline:
-                    return fallback, reason or "UNKNOWN"
-            row.append(model.NewIntVar(
-                0, int(component_of[i] in allowed_components[k]), f"regional_{k}_{i}"))
+                    return construction_fallback(reason), reason or "UNKNOWN"
+            can_assign = component_of[i] in allowed_components[k]
+            row.append(model.NewIntVar(0, int(can_assign), f"regional_{k}_{i}"))
+            allowed.append(can_assign)
         x.append(row)
+        assignment_allowed.append(allowed)
     selected_any = []
     for i in range(n):
         if i % 256 == 0:
             reason = cancellation()
             if reason or time.monotonic() >= deadline:
-                return fallback, reason or "UNKNOWN"
+                return construction_fallback(reason), reason or "UNKNOWN"
         if partial_hint:
             selected_var = model.NewBoolVar(f"joint_selected_{i}")
             model.Add(selected_var == sum(row[i] for row in x))
@@ -7566,13 +7845,20 @@ def _solve_regional_exchange(units, nodes, nb, u, E, P, tau, pop_thresh,
         else:
             model.Add(sum(row[i] for row in x) <= 1)
     model.Add(sum(var for row in x for var in row) <= total_bound)
+    joint_deficit_rows = 0
+    if joint_deficit_count_bound < min(len(deficit_indices), total_bound):
+        model.Add(sum(row[i] for row in x for i in deficit_indices)
+                  <= joint_deficit_count_bound)
+        joint_deficit_rows += 1
     previous_free_group = None
     active_groups, group_counts, root_rows = [], [], []
+    group_objective_bounds = []
+    group_deficit_bounds = []
     distance_rows = separator_rows = 0
     for k, seed in enumerate(seeds):
         reason = cancellation()
         if reason or time.monotonic() >= deadline:
-            return fallback, reason or "UNKNOWN"
+            return construction_fallback(reason), reason or "UNKNOWN"
         root_local = index[_pick_capacity_root(seed, u, E, P, tau)] if seed else 0
         selected = [index[v] for v in fallback[k]]
         selected_set = set(selected)
@@ -7585,7 +7871,8 @@ def _solve_regional_exchange(units, nodes, nb, u, E, P, tau, pop_thresh,
             model.AddHint(active, int(valid_seeds[k]))
         if seed:
             model.Add(sum(row[index[v]] for v in seed) >= active)
-        roots = [model.NewBoolVar(f"regional_root_{k}_{i}") for i in range(n)]
+        roots = [model.NewIntVar(0, int(assignment_allowed[k][i]),
+                                 f"regional_root_{k}_{i}") for i in range(n)]
         root_rows.append(roots)
         model.Add(sum(roots) == active)
         if not seed:
@@ -7600,6 +7887,7 @@ def _solve_regional_exchange(units, nodes, nb, u, E, P, tau, pop_thresh,
         _add_capacity_root_order(
             model, row, roots, local_u, local_e, local_p, tau,
             hint=None if partial_hint else selected, prefix=f"regional_root_{k}",
+            eligible=[i for i in range(n) if assignment_allowed[k][i]],
         )
         _add_asu_feasibility_constraints(
             model, row, local_u, local_e, local_p, tau, pop_thresh,
@@ -7616,15 +7904,47 @@ def _solve_regional_exchange(units, nodes, nb, u, E, P, tau, pop_thresh,
                     component = components[c]
                     model.Add(sum(row[i] for i in component) <=
                               min(group_bound, len(component)) * sum(roots[i] for i in component))
+        group_deficit_bound = joint_deficit_count_bound
+        if local_seeds[k]:
+            group_deficit_bound = min(
+                group_deficit_bound,
+                max(conditional_deficit_bounds[i] for i in local_seeds[k]),
+            )
+        group_deficit_bounds.append(group_deficit_bound)
+        if group_deficit_bound < 0:
+            model.Add(active == 0)
+        elif group_deficit_bound < min(len(deficit_indices), group_bound):
+            model.Add(sum(row[i] for i in deficit_indices)
+                      <= int(group_deficit_bound) * active)
+            joint_deficit_rows += 1
+        # An active seeded group contains at least one of its seed tracts.  The
+        # maximum of their conditional rate-relaxation bounds is therefore a
+        # valid cap for this slot; an unseeded slot uses the global cap.
+        group_objective_bound = min(
+            rate_objective_bound,
+            count_objective_bound(group_bound),
+        ) if rate_objective_bound >= 0 else -1
+        if conditional_bounds and local_seeds[k]:
+            group_objective_bound = min(
+                group_objective_bound,
+                max(conditional_bounds[i] for i in local_seeds[k]),
+            )
+        group_objective_bounds.append(group_objective_bound)
+        if group_objective_bound < 0:
+            model.Add(active == 0)
+        else:
+            model.Add(sum(int(local_u[i]) * row[i] for i in range(n)) <=
+                      int(group_objective_bound) * active)
         if use_joint_cuts:
             if seed:
                 for i, distance in enumerate(_joint_seed_distances(local_nb, local_seeds[k])):
                     if i % 256 == 0:
                         reason = cancellation()
                         if reason or time.monotonic() >= deadline:
-                            return fallback, reason or "UNKNOWN"
+                            return construction_fallback(reason), reason or "UNKNOWN"
                     if distance < 0 or distance + 1 > group_bound:
                         model.Add(row[i] == 0)
+                        assignment_allowed[k][i] = False
                         distance_rows += 1
                     elif distance > 0:
                         model.Add(count >= (distance + 1) * row[i])
@@ -7651,38 +7971,120 @@ def _solve_regional_exchange(units, nodes, nb, u, E, P, tau, pop_thresh,
               f"min_tracts={minimum_count} max_tracts_derived={group_bound} "
               f"graph_cuts={bool(use_joint_cuts)} separator_cuts={separator_rows} "
               f"seed_distance_rows={distance_rows} "
-              f"graph_components={len(components)} fixed_zero_assignments={blocked}", flush=True)
+              f"graph_components={len(components)} fixed_zero_assignments={blocked} "
+              f"relaxation_fixed_zero={len(relaxation_fixed_zero)} "
+              f"deficit_tracts={len(deficit_indices)} "
+              f"joint_deficit_count_upper={joint_deficit_count_bound} "
+              f"group_deficit_upper_min={min(group_deficit_bounds)} "
+              f"group_deficit_upper_max={max(group_deficit_bounds)} "
+              f"deficit_count_rows={joint_deficit_rows} "
+              f"group_unemp_upper_min={min(group_objective_bounds)} "
+              f"group_unemp_upper_max={max(group_objective_bounds)}", flush=True)
 
-    objective = (sum(int(local_u[i]) * selected_any[i] for i in range(n)) if partial_hint
-                 else sum(int(local_u[i]) * row[i] for row in x for i in range(n)))
-    model.Add(objective >= baseline)
+    objective_expression = (
+        sum(int(local_u[i]) * selected_any[i] for i in range(n)) if partial_hint
+        else sum(int(local_u[i]) * row[i] for row in x for i in range(n))
+    )
+    # Every active group satisfies q*x_k >= 0 and assignments are disjoint, so
+    # their union also satisfies q*selected_any >= 0. Dropping connectivity,
+    # population, group identity, and seed-overlap constraints therefore gives
+    # the same one-row rate relaxation used by the single-ASU model. Make the
+    # resulting joint cap the objective VARIABLE'S domain, rather than only a
+    # constraint on the expanded expression. CP-SAT otherwise advertises and
+    # searches the raw sum domain (for example 0..125598) even while respecting
+    # the cap as a feasibility row, leaving the exact-flow proof with a bogusly
+    # loose objective bound.
+    objective_feasible = joint_objective_bound >= baseline >= 0
+    objective_upper = max(0, int(joint_objective_bound))
+    objective_lower = min(max(0, int(baseline)), objective_upper)
+    objective = model.NewIntVar(
+        objective_lower, objective_upper, 'regional_objective_unemployment')
+    model.Add(objective == objective_expression)
+    if not objective_feasible:
+        model.AddBoolOr([])
+    elif not partial_hint:
+        model.AddHint(objective, baseline)
+    consolidation_target = None
+    if allow_seed_consolidation and joint_objective_bound == baseline:
+        # The primary objective is now proved: objective == baseline.  Search
+        # only for the secondary outcome the touching caller can accept, namely
+        # a partition with fewer active ASUs.  Without this row CP-SAT is free
+        # to return the hinted incumbent immediately and miss an available
+        # equal-value merge; with it, infeasibility is also a direct proof that
+        # no such consolidation exists.
+        consolidation_target = max(0, sum(bool(unit) for unit in fallback) - 1)
+        model.Add(sum(active_groups) <= consolidation_target)
     model.Maximize(objective)
+    if log:
+        print(f"[STAGE] {stage_prefix}_BOUND "
+              f"lagrangian_unemp_upper={rate_objective_bound} "
+              f"cardinality_unemp_upper={cardinality_objective_bound} "
+              f"joint_unemp_upper={joint_objective_bound} "
+              f"baseline_unemp={baseline} "
+              f"consolidation_active_upper={consolidation_target}", flush=True)
     if use_joint_cuts:
         remaining = max(0.0, deadline - time.monotonic())
+        cut_proof = []
         best, best_obj, cut_status = _joint_connectivity_cut_pass(
-            model, x, root_rows, local_nb, local_u, hint_units,
-            valid_local_candidate, time.monotonic() + min(60.0, .15 * remaining),
+            model, x, root_rows, local_nb, local_u, preheuristic_units,
+            valid_local_candidate, time.monotonic() + min(180, .15 * remaining),
             workers, cancellation, log=log, report=incumbent_report_callback,
             stage_prefix=stage_prefix, objective=objective,
-            cut_cache=cut_cache, global_nodes=nodes)
-        if best_obj > baseline:
+            cut_cache=cut_cache, global_nodes=nodes, proof_out=cut_proof)
+        proved_by_cuts = bool(cut_proof and cut_proof[0])
+        if (best_obj >= baseline and (best_obj > incumbent_baseline or
+                (proved_by_cuts and allow_seed_consolidation
+                 and sum(bool(group) for group in best)
+                 < sum(bool(unit) for unit in fallback)))):
             fallback = [[nodes[i] for i in group] for group in best]
             baseline = best_obj
+            heuristic_confirmed = True
             model.Add(objective >= baseline)
             hint_units = best
             partial_hint = False
             _joint_assignment_hints(model, x, root_rows, active_groups, group_counts,
-                                    selected_any, best, local_u, local_e, local_p, tau)
+                                    selected_any, best, local_u, local_e, local_p, tau,
+                                    objective=objective)
+            if conditional_bounds:
+                newly_fixed = {
+                    i for i, bound in enumerate(conditional_bounds)
+                    if bound < baseline
+                } - relaxation_fixed_zero
+                for i in sorted(newly_fixed):
+                    for k, row in enumerate(x):
+                        model.Add(row[i] == 0)
+                        assignment_allowed[k][i] = False
+                relaxation_fixed_zero.update(newly_fixed)
         if cut_status in ("STOPPED", "SKIPPED"):
+            if heuristic_improved and not heuristic_confirmed:
+                return interruption_fallback, cut_status
             return fallback, cut_status
+        if accept_connected_cut_proof and proved_by_cuts:
+            if log:
+                print(f"[STAGE] {stage_prefix}_CUT_PROOF status=OPTIMAL "
+                      f"unemp={baseline} exact_flow_skipped=1", flush=True)
+            return fallback, "OPTIMAL"
+        if accept_connected_cut_proof and cut_status == "INFEASIBLE":
+            if log:
+                print(f"[STAGE] {stage_prefix}_CUT_PROOF status=INFEASIBLE "
+                      "exact_flow_skipped=1", flush=True)
+            return fallback, cut_status
+        if not exact_flow_after_cuts:
+            if log:
+                print(f"[STAGE] {stage_prefix}_FLOW_DEFERRED "
+                      f"baseline_unemp={incumbent_baseline} "
+                      f"returned_unemp={baseline} reason=cut_only_policy", flush=True)
+            return fallback, "CUT_DEFERRED"
 
     # Build exact connectivity only AFTER the cut-only rounds. The cuts stay
     # in this model; disconnected relaxed assignments never become fallbacks.
     if use_joint_cuts and log:
         print(f"[STAGE] {stage_prefix}_FLOW groups={len(seeds)} "
               f"baseline_unemp={baseline} workers={workers} "
+              f"joint_unemp_upper={joint_objective_bound} "
               f"incumbent_stall_seconds={incumbent_stall_seconds} "
               f"remaining_seconds={max(0, deadline-time.monotonic()):.3f}", flush=True)
+    flow_variables = skipped_flow_edges = skipped_flow_nodes = 0
     for k, (row, roots, active, count) in enumerate(zip(x, root_rows, active_groups, group_counts)):
         selected = hint_units[k]
         root_local = _pick_capacity_root(selected, local_u, local_e, local_p, tau) if selected else 0
@@ -7692,12 +8094,19 @@ def _solve_regional_exchange(units, nodes, nb, u, E, P, tau, pop_thresh,
             if edge_index % 128 == 0:
                 reason = cancellation()
                 if reason or time.monotonic() >= deadline:
-                    return fallback, reason or "UNKNOWN"
+                    return construction_fallback(reason), reason or "UNKNOWN"
+            if not assignment_allowed[k][i] or not assignment_allowed[k][j]:
+                skipped_flow_edges += 1
+                continue
             edge_bound = flow_bound
             if tighten_model:
                 edge_bound = (min(group_bound, len(components[component_of[i]])) - 1
                               if component_of[i] in allowed_components[k] else 0)
+            if edge_bound <= 0:
+                skipped_flow_edges += 1
+                continue
             flow = model.NewIntVar(-edge_bound, edge_bound, f"regional_flow_{k}_{i}_{j}")
+            flow_variables += 1
             for endpoint in (i, j):
                 model.Add(flow <= edge_bound * row[endpoint])
                 model.Add(flow >= -edge_bound * row[endpoint])
@@ -7712,7 +8121,10 @@ def _solve_regional_exchange(units, nodes, nb, u, E, P, tau, pop_thresh,
             if i % 256 == 0:
                 reason = cancellation()
                 if reason or time.monotonic() >= deadline:
-                    return fallback, reason or "UNKNOWN"
+                    return construction_fallback(reason), reason or "UNKNOWN"
+            if not assignment_allowed[k][i]:
+                skipped_flow_nodes += 1
+                continue
             injected = model.NewIntVar(0, group_bound, f"regional_injected_{k}_{i}")
             model.Add(injected <= group_bound * roots[i])
             model.Add(sum(net[i]) == injected - row[i])
@@ -7721,9 +8133,15 @@ def _solve_regional_exchange(units, nodes, nb, u, E, P, tau, pop_thresh,
                 model.Add(injected >= count - group_bound * (1 - roots[i]))
             if not partial_hint:
                 model.AddHint(injected, len(selected) if i == root_local else 0)
+    if use_joint_cuts and log:
+        print(f"[STAGE] {stage_prefix}_FLOW_MODEL flow_variables={flow_variables} "
+              f"skipped_edges={skipped_flow_edges} skipped_nodes={skipped_flow_nodes} "
+              f"relaxation_fixed_zero={len(relaxation_fixed_zero)}", flush=True)
     reason = cancellation()
     remaining_seconds = deadline - time.monotonic()
     if reason or remaining_seconds <= 0:
+        if reason in ("STOPPED", "SKIPPED") and heuristic_improved and not heuristic_confirmed:
+            return interruption_fallback, reason
         return fallback, reason or "UNKNOWN"
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = remaining_seconds
@@ -7780,6 +8198,8 @@ def _solve_regional_exchange(units, nodes, nb, u, E, P, tau, pop_thresh,
         watcher.join()
     status_name = interrupted[0] if interrupted else solver.StatusName(status)
     if status not in (cp_model.FEASIBLE, cp_model.OPTIMAL):
+        if status_name in ("STOPPED", "SKIPPED") and heuristic_improved and not heuristic_confirmed:
+            return interruption_fallback, status_name
         return fallback, status_name
     candidate = [[nodes[i] for i in range(n) if solver.BooleanValue(row[i])] for row in x]
     flat = [v for unit in candidate for v in unit]
@@ -9651,7 +10071,6 @@ def build_many_asus_cpsat(
         if final_asu_polish_time_limit is None
         else float(final_asu_polish_time_limit)
     )
-    regional_exchange_state = _RegionalExchangeState(polish_time_limit)
     feasibility_cache: Dict = {}
 
     def _solve_window(**kwargs):
@@ -9663,16 +10082,71 @@ def build_many_asus_cpsat(
             cache=feasibility_cache, workers=workers, stop_path=stop_flag_path,
         )
 
-    touching_attempts = set()
+    touching_attempts = _TouchingJointAttemptCache()
     touching_sweep = _TouchingJointSweep()
     touching_cut_cache = _JointConnectivityCutCache()
     touching_deferrals = _TouchingJointDeferrals()
+    # Exact touching-flow work shares one build-level allowance.  Expansion
+    # uses the cheaper cut/capacity phase; this budget is reserved for the
+    # post-polish cases where a deterministic legal union cannot settle the
+    # neighborhood.  This prevents several nearly identical windows from each
+    # consuming the full per-model polish limit.
+    touching_joint_seconds_remaining = min(
+        180.0, max(0.0, float(polish_time_limit)),
+    )
 
-    def _resolve_touching_units(units, source, seconds, protected_nodes=(), peer_units=None):
+    def _resolve_touching_units(
+        units, source, seconds, protected_nodes=(), peer_units=None, *,
+        allow_joint=True, allow_exact_flow=None,
+    ):
+        nonlocal touching_joint_seconds_remaining
         if not merge_adjacent:
             return units, 0
+        original_units = [sorted(set(map(int, unit))) for unit in units]
+        # The union of touching valid ASUs is connected and preserves both the
+        # population and unemployment-rate lower bounds.  Prefer that theorem-
+        # backed operation whenever the tract-count limit also permits it.
+        if exact_nodes_per_asu is None and all(component_ok(
+            unit, u, E, P, tau, pop_thresh, nb, max_nodes=max_nodes_per_asu,
+        ) for unit in original_units):
+            united, union_count = _merge_touching_asu_units(
+                original_units, nb, max_nodes=max_nodes_per_asu,
+            )
+            if union_count and all(component_ok(
+                unit, u, E, P, tau, pop_thresh, nb, max_nodes=max_nodes_per_asu,
+            ) for unit in united):
+                if verbose:
+                    print(
+                        f"[STAGE] PARTITION_TOUCHING_SAFE_UNION source={source} "
+                        f"groups_before={len(original_units)} groups_after={len(united)} "
+                        f"merges={union_count} unemp="
+                        f"{sum(int(u[unit].sum()) for unit in united)}",
+                        flush=True,
+                    )
+                return united, union_count
         if not harvest_connectivity_free_asus:
-            return _merge_touching_asu_units(units, nb, max_nodes=max_nodes_per_asu)
+            return original_units, 0
+        if not allow_joint:
+            return original_units, 0
+
+        expansion_sources = {
+            "expansion_round", "harvest_commit", "expansion", "main_commit",
+            "cross_batch", "capacity_sweep",
+        }
+        expansion_phase = source in expansion_sources
+        exact_flow = (not expansion_phase if allow_exact_flow is None
+                      else bool(allow_exact_flow))
+        solve_seconds = max(0.0, float(seconds))
+        if exact_flow:
+            solve_seconds = min(solve_seconds, touching_joint_seconds_remaining)
+            if solve_seconds <= 0:
+                if verbose:
+                    print(
+                        f"[STAGE] PARTITION_TOUCHING_JOINT_COMPLETE source={source} "
+                        "status=BUDGET_EXHAUSTED accepted=0 exact_flow=1",
+                        flush=True,
+                    )
+                return original_units, 0
         available = set(np.flatnonzero(remaining)) - set(protected_nodes)
 
         def preview_factory(nodes, seeds):
@@ -9681,31 +10155,46 @@ def build_many_asus_cpsat(
                 ("touching_joint", source), nodes,
                 [i for i, v in enumerate(nodes) if v in baseline])
 
+        started = time.monotonic()
         try:
-            return _reoptimize_touching_asu_units(
-                units, available, nb, u, E, P, tau, pop_thresh, seconds, workers,
+            result = _reoptimize_touching_asu_units(
+                original_units, available, nb, u, E, P, tau, pop_thresh,
+                solve_seconds, workers,
                 max_nodes=max_nodes_per_asu, exact_nodes=exact_nodes_per_asu,
                 stop_path=stop_flag_path, skip_path=skip_flag_path,
                 attempted=touching_attempts, log=verbose, rel_gap=rel_gap,
                 cut_cache=touching_cut_cache,
                 sweep=touching_sweep,
-                incumbent_stall_seconds=(expansion_stall if source in
-                    ("expansion_round", "harvest_commit", "expansion",
-                     "main_commit", "cross_batch", "capacity_sweep")
-                    else incumbent_stall_seconds),
+                incumbent_stall_seconds=(expansion_stall if expansion_phase
+                                          else incumbent_stall_seconds),
                 source=source, preview_factory=preview_factory,
                 deferrals=touching_deferrals, peer_units=peer_units,
+                exact_flow_after_cuts=exact_flow,
+                max_cluster_groups=2 if expansion_phase else 3,
+                max_cluster_attempts=1,
             )
+            return result
         finally:
+            if exact_flow:
+                touching_joint_seconds_remaining = max(
+                    0.0,
+                    touching_joint_seconds_remaining - (time.monotonic() - started),
+                )
             _clear_incumbent_previews()
 
-    def _reoptimize_committed_touching(source, seconds, protected_nodes=()):
+    def _reoptimize_committed_touching(
+        source, seconds, protected_nodes=(), *, allow_joint=True,
+        allow_exact_flow=None,
+    ):
         nonlocal k
         if not harvest_connectivity_free_asus or not merge_adjacent:
             return False
         units = [np.flatnonzero(asu_id == label).tolist()
                  for label in np.unique(asu_id[asu_id > 0])]
-        updated, changes = _resolve_touching_units(units, source, seconds, protected_nodes)
+        updated, changes = _resolve_touching_units(
+            units, source, seconds, protected_nodes,
+            allow_joint=allow_joint, allow_exact_flow=allow_exact_flow,
+        )
         if not changes:
             return False
         previously_selected = asu_id > 0
@@ -11698,12 +12187,16 @@ def build_many_asus_cpsat(
             )
         return True
 
-    def _merge_committed_asus(stage: str, detail: str = "") -> bool:
+    def _merge_committed_asus(
+        stage: str, detail: str = "", *, allow_joint: bool = True,
+    ) -> bool:
         """Jointly reoptimize partition groups; retain legacy touching unions."""
         if harvest_connectivity_free_asus:
             return _reoptimize_committed_touching(
                 f"{stage} {detail}".strip(),
                 polish_time_limit if polish_time_limit > 0 else standalone_expansion_time_limit,
+                allow_joint=allow_joint,
+                allow_exact_flow=allow_joint,
             )
         if (not merge_adjacent or exact_nodes_per_asu is not None
                 or _stop_requested(stop_flag_path)):
@@ -11814,12 +12307,14 @@ def build_many_asus_cpsat(
 
                 # A polish can make this ASU touch another one. Check now,
                 # before polishing ASUs whose assignments could become stale.
-                # An accepted joint update (or legacy merge) restarts the round
-                # with a freshly computed ASU order and territory.
+                # A safe union restarts the round with a freshly computed ASU
+                # order and territory. Exact joint work waits for the completed
+                # sweep below.
                 if _merge_committed_asus(
                     "FINAL_POLISH_MERGE",
                     f"round={polish_round} checked={polish_position}/{len(polish_ids)} "
                     f"after_asu={asu_number}",
+                    allow_joint=False,
                 ):
                     restart_after_merge = True
                     break
@@ -11828,6 +12323,19 @@ def build_many_asus_cpsat(
                 break
             if restart_after_merge:
                 pending_ids = None
+                start_polish_sweep = True
+                continue
+            # Only after every ASU has seen the current residual territory do
+            # we permit one exact joint neighborhood.  Per-ASU hooks above use
+            # safe union only, avoiding a sequence of highly overlapping flow
+            # models.  The shared budget and proof-aware cache bound retries.
+            if pending_ids is None and merge_adjacent and _merge_committed_asus(
+                "FINAL_POLISH_JOINT",
+                f"round={polish_round} after_complete_sweep=1",
+                allow_joint=True,
+            ):
+                pending_ids = None
+                start_polish_sweep = True
                 continue
             start_polish_sweep = True
             if touching_sweep.pending:
@@ -11872,32 +12380,28 @@ def build_many_asus_cpsat(
                 )
 
     def _settle_late_merges(stage: str) -> bool:
-        if not _merge_committed_asus(f"{stage}_MERGE"):
+        committed_units = [
+            np.flatnonzero(asu_id == label).tolist()
+            for label in np.unique(asu_id[asu_id > 0])
+        ]
+        if not any(
+            _asu_units_touch(left, right, nb)
+            for index, left in enumerate(committed_units)
+            for right in committed_units[index + 1:]
+        ):
             return False
-        _run_final_polish()
-        if harvest_connectivity_free_asus:
-            while _merge_committed_asus(f"{stage}_TOUCHING_JOINT"):
-                _run_final_polish()
-        return True
+        before = asu_id.tobytes()
+        safe_changed = _merge_committed_asus(
+            f"{stage}_MERGE", allow_joint=False,
+        )
+        # If a size cap blocks safe union, the completed polish sweep itself
+        # schedules the one bounded exact joint fallback.  Thus takeover and
+        # residual hooks cannot bypass the post-sweep policy.
+        if safe_changed or polish_enabled:
+            _run_final_polish()
+        return safe_changed or asu_id.tobytes() != before
 
     _run_final_polish()
-
-    # Joint regional exchanges account for donor feasibility during selection,
-    # before the larger takeover's sequential donor-repair attempt.
-    while polish_time_limit > 0 and not _stop_requested(stop_flag_path):
-        exchanged = _regional_exchange_pass(
-            asu_id, nb, u, E, P, tau, pop_thresh, polish_time_limit, workers,
-            max_nodes=polish_max_nodes, exact_nodes=exact_nodes_per_asu,
-            stop_path=stop_flag_path, skip_path=skip_flag_path, log=verbose,
-            exchange_state=regional_exchange_state,
-            stop_after_gain=True,
-        )
-        if np.array_equal(exchanged, asu_id):
-            break
-        asu_id = exchanged
-        remaining = asu_id <= 0
-        _emit_progress("REGIONAL_EXCHANGE")
-        _settle_late_merges("REGIONAL_EXCHANGE")
 
     # ---- Single-ASU full-visibility takeover pass ----
     # After polish/merge settles, let the single biggest (by unemployment
