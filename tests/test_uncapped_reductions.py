@@ -10,13 +10,47 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "inst" / "python"))
 from asu_cpsat import (
+    _lagrangian_objective_bound_cached,
     _lagrangian_conditional_bounds,
+    _lagrangian_objective_bound,
     _profitable_closure_edges,
     solve_one_asu_cpsat,
 )
 
 
 class UncappedReductionsTest(unittest.TestCase):
+    def test_global_bound_against_enumeration_and_cache(self):
+        rng = random.Random(8921)
+        _lagrangian_objective_bound_cached.cache_clear()
+        for n in range(1, 9):
+            for _ in range(50):
+                u = [rng.randrange(21) for _ in range(n)]
+                q = [rng.randrange(-20, 21) for _ in range(n)]
+                forced = {i for i in range(n) if rng.random() < 0.2}
+                bound = _lagrangian_objective_bound(u, q, forced)
+                feasible = []
+                for mask in range(1 << n):
+                    selected = {i for i in range(n) if mask & (1 << i)}
+                    if forced <= selected and sum(q[i] for i in selected) >= 0:
+                        feasible.append(selected)
+                if feasible:
+                    self.assertGreaterEqual(
+                        bound, max(sum(u[i] for i in selected) for selected in feasible)
+                    )
+                else:
+                    self.assertEqual(bound, -1)
+        misses = _lagrangian_objective_bound_cached.cache_info().misses
+        self.assertEqual(
+            _lagrangian_objective_bound([10, 1], [1, -1], {0}), 11
+        )
+        first = _lagrangian_objective_bound_cached.cache_info()
+        self.assertEqual(
+            _lagrangian_objective_bound([10, 1], [1, -1], {0}), 11
+        )
+        second = _lagrangian_objective_bound_cached.cache_info()
+        self.assertEqual(first.misses, misses + 1)
+        self.assertEqual(second.hits, first.hits + 1)
+
     def test_conditional_bounds_against_enumeration(self):
         rng = random.Random(73419)
         for n in range(1, 9):

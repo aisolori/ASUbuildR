@@ -185,5 +185,49 @@ class PolishFollowupTest(unittest.TestCase):
         self.assertIn("seconds_remaining=0.000", log)
 
 
+class PartitionWorkspaceCacheTest(unittest.TestCase):
+    def test_repartition_gain_reuses_compiled_territory(self):
+        frame = pd.DataFrame({
+            "geoid": ["0", "1", "2"],
+            "tract_ASU_unemp": [10, 1, 1],
+            "tract_ASU_emp": [0, 0, 0],
+            "tract_pop2024": [10000, 10000, 10000],
+        })
+        info = dict(
+            connectivity_free_standalone_asus=[[0]], hint_valid=False,
+            hint_improved=[], hint_obj_val=None, hint_source="test",
+            n_contracted=3, root_component=[0],
+        )
+        compiled_neighbors = []
+
+        def solve(**kwargs):
+            compiled_neighbors.append(kwargs["nb_local"])
+            selected = [0, 1] if len(compiled_neighbors) == 1 else kwargs["hint"]
+            return solver.CpsatResult(
+                list(selected), kwargs["root_local"],
+                int(kwargs["u_g"][selected].sum()), "FEASIBLE",
+            )
+
+        output = io.StringIO()
+        with (
+            patch.object(solver, "_prepare_window_hint", return_value=info),
+            patch.object(solver, "solve_one_asu_cpsat", side_effect=solve),
+            patch.object(solver, "_search_unassigned_asu", return_value=([], "INFEASIBLE")),
+            contextlib.redirect_stdout(output),
+        ):
+            result = solver.build_many_asus_cpsat(
+                frame, [[1], [0, 2], [1]], .1, 10000,
+                max_asus=1, full_graph_window=True,
+                harvest_connectivity_free_asus=True, merge_adjacent=False,
+                standalone_expansion_time_limit=1,
+                final_asu_polish_time_limit=0, verbose=True, workers=1,
+            )
+
+        self.assertEqual(result["asu_id"], [1, 1, -1])
+        self.assertEqual(len(compiled_neighbors), 2)
+        self.assertIs(compiled_neighbors[0], compiled_neighbors[1])
+        self.assertIn("reused compiled territory: 3 tracts", output.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

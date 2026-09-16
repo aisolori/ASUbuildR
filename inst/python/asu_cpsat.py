@@ -31,7 +31,9 @@ from __future__ import annotations
 
 import argparse
 from bisect import bisect_right
+from collections import deque
 import concurrent.futures
+from functools import lru_cache
 import heapq
 import json
 import math
@@ -186,41 +188,40 @@ def _partition_standalone_expansion_territories(
         unit_priority = [-int(u[np.array(nodes, dtype=int)].sum()) for nodes in standalone_units]
 
     owner = np.full(n, -1, dtype=int)
-    distance = np.full(n, np.iinfo(np.int32).max, dtype=np.int64)
-    queue: List[Tuple[int, int, int, int]] = []
-    for unit_index, nodes in enumerate(standalone_units):
-        for raw_node in nodes:
+    distance = np.full(n, -1, dtype=np.int64)
+    queue = deque()
+    # This is an unweighted multi-source shortest-path problem, so a FIFO BFS
+    # is sufficient. Seeding the queue in owner-priority order also resolves
+    # equal-distance ties in exactly that order; by induction, every subsequent
+    # BFS layer is visited in the same owner order. The former heap-based
+    # Dijkstra traversal paid O((V + E) log V) for distances that are all one.
+    seed_order = sorted(
+        range(len(standalone_units)),
+        key=lambda unit_index: (unit_priority[unit_index], unit_index),
+    )
+    for unit_index in seed_order:
+        for raw_node in sorted(map(int, standalone_units[unit_index])):
             node = int(raw_node)
             if not (0 <= node < n) or not allowed_mask[node]:
                 continue
             if owner[node] >= 0 and owner[node] != unit_index:
                 raise ValueError("standalone ASU seeds must be disjoint")
+            if owner[node] == unit_index:
+                continue
             owner[node] = unit_index
             distance[node] = 0
-            heapq.heappush(queue, (0, unit_priority[unit_index], unit_index, node))
+            queue.append(node)
 
     while queue:
-        node_distance, _, unit_index, node = heapq.heappop(queue)
-        if distance[node] != node_distance or owner[node] != unit_index:
-            continue
+        node = queue.popleft()
+        node_distance = int(distance[node])
+        unit_index = int(owner[node])
         for neighbor in nb[node]:
-            if not allowed_mask[neighbor]:
-                continue
-            candidate = (node_distance + 1, unit_priority[unit_index], unit_index)
-            current_owner = int(owner[neighbor])
-            current = (
-                int(distance[neighbor]),
-                unit_priority[current_owner] if current_owner >= 0 else 0,
-                current_owner,
-            )
-            if candidate >= current:
+            if not allowed_mask[neighbor] or distance[neighbor] >= 0:
                 continue
             distance[neighbor] = node_distance + 1
             owner[neighbor] = unit_index
-            heapq.heappush(
-                queue,
-                (node_distance + 1, unit_priority[unit_index], unit_index, int(neighbor)),
-            )
+            queue.append(int(neighbor))
 
     return [
         np.flatnonzero(owner == unit_index).astype(int).tolist()
@@ -2432,18 +2433,19 @@ def _profitable_closure_edges(nb, u, q):
     ]
 
 
-def _lagrangian_conditional_bounds(u, q, forced):
-    """Floor of min_lambda B_{forced union {i}}(lambda), using exact rationals.
+def _compute_lagrangian_bounds(u_tuple, q_tuple, forced_tuple, conditionals):
+    """Return the global and conditional rate-relaxation objective bounds.
 
     Nonnegative unemployment is required. Dropping connectivity/population
-    gives a valid upper bound. Prefix sums over u/(-q) breakpoints permit each
-    conditional minimum to be found by binary search, without another solve.
-    -1 denotes an infeasible conditional rate row (nonnegative objectives).
+    gives valid upper bounds. Prefix sums over u/(-q) breakpoints permit every
+    conditional minimum to be found by binary search. The bounded cache matters
+    in partition mode, where the same territory may be solved again with a new
+    incumbent but identical economics. -1 denotes an infeasible rate row.
     """
-    u, q = list(map(int, u)), list(map(int, q))
+    u, q = list(map(int, u_tuple)), list(map(int, q_tuple))
     if any(value < 0 for value in u):
         raise ValueError("Lagrangian bounds require nonnegative unemployment")
-    forced = set(forced)
+    forced = set(map(int, forced_tuple))
     events = sorted(
         (Fraction(u[i], -q[i]), i)
         for i in range(len(u)) if i not in forced and q[i] < 0
@@ -2456,21 +2458,19 @@ def _lagrangian_conditional_bounds(u, q, forced):
         prefix_q.append(prefix_q[-1] + q[i])
     total_u, total_q = sum(u), sum(q)
 
-    def value_slope(lam, i):
+    def value_slope(lam, i=None):
         removed = bisect_right(event_points, lam)
         intercept = total_u - prefix_u[removed]
         slope = total_q - prefix_q[removed]
         # Force i back in after its coefficient would otherwise be omitted.
-        if i not in forced and q[i] < 0 and lam * (-q[i]) >= u[i]:
+        if i is not None and i not in forced and q[i] < 0 and lam * (-q[i]) >= u[i]:
             intercept += u[i]
             slope += q[i]
         return intercept + lam * slope, slope
 
-    bounds = []
-    for i in range(len(u)):
+    def bound_for(i=None):
         if value_slope(breaks[-1], i)[1] < 0:
-            bounds.append(-1)
-            continue
+            return -1
         lo, hi = 0, len(breaks) - 1
         while lo < hi:
             mid = (lo + hi) // 2
@@ -2479,8 +2479,40 @@ def _lagrangian_conditional_bounds(u, q, forced):
             else:
                 lo = mid + 1
         value, _ = value_slope(breaks[lo], i)
-        bounds.append(value.numerator // value.denominator)
-    return bounds
+        return value.numerator // value.denominator
+
+    global_bound = bound_for()
+    bounds = tuple(bound_for(i) for i in range(len(u))) if conditionals else ()
+    return global_bound, bounds
+
+
+@lru_cache(maxsize=32)
+def _lagrangian_objective_bound_cached(u_tuple, q_tuple, forced_tuple):
+    return _compute_lagrangian_bounds(
+        u_tuple, q_tuple, forced_tuple, conditionals=False
+    )[0]
+
+
+@lru_cache(maxsize=32)
+def _lagrangian_conditional_bounds_cached(u_tuple, q_tuple, forced_tuple):
+    return _compute_lagrangian_bounds(
+        u_tuple, q_tuple, forced_tuple, conditionals=True
+    )[1]
+
+
+def _lagrangian_objective_bound(u, q, forced):
+    """Floor of the best Lagrangian upper bound for the rate-only relaxation."""
+    return _lagrangian_objective_bound_cached(
+        tuple(map(int, u)), tuple(map(int, q)), tuple(sorted(map(int, forced)))
+    )
+
+
+def _lagrangian_conditional_bounds(u, q, forced):
+    """Bounds when each node is additionally forced into the selection."""
+    bounds = _lagrangian_conditional_bounds_cached(
+        tuple(map(int, u)), tuple(map(int, q)), tuple(sorted(map(int, forced)))
+    )
+    return list(bounds)
 
 
 def _bridge_subtree_zero_fix(
@@ -3051,6 +3083,25 @@ def solve_one_asu_cpsat(
     # Objective: maximize unemployment captured
     obj_expr = sum(int(u_g[i]) * x[i] for i in range(N))
     model.Maximize(obj_expr)
+
+    # Projecting out connectivity and population leaves a one-row 0/1 rate
+    # relaxation. Its exact Lagrangian dual gives an inexpensive integer cap
+    # on the primary objective. CP-SAT can in principle rediscover this through
+    # LP/knapsack reasoning, but stating the cap directly makes it available to
+    # every SAT, probing, and LNS worker from the start of the proof.
+    lagrangian_objective_bound = _lagrangian_objective_bound(
+        u_g, q_surplus, forced_set
+    )
+    if lagrangian_objective_bound < 0:
+        model.AddBoolOr([])
+    else:
+        model.Add(obj_expr <= int(lagrangian_objective_bound))
+    if log:
+        print(
+            "  Lagrangian rate-relaxation bound: unemp <= "
+            f"{lagrangian_objective_bound}",
+            flush=True,
+        )
 
     if objective_upper_bound is not None:
         proposed_upper_bound = int(objective_upper_bound)
@@ -9590,6 +9641,11 @@ def build_many_asus_cpsat(
     poisoned_seeds: Set[Tuple[int, ...]] = set()
     # Graph, economics, and solver settings are immutable within this build.
     optimal_territories: Dict[Tuple, Tuple[int, ...]] = {}
+    # Repartitioning can revisit an unchanged territory after one of its seeds
+    # improves. Cache only immutable window compilation here; hints and roots
+    # remain per-attempt. A small FIFO bound prevents long statewide runs from
+    # retaining every historical induced graph.
+    territory_workspaces: Dict[Tuple[int, ...], Tuple] = {}
     polish_time_limit = (
         standalone_expansion_time_limit
         if final_asu_polish_time_limit is None
@@ -10033,21 +10089,59 @@ def build_many_asus_cpsat(
                         return seed_global, "SEED ONLY"
 
                     expansion_attempted_indices.add(unit_index)
-                    local_index = {
-                        global_node: local_node
-                        for local_node, global_node in enumerate(territory_global)
-                    }
-                    nb_expansion = [
-                        sorted(
-                            local_index[neighbor]
-                            for neighbor in nb[global_node]
-                            if neighbor in local_index
+                    workspace_key = tuple(map(int, territory_global))
+                    workspace = territory_workspaces.get(workspace_key)
+                    if workspace is None:
+                        local_index = {
+                            global_node: local_node
+                            for local_node, global_node in enumerate(territory_global)
+                        }
+                        nb_expansion = [
+                            sorted(
+                                local_index[neighbor]
+                                for neighbor in nb[global_node]
+                                if neighbor in local_index
+                            )
+                            for global_node in territory_global
+                        ]
+                        u_expansion = u[territory_global]
+                        E_expansion = E[territory_global]
+                        P_expansion = P[territory_global]
+                        if "geoid" in df.columns:
+                            stable_values = [
+                                str(df.iloc[global_node]["geoid"])
+                                for global_node in territory_global
+                            ]
+                        else:
+                            stable_values = [
+                                str(global_node).zfill(12)
+                                for global_node in territory_global
+                            ]
+                        stable_order = sorted(
+                            range(len(territory_global)),
+                            key=lambda node: (stable_values[node], node),
                         )
-                        for global_node in territory_global
-                    ]
-                    u_expansion = u[territory_global]
-                    E_expansion = E[territory_global]
-                    P_expansion = P[territory_global]
+                        expansion_tie_rank = [0] * len(territory_global)
+                        for rank, local_node in enumerate(stable_order):
+                            expansion_tie_rank[local_node] = rank
+                        workspace = (
+                            local_index, nb_expansion, u_expansion,
+                            E_expansion, P_expansion, expansion_tie_rank,
+                        )
+                        if len(territory_workspaces) >= 64:
+                            territory_workspaces.pop(next(iter(territory_workspaces)), None)
+                        territory_workspaces[workspace_key] = workspace
+                    else:
+                        if verbose:
+                            print(
+                                f"  [EXPAND] reused compiled territory: "
+                                f"{len(territory_global)} tracts",
+                                flush=True,
+                            )
+                    (
+                        local_index, nb_expansion, u_expansion,
+                        E_expansion, P_expansion, expansion_tie_rank,
+                    ) = workspace
                     seed_local = sorted(
                         local_index[node] for node in seed_global
                     )
@@ -10068,24 +10162,6 @@ def build_many_asus_cpsat(
                             return list(cached), "OPTIMAL"
                         # A stronger feasible seed contradicts the certificate.
                         optimal_territories.pop(territory_key)
-
-                    if "geoid" in df.columns:
-                        stable_values = [
-                            str(df.iloc[global_node]["geoid"])
-                            for global_node in territory_global
-                        ]
-                    else:
-                        stable_values = [
-                            str(global_node).zfill(12)
-                            for global_node in territory_global
-                        ]
-                    stable_order = sorted(
-                        range(len(territory_global)),
-                        key=lambda node: (stable_values[node], node),
-                    )
-                    expansion_tie_rank = [0] * len(territory_global)
-                    for rank, local_node in enumerate(stable_order):
-                        expansion_tie_rank[local_node] = rank
 
                     seed_objective = int(u_expansion[seed_local].sum())
 
