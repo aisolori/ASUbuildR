@@ -131,7 +131,7 @@ class LateStageMergeTest(unittest.TestCase):
             result = solver.build_many_asus_cpsat(
                 frame, nb, .1, 10000, max_asus=3 if mode == "residual" else 2,
                 workers=1, verbose=True, full_graph_window=True,
-                harvest_connectivity_free_asus=True,
+                harvest_connectivity_free_asus=True, final_consolidation=False,
                 standalone_expansion_time_limit=1, final_asu_polish_time_limit=1,
                 merge_adjacent=merge_adjacent, max_nodes_per_asu=max_nodes,
                 combine_capped_asus=False,

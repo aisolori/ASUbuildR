@@ -8,6 +8,7 @@ import unittest
 from unittest.mock import patch
 
 import numpy as np
+import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "inst" / "python"))
 import asu_cpsat as solver
@@ -18,6 +19,88 @@ def chain(n):
 
 
 class TouchingJointTest(unittest.TestCase):
+    def test_polish_peers_finish_before_changed_cluster_retries(self):
+        frame = pd.DataFrame(dict(geoid=list(map(str, range(6))),
+                                  tract_ASU_unemp=[20, 10, 1, 0, 5, 0],
+                                  tract_ASU_emp=[0, 0, 0, 1000, 0, 1000],
+                                  tract_pop2024=list(range(10000, 10006))))
+        events = []
+        original = solver._reoptimize_touching_asu_units
+        def touching(units, *args, **kw):
+            if kw['source'] == 'cross_batch':
+                return units, 0  # Focus this regression on the polish sweep.
+            return original(units, *args, **kw)
+        def joint(units, *args, **kw):
+            events.append(('joint', tuple(map(tuple, units))))
+            return [[0], [1, 2]], 'FEASIBLE'
+        def single(**kw):
+            events.append(('single', int(kw['P_g'][kw['root_local']])-10000))
+            hint = kw.get('hint')
+            return (solver.CpsatResult(hint, kw['root_local'], int(kw['u_g'][hint].sum()), 'FEASIBLE')
+                    if hint else None)
+        with (patch.object(solver, '_reoptimize_touching_asu_units', side_effect=touching),
+              patch.object(solver, '_solve_regional_exchange', side_effect=joint),
+              patch.object(solver, 'solve_one_asu_cpsat', side_effect=single),
+              patch.object(solver, '_regional_exchange_pass', side_effect=lambda a, *args, **kw: a.copy()),
+              patch.object(solver, '_search_unassigned_asu', return_value=([], 'INFEASIBLE'))):
+            solver.build_many_asus_cpsat(
+                frame, chain(6), .1, 10000, initial_asu_id=[1, 2, -1, -1, 3, -1],
+                max_asus=3, harvest_connectivity_free_asus=True, final_consolidation=False,
+                standalone_expansion_time_limit=1, final_asu_polish_time_limit=1,
+                workers=1, verbose=False)
+        joints = [i for i, event in enumerate(events) if event[0] == 'joint']
+        self.assertEqual(len(joints), 2, events)
+        self.assertIn(('single', 4), events[joints[0]+1:joints[1]], events)
+
+    def test_changed_neighborhood_waits_for_next_sweep(self):
+        sweep = solver._TouchingJointSweep()
+        sweep.begin()
+        cache = set()
+        self.run_case([[0], [1]], [2], ([[0], [1, 2]], 'FEASIBLE'),
+                      sweep=sweep, attempted=cache)
+        _, solve = self.run_case([[0], [1, 2]], [3], sweep=sweep, attempted=cache)
+        solve.assert_not_called()
+        self.assertTrue(sweep.pending)
+        # Unrelated clusters still receive their turn, even if free windows overlap.
+        _, solve = self.run_case([[4], [5]], [2, 3, 6], sweep=sweep, attempted=cache)
+        solve.assert_called_once()
+        sweep.begin()
+        _, solve = self.run_case([[0], [1, 2]], [3], sweep=sweep, attempted=cache)
+        solve.assert_called_once()
+
+    def test_sweep_follows_absorbed_members_and_preserves_exact_cache(self):
+        sweep = solver._TouchingJointSweep()
+        sweep.begin()
+        sweep.record({0, 1})
+        self.assertTrue(sweep.blocks({1, 2}))
+        self.assertTrue(sweep.blocks({2, 3}))
+        sweep.begin()
+        cache = set()
+        self.run_case([[0], [1]], [2], sweep=sweep, attempted=cache)
+        _, solve = self.run_case([[0], [1]], [2], sweep=sweep, attempted=cache)
+        solve.assert_not_called()
+        self.assertFalse(sweep.pending)  # Exact hits do not schedule another sweep.
+
+    def test_cross_batch_uses_expansion_stall_and_polish_keeps_general_limit(self):
+        frame = pd.DataFrame(dict(geoid=["0", "1"], tract_ASU_unemp=[10, 10],
+                                  tract_ASU_emp=[0, 0], tract_pop2024=[10000, 10000]))
+        calls = []
+        def touching(units, *args, **kwargs):
+            calls.append((kwargs["source"], kwargs["incumbent_stall_seconds"]))
+            return units, 0
+        with patch.object(solver, "_reoptimize_touching_asu_units", side_effect=touching):
+            solver.build_many_asus_cpsat(
+                frame, chain(2), .1, 10000, max_asus=2, initial_asu_id=[1, 2],
+                harvest_connectivity_free_asus=True, workers=1, verbose=False,
+                standalone_expansion_time_limit=1, final_asu_polish_time_limit=1,
+                expansion_incumbent_stall_seconds=7, incumbent_stall_seconds=37,
+                configure_subsolvers=False, deterministic_ties=False,
+            )
+        self.assertIn(("cross_batch", 7), calls)
+        polish_calls = [(source, limit) for source, limit in calls if source != "cross_batch"]
+        self.assertTrue(polish_calls)
+        self.assertTrue(all(limit == 37 for _, limit in polish_calls), calls)
+
     def run_case(self, units, available, result=None, *, n=7, nb=None, **kwargs):
         args = (units, available, chain(n) if nb is None else nb,
                 np.full(n, 10), np.zeros(n, dtype=int), np.full(n, 10000),

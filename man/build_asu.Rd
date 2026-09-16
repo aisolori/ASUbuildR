@@ -34,6 +34,7 @@ build_asu(
   connectivity_free_time_limit = 10,
   harvest_connectivity_free_asus = FALSE,
   harvest_all_connectivity_free_components = FALSE,
+  partition_seed_strategy = "connectivity_free",
   standalone_expansion_time_limit = 30,
   use_buffer_asu_merge = FALSE,
   buffer_asu_merge_time_limit = NA_real_,
@@ -46,7 +47,10 @@ build_asu(
   parallel_asus = 1L,
   use_flow_first_search = FALSE,
   use_tract_capacity_search = FALSE,
-  use_flow_capacity_hybrid_search = FALSE
+  use_flow_capacity_hybrid_search = FALSE,
+  expansion_incumbent_stall_seconds = NA_real_,
+  final_consolidation = TRUE,
+  polish_consolidated_asus = FALSE
 )
 }
 \arguments{
@@ -57,6 +61,23 @@ build_asu(
 \item{tau}{numeric unemployment rate threshold (e.g. 0.0645)}
 
 \item{pop_thresh}{integer population threshold}
+
+\item{final_consolidation}{Merge touching partition ASUs after all search,
+preserving selected tracts and respecting tract-count limits (default TRUE).}
+
+\item{polish_consolidated_asus}{Optionally polish consolidated groups without
+releasing selected tracts, then consolidate new contacts (default FALSE).}
+
+\item{expansion_incumbent_stall_seconds}{Seconds without incumbent improvement
+before finishing partition repair/expansion. NA inherits the solver default;
+zero disables the limit. Does not change final polishing.}
+
+\item{partition_seed_strategy}{Seed method: \code{"connectivity_free"} (default)
+or \code{"surplus_prune"}. Surplus pruning enables full-graph partitioning,
+removes lowest-surplus tracts while preserving population, and allows splits
+only when all resulting components meet the population threshold. Each is then pruned independently toward the rate threshold. Retained components
+are repaired with pruned tracts excluded; only valid seeds enter outward
+expansion and polishing. No unrestricted fallback runs if repair yields none.}
 
 \item{max_asus}{max number of ASUs to carve}
 

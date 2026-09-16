@@ -65,7 +65,7 @@ class PartitionInterruptionsTest(unittest.TestCase):
                   contextlib.redirect_stdout(output)):
                 result = solver.build_many_asus_cpsat(
                     frame, nb, .2, 10000, max_asus=4, workers=2, verbose=True,
-                    full_graph_window=True, harvest_connectivity_free_asus=True,
+                    full_graph_window=True, harvest_connectivity_free_asus=True, final_consolidation=False,
                     harvest_all_connectivity_free_components=True,
                     standalone_expansion_time_limit=5, final_asu_polish_time_limit=0,
                     combine_capped_asus=False, stop_flag_path=str(stop))
@@ -82,7 +82,8 @@ class PartitionInterruptionsTest(unittest.TestCase):
         self.assertIn(("turn", ((5,),)), turns)
         self.assertIn(("turn", ((7,),)), turns)
         self.assertIn("status=DEFERRED_SKIP", log)
-        self.assertNotIn("PARTITION_EXPANSION round=3", log)
+        self.assertIn("PARTITION_EXPANSION round=3", log)
+        self.assertIn("DEFERRED_SWEEP", log)
 
     def test_stop_after_joint_gain_keeps_result_without_restart_or_false_rejections(self):
         result, events, log = self.run_build("stop_joint")

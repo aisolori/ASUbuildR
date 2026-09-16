@@ -55,7 +55,7 @@ class HarvestValidationTest(unittest.TestCase):
                 max_asus=len(seeds) if max_asus is None else max_asus,
                 workers=workers, verbose=True,
                 full_graph_window=True,
-                harvest_connectivity_free_asus=True,
+                harvest_connectivity_free_asus=True, final_consolidation=False,
                 harvest_all_connectivity_free_components=True,
                 standalone_expansion_time_limit=1,
                 final_asu_polish_time_limit=0,

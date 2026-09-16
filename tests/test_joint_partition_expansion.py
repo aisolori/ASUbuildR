@@ -153,7 +153,7 @@ class JointBuildTest(unittest.TestCase):
         ):
             result = solver.build_many_asus_cpsat(
                 frame, chain(4), .2, 10000, max_asus=2, workers=4, time_limit=1,
-                verbose=True, full_graph_window=True, harvest_connectivity_free_asus=True,
+                verbose=True, full_graph_window=True, harvest_connectivity_free_asus=True, final_consolidation=False,
                 harvest_all_connectivity_free_components=True,
                 joint_partition_expansion=joint, standalone_expansion_time_limit=5,
                 final_asu_polish_time_limit=0, merge_adjacent=merge,

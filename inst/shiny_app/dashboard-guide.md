@@ -56,13 +56,74 @@ access to the unassigned tracts. Ties favor higher total unemployment, then
 the lower ASU number. A merge restarts the round and recalculates this order
 from the updated assignments.
 
-Partitioning seeds come from connected components of the connectivity-free
-solution. Components with the highest total `q_surplus` are selected first:
+Partitioning's **Initial ASU seed method** defaults to connected components of
+the connectivity-free solution. The optional **Surplus pruning** method starts
+with all available tracts and removes negative-surplus tracts in ascending
+`q_surplus` order, preserving the population threshold. Articulation tracts can
+be removed when every resulting component meets the population threshold,
+even if some do not yet meet the unemployment-rate threshold. Each resulting
+component is then pruned independently and may split again. Pruning stops for a component once it qualifies or no eligible
+removal remains. Stalled components are first repaired using only their retained
+tracts; pruned tracts are excluded from these solves. Already-valid components
+need no restricted solve because all their retained tracts are selected. Only
+valid seeds enter outward territory expansion and final polishing, where removed
+tracts become available again. If no valid seeds survive repair, the strategy
+returns no new ASUs rather than falling back to an unrestricted full-graph solve.
+This is not a proof that no ASUs exist.
+
+**Expansion incumbent stall limit (sec)** controls how long retained-component
+repair, sequential/joint expansion, and expansion touching-group solves may run
+without improving an incumbent. The dashboard default is 300 seconds; 0 disables
+this limit. The solve time budget still applies. Final polishing uses the general
+incumbent stall limit. Python/CLI callers can set
+`expansion_incumbent_stall_seconds` / `--expansion-incumbent-stall-seconds`;
+omitting it inherits the general stall setting.
+
+`SURPLUS_PRUNE_COMPONENT` logs each retained component's population, unemployment
+rate, threshold, and exact `q_surplus`. Stalled components also report counts of
+candidate removals blocked by population, nonnegative surplus, or resulting
+components with insufficient population. `SURPLUS_PRUNE_SPLIT` identifies
+accepted splits; `split_pending_prune` reports each child before independent pruning.
+`SURPLUS_PRUNE_REPAIR` and `SURPLUS_PRUNE_REPAIR_COMPLETE` show the restricted
+repair size and whether it produced a valid seed.
+
+With either method, components with the highest total `q_surplus` are selected first:
 this is their signed surplus above the unemployment-rate threshold, summed
 over all their tracts. Ties favor higher total unemployment, then stable tract
 order. The available Max ASUs slots limit how many seeds are expanded at once.
 Expansion still maximizes captured unemployment, and candidates must meet the
 rate, population, and connectivity requirements before being committed.
+
+**Consolidate touching ASUs at the end** is enabled by default for partitioning.
+After the search stages, it deterministically unions eligible touching groups,
+preserving every selected tract and the total captured unemployment. It respects
+the tract cap; exact tract-count requirements prevent consolidation. This quick
+cleanup also runs after Stop. It does not depend on a joint solve finding a merge.
+
+Touching-ASU joint solves reuse generated connectivity cuts within the current
+run when the tract window and adjacency match exactly. Cuts use global tract IDs
+and are applied to the current group slots with their current root variables,
+so changes in seed boundaries or group order do not discard reusable graph cuts.
+Changed windows or adjacency do not reuse cuts. Objective bounds, seed-distance
+constraints, and the solver's internal learned clauses are not cached.
+`PARTITION_TOUCHING_JOINT_CUT_CACHE` reports cached cuts and reused model rows;
+`CUT_CACHE_COMPLETE` reports newly stored cuts. Storage is limited to eight
+recent windows and 256 distinct cuts per window; replay adds at most 1,024 rows.
+
+Each touching neighborhood gets at most one joint attempt per complete expansion
+or polish sweep. Boundary changes, relabeling, or a merge do not immediately reset
+its turn. Independent neighborhoods can still run. Mid-sweep restarts retain this
+scheduling state so other ASUs finish before a changed neighborhood is retried.
+`DEFERRED_SWEEP` identifies these postponed attempts. A changed deferred problem
+can trigger a new sweep after peers finish; an exact `CACHED` hit does not.
+This scheduling rule is separate from cut reuse and is not an optimality claim.
+
+**Polish consolidated groups** is optional and off by default. It gives merged
+groups one additional polish attempt using the final-polish budget and general
+incumbent stall limit. Replacements that release selected tracts are discarded.
+Any new contacts are consolidated afterward without starting another polish loop.
+Stop skips additional solves. Logs report `FINAL_CONSOLIDATION` with group counts
+before/after, selected tract count, and captured unemployment.
 
 Set these before starting. Changing a control does not reconfigure a running solve.
 

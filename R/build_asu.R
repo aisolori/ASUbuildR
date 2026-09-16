@@ -76,6 +76,19 @@
 #'   population/UR/connectivity are released rather than committed, so
 #'   correctness is unaffected, but this is unproven for real-data solve speed
 #'   (default FALSE)
+#' @param partition_seed_strategy seed method: `"connectivity_free"` (default)
+#'   or `"surplus_prune"`. Surplus pruning enables full-graph partitioning,
+#'   removes lowest-surplus tracts while preserving population, and allows splits
+#'   only when all resulting components meet the population threshold. Each is then pruned independently toward the rate threshold. Retained components
+#'   are repaired with pruned tracts excluded; only valid seeds enter outward
+#'   expansion and polishing. No unrestricted fallback runs if repair yields none.
+#' @param expansion_incumbent_stall_seconds seconds without incumbent improvement
+#'   before finishing partition repair/expansion. NA inherits the solver default;
+#'   zero disables the limit. Does not change final polishing.
+#' @param final_consolidation merge touching partition ASUs after all search,
+#'   preserving selected tracts and respecting tract-count limits (default TRUE).
+#' @param polish_consolidated_asus optionally polish consolidated groups without
+#'   releasing selected tracts, then consolidate new contacts (default FALSE).
 #' @param standalone_expansion_time_limit seconds allowed for each exact CP-SAT
 #'   expansion of a standalone relaxed component within its assigned disjoint
 #'   territory. The current ASU is a hint and objective floor, so tracts may be
@@ -155,6 +168,7 @@ build_asu <- function(
     connectivity_free_time_limit = 10,
     harvest_connectivity_free_asus = FALSE,
     harvest_all_connectivity_free_components = FALSE,
+    partition_seed_strategy = "connectivity_free",
     standalone_expansion_time_limit = 30,
     use_buffer_asu_merge = FALSE,
     buffer_asu_merge_time_limit = NA_real_,
@@ -167,7 +181,10 @@ build_asu <- function(
     parallel_asus = 1L,
     use_flow_first_search = FALSE,
     use_tract_capacity_search = FALSE,
-    use_flow_capacity_hybrid_search = FALSE
+    use_flow_capacity_hybrid_search = FALSE,
+    expansion_incumbent_stall_seconds = NA_real_,
+    final_consolidation = TRUE,
+    polish_consolidated_asus = FALSE
 ) {
   asu_use_python(required = TRUE)
   asu_assert_ortools_version(required = TRUE)
@@ -229,6 +246,14 @@ build_asu <- function(
     use_bridge_edge_bounds = isTRUE(use_bridge_edge_bounds),
     use_articulation_edge_bounds = isTRUE(use_articulation_edge_bounds),
     use_distance_flow_bounds = isTRUE(use_distance_flow_bounds),
+    partition_seed_strategy = match.arg(partition_seed_strategy, c("connectivity_free", "surplus_prune")),
+    final_consolidation = isTRUE(final_consolidation),
+    polish_consolidated_asus = isTRUE(polish_consolidated_asus),
+    expansion_incumbent_stall_seconds = if (is.na(expansion_incumbent_stall_seconds)) NULL else as.numeric(expansion_incumbent_stall_seconds),
+    harvest_connectivity_free_asus = isTRUE(harvest_connectivity_free_asus),
+    harvest_all_connectivity_free_components = isTRUE(harvest_all_connectivity_free_components),
+    standalone_expansion_time_limit = as.numeric(standalone_expansion_time_limit),
+    final_asu_polish_time_limit = if (is.na(final_asu_polish_time_limit)) NULL else as.numeric(final_asu_polish_time_limit),
     max_nodes_per_asu = if (is.na(max_nodes_per_asu)) NULL else as.integer(max_nodes_per_asu),
     exact_nodes_per_asu = if (is.na(exact_nodes_per_asu)) NULL else as.integer(exact_nodes_per_asu),
     combine_capped_asus = isTRUE(combine_capped_asus),

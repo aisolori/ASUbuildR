@@ -989,6 +989,19 @@ shiny::conditionalPanel(
     ),
     shiny::conditionalPanel(
       condition = "input.cpsat_strategy === 'partition'",
+      shiny::selectInput(
+        "cpsat_partition_seed_strategy", "Initial ASU seed method",
+        choices = c("Connectivity-free components" = "connectivity_free",
+                    "Surplus pruning" = "surplus_prune"),
+        selected = "connectivity_free"
+      ),
+      shiny::numericInput("cpsat_expansion_incumbent_stall_seconds",
+                          "Expansion incumbent stall limit (sec)", value = 300, min = 0, step = 30),
+      shiny::checkboxInput("cpsat_final_consolidation", "Consolidate touching ASUs at the end", value = TRUE),
+      shiny::checkboxInput("cpsat_polish_consolidated_asus", "Polish consolidated groups", value = TRUE),
+      shiny::helpText("Final consolidation preserves every selected tract and respects tract-count limits. Optional polishing uses the final-polish budget and general stall limit, preserves selected tracts, then consolidates any new contacts. Stop still allows the quick consolidation but skips additional solves."),
+      shiny::helpText("Finish retained-component repair and partition expansion solves after this many seconds without an incumbent improvement. Applies to sequential and joint expansion. 0 disables this limit; the solve time budget still applies. Final polishing uses the general stall limit."),
+      shiny::helpText("Surplus pruning starts with all tracts and removes the lowest-surplus tracts while preserving population. A removal may split a component only if every resulting component meets the population threshold; each is then pruned independently toward the rate threshold. Stalled components are repaired using only retained tracts. Valid seeds then enter outward expansion and polishing, where pruned tracts become available again."),
       shiny::checkboxInput(
         "cpsat_joint_partition_expansion",
         "Joint multi-ASU expansion (experimental)", value = FALSE
@@ -1252,6 +1265,8 @@ if (identical(algo_choice, "cpsat")) {
     parallel_asus <- if (is.null(input$cpsat_parallel_asus)) 1L else max(1L, as.integer(input$cpsat_parallel_asus))
     cpsat_strategy <- if (is.null(input$cpsat_strategy) || identical(input$cpsat_strategy, "")) "partition" else as.character(input$cpsat_strategy)
     use_partitioning <- identical(cpsat_strategy, "partition")
+    partition_seed_strategy <- if (use_partitioning && identical(input$cpsat_partition_seed_strategy, "surplus_prune")) "surplus_prune" else "connectivity_free"
+    expansion_incumbent_stall_seconds <- if (is.null(input$cpsat_expansion_incumbent_stall_seconds) || is.na(input$cpsat_expansion_incumbent_stall_seconds)) 300L else max(0L, as.integer(input$cpsat_expansion_incumbent_stall_seconds))
     use_statewide_joint <- identical(cpsat_strategy, "statewide_joint")
     statewide_relaxed_hint <- isTRUE(input$cpsat_statewide_relaxed_hint)
     statewide_tighten_model <- isTRUE(input$cpsat_statewide_tighten_model)
@@ -1513,6 +1528,9 @@ kwargs = dict(
     use_connectivity_free_repair=True,
     connectivity_free_time_limit=60.0,
     harvest_connectivity_free_asus=%s,
+    partition_seed_strategy='%s',
+    final_consolidation=%s,
+    polish_consolidated_asus=%s,
     harvest_all_connectivity_free_components=%s,
     joint_partition_expansion=%s,
     statewide_joint=%s,
@@ -1525,6 +1543,7 @@ kwargs = dict(
     graph_cut_repair_time_limit=60,
     standalone_expansion_time_limit=1800,
     incumbent_stall_seconds=%d,
+    expansion_incumbent_stall_seconds=%d,
     stop_flag_path=r'%s',
     skip_flag_path=r'%s',
     progress_out_path=r'%s'
@@ -1555,6 +1574,9 @@ print('[runner] OK', flush=True)
       py_mod_path, df_csv, nb_json,
         format(tau, scientific = FALSE), pop_thr, max_asus, tlimit, workers, parallel_asus,
   if (use_partitioning) "True" else "False",
+  partition_seed_strategy,
+  if (!identical(input$cpsat_final_consolidation, FALSE)) "True" else "False",
+  if (isTRUE(input$cpsat_polish_consolidated_asus)) "True" else "False",
   if (use_partitioning) "True" else "False",
   if (joint_partition_expansion) "True" else "False",
   if (use_statewide_joint) "True" else "False",
@@ -1564,6 +1586,7 @@ print('[runner] OK', flush=True)
   if (statewide_tighten_model) "True" else "False",
   if (statewide_graph_cuts) "True" else "False",
         incumbent_stall_seconds,
+        expansion_incumbent_stall_seconds,
         stop_file, skip_file,
       progress_json,
       if (is.na(rel_gap)) "None" else as.character(rel_gap),
