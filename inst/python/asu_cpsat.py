@@ -7219,7 +7219,7 @@ def _solve_supernode_polish(nb_local, u_g, E_g, P_g, tau, pop_thresh,
     cut_model = model
     root_rows = [[model.NewConstant(int(i == root)) for i in range(n)]]
     seen_cuts = set()
-    cycle, cut_round_limit, cut_stall_limit = 1, 25, 5
+    cycle, cut_round_limit, cut_stall_limit = 1, 50, 5
     flow_stall_limit = incumbent_stall_seconds
     while True:
         reason = interruption()
@@ -7362,9 +7362,16 @@ def _solve_supernode_polish(nb_local, u_g, E_g, P_g, tau, pop_thresh,
             flow_value = int(engine.Value(objective))
             if not valid_cut_candidate([flow_selected]) or flow_value < best_obj:
                 return fallback
-            best_obj = flow_value
-            selected_hint = set(flow_selected)
-            fallback = CpsatResult(expand([flow_selected]), root_local, best_obj, status_name)
+            # At equal captured unemployment, retain an incumbent that absorbs
+            # more whole donors. A same-value flow response must not discard
+            # an already available merge from the cut pass.
+            donor_start = n - len(donors)
+            if (flow_value > best_obj or
+                    sum(i >= donor_start for i in flow_selected) >=
+                    sum(i >= donor_start for i in selected_hint)):
+                best_obj = flow_value
+                selected_hint = set(flow_selected)
+                fallback = CpsatResult(expand([flow_selected]), root_local, best_obj, status_name)
         flow_bound = engine.BestObjectiveBound()
         if math.isfinite(flow_bound) and best_obj <= flow_bound < 2**53:
             upper = min(upper, math.ceil(flow_bound))
@@ -7375,6 +7382,18 @@ def _solve_supernode_polish(nb_local, u_g, E_g, P_g, tau, pop_thresh,
         if reason:
             fallback.status = reason
             return fallback
+        if status_name == 'STALLED_FEASIBLE':
+            absorbed = sum(i >= n - len(donors) for i in selected_hint)
+            if absorbed and best_obj >= baseline and valid_cut_candidate([sorted(selected_hint)]):
+                # Return to the owner so it validates/commits absorption and
+                # rebuilds the polish queue before spending more time on cuts.
+                fallback.status = status_name
+                if log:
+                    _stage_print(f'[STAGE] FINAL_POLISH_SUPERNODES_STALL_MERGE asu={asu_number} '
+                                 f'cycle={cycle} absorbed_asus={absorbed} '
+                                 f'valid_unemp={best_obj} statewide_gain={best_obj-baseline} '
+                                 'action=return_for_commit', flush=True)
+                return fallback
         if status_name == 'STALLED_FEASIBLE' and not primary_proved:
             if time.monotonic() >= deadline:
                 return fallback

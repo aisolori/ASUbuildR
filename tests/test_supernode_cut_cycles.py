@@ -44,6 +44,9 @@ class SupernodeCutCyclesTest(unittest.TestCase):
                 cut_models.append(model.Clone())
                 kwargs['proof_out'].append(False)
                 kwargs['bound_out'].append(30)
+                if mode in ('cut_merge', 'unknown_merge'):
+                    fallback = [[0, 4]]
+                    self.assertTrue(valid(fallback))
                 value = sum(int(profit[group].sum()) for group in fallback)
                 if mode == 'skip_retry' and len(cuts_seen) == 2:
                     return fallback, value, 'SKIPPED_FEASIBLE'
@@ -57,8 +60,11 @@ class SupernodeCutCyclesTest(unittest.TestCase):
                     engine.parameters.log_to_stdout = False
                     return original_solve(engine, model, *args, **kwargs)
                 selected = {0, 1} if len(flows_seen) == 1 else {0, 1, 2}
+                if mode in ('merge', 'cut_merge', 'unknown_merge'):
+                    selected = {0, 4} if mode == 'merge' else {0}
                 engine.BooleanValue = lambda var: int(var.name.rsplit('_', 1)[1]) in selected
-                engine.Value = lambda var: 15 if len(flows_seen) == 1 else 20
+                engine.Value = lambda var: (10 if mode in ('merge', 'cut_merge', 'unknown_merge')
+                                            else 15 if len(flows_seen) == 1 else 20)
                 engine.BestObjectiveBound = lambda: 30
                 if mode != 'ordinary_end':
                     stopped = threading.Event()
@@ -70,7 +76,7 @@ class SupernodeCutCyclesTest(unittest.TestCase):
                     self.assertTrue(stopped.wait(2), 'stall/cancellation watcher did not stop flow')
                     if mode == 'deadline':
                         clock_offset[0] = 10.0
-                if mode == 'unknown_stall' and len(flows_seen) == 1:
+                if mode in ('unknown_stall', 'unknown_merge') and len(flows_seen) == 1:
                     return solver.cp_model.UNKNOWN
                 return solver.cp_model.FEASIBLE
 
@@ -79,7 +85,9 @@ class SupernodeCutCyclesTest(unittest.TestCase):
                   patch.object(solver.time, 'monotonic', side_effect=lambda: real_clock() + clock_offset[0]),
                   contextlib.redirect_stdout(output)):
                 result = solver._solve_supernode_polish(
-                    [[1], [0, 2], [1, 3], [2, 4], [3]],
+                    ([[1, 4], [0, 2], [1, 3], [2], [0]]
+                     if mode in ('merge', 'cut_merge', 'unknown_merge') else
+                     [[1], [0, 2], [1, 3], [2, 4], [3]]),
                     np.array([10, 5, 5, 10, 20]), np.zeros(5, dtype=int),
                     np.array([10000]*5), .2, 10000, 0, 5, 1,
                     assignments=np.array([1, -1, -1, -1, 2]), asu_number=1, hint=[0],
@@ -135,6 +143,17 @@ class SupernodeCutCyclesTest(unittest.TestCase):
         self.assertEqual((len(cuts), len(flows)), (3, 3))
         self.assertEqual(cuts[1][3], [[0]])
         self.assertEqual((result.obj, result.status), (30, 'OPTIMAL'))
+
+    def test_stall_returns_available_merge_without_retry_even_at_equal_coverage(self):
+        for mode in ('merge', 'cut_merge', 'unknown_merge'):
+            with self.subTest(mode=mode):
+                result, cuts, flows, _, log = self.run_case(mode)
+                self.assertEqual((len(cuts), len(flows)), (1, 1))
+                self.assertEqual(result.sel_idx_local, [0, 4])
+                self.assertEqual((result.obj, result.status), (10, 'STALLED_FEASIBLE'))
+                self.assertIn('[STAGE] FINAL_POLISH_SUPERNODES_STALL_MERGE ', log)
+                self.assertIn('statewide_gain=0', log)
+                self.assertNotIn('[STAGE] FINAL_POLISH_SUPERNODES_RETRY_CUTS ', log)
 
 
 if __name__ == '__main__':

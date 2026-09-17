@@ -198,7 +198,11 @@ better upper bound, whichever happens first. A better bound resets the stall
 count, not the total round count. There is no individual-cut-count cap.
 Proof, cancellation, and the overall polish time limit can stop it sooner.
 Exact flow retains the cuts and best connected solution and uses the remaining
-time. If the primary flow solve reaches its incumbent stall limit without a
+time. If primary flow stalls with a valid incumbent that absorbs another ASU,
+that solution returns immediately for merge validation/commit and the polish
+queue restarts. Equal statewide unemployment is sufficient; coverage cannot
+decrease. `FINAL_POLISH_SUPERNODES_STALL_MERGE` reports this handoff.
+Otherwise, if the primary flow solve reaches its incumbent stall limit without a
 proof, another flow-free cut pass runs with both limits doubled: 50/10, 100/20,
 200/40, and so on. Each flow solve is rebuilt from the accumulated cuts.
 The primary flow incumbent-stall allowance also doubles on each retry:
