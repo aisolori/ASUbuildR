@@ -200,8 +200,10 @@ if (is_dev_mode) {
   source(file.path(r_dir, "run_asu_original.r"))
   source(file.path(r_dir,"setup_asu_python.R"))
   source(file.path(r_dir, "read_asu_warm_start.R"))
+  source(file.path(r_dir, "asu_summary.R"))
 } else {
   asu_read_warm_start <- getFromNamespace("asu_read_warm_start", "ASUbuildR")
+  asu_summarize_tracts <- getFromNamespace("asu_summarize_tracts", "ASUbuildR")
   message("→ Installed package mode: functions should already be available")
 }
 
@@ -492,6 +494,19 @@ shiny::observe({
 })
 
 highlighted_tracts <- shiny::reactiveVal(character(0))
+
+# Keep the shared ASU summary synchronized with the authoritative assignment
+# table. This covers solver completion, manual edits, reset, and RDS loading.
+shiny::observeEvent(full_data(), {
+  current_summary <- asu_summarize_tracts(full_data(), by_asu = TRUE) |>
+    dplyr::select(-`Unemployment Rate Exact`)
+  asu_summary(current_summary)
+}, ignoreNULL = TRUE)
+
+output$asu <- shiny::renderTable({
+  shiny::req(asu_summary())
+  asu_summary()
+}, digits = 3)
 
 # Load static data
 excel_names <- c("record",
@@ -987,7 +1002,6 @@ shiny::conditionalPanel(
       "CP-SAT strategy",
       choices = c(
         "Partitioning strategy (potential multiple ASUs)" = "partition",
-        "Statewide joint multi-ASU (experimental)" = "statewide_joint",
         "Legacy single-ASU solve" = "single"
       ),
       selected = "single"
@@ -996,7 +1010,7 @@ shiny::conditionalPanel(
     shiny::conditionalPanel(
       condition = "input.cpsat_use_warm_start === true",
       shiny::fileInput("cpsat_warm_start", "Warm-start RDS", accept = ".rds", multiple = FALSE),
-      shiny::helpText("Matches GEOID plus asunum/asu_id to the current input data. Saved groups must meet current thresholds and connectivity. Max ASUs includes these groups. In statewide mode, the file replaces automatic seed search and relaxed hints; assignments remain changeable.")
+      shiny::helpText("Matches GEOID plus asunum/asu_id to the current input data. Saved groups must meet current thresholds and connectivity. Max ASUs includes these groups; assignments remain changeable.")
     ),
     shiny::conditionalPanel(
       condition = "input.cpsat_strategy === 'partition'",
@@ -1017,33 +1031,26 @@ shiny::conditionalPanel(
         "cpsat_joint_partition_expansion",
         "Joint multi-ASU expansion (experimental)", value = FALSE
       ),
+      shiny::checkboxInput(
+        "cpsat_use_bridge_pair",
+        "Try only a specific bridge pair", value = FALSE
+      ),
+      shiny::conditionalPanel(
+        condition = "input.cpsat_use_bridge_pair === true",
+        shiny::numericInput("cpsat_bridge_asu1", "First ASU ID", value = 1, min = 1, step = 1),
+        shiny::numericInput("cpsat_bridge_asu2", "Second ASU ID", value = 2, min = 1, step = 1),
+        shiny::helpText("These IDs are evaluated after final polishing. The requested pair is tried even when it is more than three hops apart; all other bridge pairs are skipped.")
+      ),
       shiny::helpText("When enabled, up to three neighboring seed territories are pooled into one solve. Batches run sequentially with all workers and a shared 1800-second limit per batch. May use more memory; invalid seeds may remain inactive."),
       shiny::helpText("In partitioning, touching ASUs are jointly reoptimized with all reachable unassigned tracts instead of automatically merged. Roots and boundaries can move; the solver may keep separate groups or consolidate them. Combined unemployment cannot decrease. Graph cuts and a connectivity pre-pass are enabled automatically for these touching solves, independent of the joint-expansion checkbox. Each touching-cluster solve uses all workers and the expansion/polish budget (1800 seconds in this dashboard); the pre-pass shares that budget.")
     ),
     shiny::numericInput("cpsat_tau",       "UR threshold (τ)",          value = 0.0645, min = 0, max = 1, step = 0.0001),
     shiny::numericInput("cpsat_pop",       "Population threshold",      value = 10000,  min = 0, step = 100),
     shiny::numericInput("cpsat_max",       "Max ASUs",                  value = 30,     min = 1, step = 1),
-    shiny::conditionalPanel(
-      condition = "input.cpsat_strategy !== 'statewide_joint'",
-      shiny::numericInput("cpsat_timelimit", "Time limit (sec) per window", value = 18000, min = 0, step = 60)
-    ),
-    shiny::conditionalPanel(
-      condition = "input.cpsat_strategy === 'statewide_joint'",
-      shiny::numericInput("cpsat_statewide_seed_seconds", "Statewide seed search (sec)", value = 60, min = 0, step = 10),
-      shiny::numericInput("cpsat_statewide_seconds", "Statewide joint solve (sec)", value = 1800, min = 0, step = 60),
-      shiny::checkboxInput("cpsat_statewide_relaxed_hint", "Hint all relaxation-selected tracts", value = TRUE),
-      shiny::checkboxInput("cpsat_statewide_tighten_model", "Tighten statewide joint model", value = TRUE),
-      shiny::checkboxInput("cpsat_statewide_graph_cuts", "Graph cuts + connectivity pre-pass (experimental)", value = FALSE),
-      shiny::helpText("Graph cuts add small-separator and seed-distance constraints, then run a short cut-only pre-pass before exact flow connectivity. The pre-pass shares the joint time limit (at most 60 seconds and 15% of the remaining budget). Disconnected trial groups are never accepted as ASUs."),
-      shiny::helpText("The relaxed hint suggests selection without fixing ownership or flows. Tightening adds derived population, connectivity-region, and flow bounds; it does not impose a tract cap. Turn either option off for comparison."),
-      shiny::helpText("One joint model over all loaded tracts, with up to Max ASUs group slots and all workers. Large states or high Max ASUs values may require substantial memory. Seed search is a separate budget; 0 skips it. Valid seeds are retained as a fallback. No later polishing, takeover, or uncapped combine pass runs.")
-    ),
+    shiny::numericInput("cpsat_timelimit", "Time limit (sec) per window", value = 18000, min = 0, step = 60),
     shiny::numericInput("cpsat_incumbent_stall_seconds", "Incumbent stall limit (sec)", value = 300, min = 0, step = 30),
     shiny::numericInput("cpsat_workers",   "Total CP-SAT workers (detected cores - 2)", value = max(1, parallel::detectCores(logical = FALSE)-2), min = 1, step = 1),
-    shiny::conditionalPanel(
-      condition = "input.cpsat_strategy !== 'statewide_joint'",
-      shiny::numericInput("cpsat_parallel_asus", "Concurrent ASU solves", value = 1, min = 1, step = 1)
-    ),
+    shiny::numericInput("cpsat_parallel_asus", "Concurrent ASU solves", value = 1, min = 1, step = 1),
     shiny::numericInput("cpsat_relgap",        "Relative gap (optional)",    value = NULL, min = 0, step = 0.0001),
     shiny::checkboxInput("cpsat_enable_max_nodes", "Limit tracts per ASU (cap + combine)", value = FALSE),
     shiny::conditionalPanel(
@@ -1099,7 +1106,7 @@ output$algo_blurb <- shiny::renderUI({
          reuses the main <code>Time limit</code> for that legacy pass.
          Partitioning instead jointly reoptimizes touching groups while keeping
          the cap; its touching solves use the expansion/polish budget, not the
-         combine time limit. Statewide joint also keeps any enabled cap.
+         combine time limit.
        </p>
        <p>
          While solving, a live <em>CP-SAT log</em> panel appears (top-right)
@@ -1276,18 +1283,27 @@ if (identical(algo_choice, "cpsat")) {
     cpsat_strategy <- if (is.null(input$cpsat_strategy) || identical(input$cpsat_strategy, "")) "partition" else as.character(input$cpsat_strategy)
     use_partitioning <- identical(cpsat_strategy, "partition")
     partition_seed_strategy <- if (use_partitioning && identical(input$cpsat_partition_seed_strategy, "surplus_prune")) "surplus_prune" else "connectivity_free"
+    bridge_pair <- NULL
+    if (use_partitioning && isTRUE(input$cpsat_use_bridge_pair)) {
+      bridge_pair <- suppressWarnings(as.integer(c(input$cpsat_bridge_asu1,
+                                                    input$cpsat_bridge_asu2)))
+      if (length(bridge_pair) != 2L || anyNA(bridge_pair) ||
+          any(bridge_pair <= 0L) || bridge_pair[1] == bridge_pair[2]) {
+        shiny::showModal(shiny::modalDialog(
+          title = "Invalid bridge pair",
+          "Choose two distinct positive ASU IDs.", easyClose = TRUE
+        ))
+        cpsat_running(FALSE)
+        return(invisible(NULL))
+      }
+      bridge_pair <- sort(bridge_pair)
+      append_cpsat_log(sprintf("[run] requested bridge pair: ASU %d + ASU %d",
+                               bridge_pair[1], bridge_pair[2]))
+    }
     expansion_incumbent_stall_seconds <- if (is.null(input$cpsat_expansion_incumbent_stall_seconds) || is.na(input$cpsat_expansion_incumbent_stall_seconds)) 300L else max(0L, as.integer(input$cpsat_expansion_incumbent_stall_seconds))
-    use_statewide_joint <- identical(cpsat_strategy, "statewide_joint")
-    statewide_relaxed_hint <- isTRUE(input$cpsat_statewide_relaxed_hint)
-    statewide_tighten_model <- isTRUE(input$cpsat_statewide_tighten_model)
-    statewide_graph_cuts <- isTRUE(input$cpsat_statewide_graph_cuts)
-    statewide_seconds <- if (is.null(input$cpsat_statewide_seconds) || !is.finite(input$cpsat_statewide_seconds)) 1800 else max(0, as.numeric(input$cpsat_statewide_seconds))
-    statewide_seed_seconds <- if (is.null(input$cpsat_statewide_seed_seconds) || !is.finite(input$cpsat_statewide_seed_seconds)) 60 else max(0, as.numeric(input$cpsat_statewide_seed_seconds))
     joint_partition_expansion <- use_partitioning && isTRUE(input$cpsat_joint_partition_expansion)
     if (use_partitioning) append_cpsat_log(sprintf("[run] partition expansion mode: %s",
                             if (joint_partition_expansion) "joint (experimental)" else "sequential"))
-    if (use_statewide_joint) append_cpsat_log(sprintf("[run] statewide joint: seed_limit=%.1fs joint_limit=%.1fs max_asus=%d workers=%d",
-                                                      statewide_seed_seconds, statewide_seconds, max_asus, workers))
     rel_gap  <- if (!is.null(input$cpsat_relgap) && !is.na(input$cpsat_relgap)) as.numeric(input$cpsat_relgap) else NA_real_
     max_nodes_enabled <- isTRUE(input$cpsat_enable_max_nodes)
     max_nodes_per_asu <- if (max_nodes_enabled && !is.null(input$cpsat_max_nodes) && !is.na(input$cpsat_max_nodes)) as.integer(input$cpsat_max_nodes) else NA_integer_
@@ -1539,16 +1555,11 @@ kwargs = dict(
     connectivity_free_time_limit=120.0,
     harvest_connectivity_free_asus=%s,
     partition_seed_strategy='%s',
+    bridge_pair=%s,
     final_consolidation=%s,
     polish_consolidated_asus=%s,
     harvest_all_connectivity_free_components=%s,
     joint_partition_expansion=%s,
-    statewide_joint=%s,
-    statewide_joint_time_limit=%s,
-    statewide_seed_time_limit=%s,
-    statewide_relaxed_hint=%s,
-    statewide_tighten_model=%s,
-    statewide_graph_cuts=%s,
     use_graph_cut_repair=True,
     graph_cut_repair_time_limit=120,
     standalone_expansion_time_limit=1800,
@@ -1569,8 +1580,8 @@ COMBINE_TL = %s
 if COMBINE_TL is not None and not (isinstance(COMBINE_TL, float) and math.isnan(COMBINE_TL)):
     kwargs['combine_time_limit'] = int(COMBINE_TL)
 print('[runner] window scope: all remaining tracts', flush=True)
-print('[runner] strategy: ' + ('statewide_joint' if kwargs['statewide_joint'] else ('partition' if kwargs['harvest_connectivity_free_asus'] else 'single')), flush=True)
-print('[runner] search: ' + ('custom joint portfolio' if kwargs['statewide_joint'] else 'flow-capacity-hybrid'), flush=True)
+print('[runner] strategy: ' + ('partition' if kwargs['harvest_connectivity_free_asus'] else 'single'), flush=True)
+print('[runner] search: flow-capacity-hybrid', flush=True)
 print('[runner] launching CP-SAT…', flush=True)
 res = build_many_asus_cpsat(**kwargs)
 print('[runner] solver finished; writing json', flush=True)
@@ -1585,16 +1596,11 @@ print('[runner] OK', flush=True)
         format(tau, scientific = FALSE), pop_thr, max_asus, tlimit, workers, parallel_asus,
   if (use_partitioning) "True" else "False",
   partition_seed_strategy,
+  if (is.null(bridge_pair)) "None" else sprintf("[%d, %d]", bridge_pair[1], bridge_pair[2]),
   if (!identical(input$cpsat_final_consolidation, FALSE)) "True" else "False",
   if (isTRUE(input$cpsat_polish_consolidated_asus)) "True" else "False",
   if (use_partitioning) "True" else "False",
   if (joint_partition_expansion) "True" else "False",
-  if (use_statewide_joint) "True" else "False",
-  format(statewide_seconds, scientific = FALSE),
-  format(statewide_seed_seconds, scientific = FALSE),
-  if (statewide_relaxed_hint) "True" else "False",
-  if (statewide_tighten_model) "True" else "False",
-  if (statewide_graph_cuts) "True" else "False",
         incumbent_stall_seconds,
         expansion_incumbent_stall_seconds,
         stop_file, skip_file,
@@ -2056,7 +2062,7 @@ shiny::observeEvent(input$skip_asu, {
   shiny::req(!is.null(kf), isTRUE(cpsat_running()))
   if (!file.exists(kf)) file.create(kf)
   cpsat_stage_text("skip current asu requested")
-  append_cpsat_log("[run] Skip requested; ending the current solve and retaining eligible incumbent improvements. Touching clusters wait for other queued ASUs before retrying.")
+  append_cpsat_log("[run] Skip requested; ending the current solve and retaining eligible incumbent improvements. Bridge mode advances to the next pair; other queued work follows its stage-specific retry policy.")
 })
 
 # Add this observer to handle closing the log manually
@@ -2638,19 +2644,12 @@ shiny::observeEvent(input$map_resize, {
 
 ```{r}
 preview_data <- shiny::reactive({
-  shiny::req(selected_tracts())
+  shiny::req(full_data(), length(selected_tracts()) > 0)
+  selected_geoids <- as.character(selected_tracts())
   replacement_data <- full_data() |>
     sf::st_drop_geometry() |>
-    subset(GEOID %in% selected_tracts())
-  summary_data <- replacement_data |>
-    dplyr::ungroup() |>
-    dplyr::summarize(
-      tracts = dplyr::n(),
-      population = sum(tract_pop_cur, na.rm = TRUE),
-      lf = sum(tract_ASU_clf, na.rm = TRUE),
-      unemp = sum(tract_ASU_unemp, na.rm = TRUE),
-      ur = round(unemp/lf*100, 5)
-    )
+    dplyr::filter(as.character(GEOID) %in% selected_geoids)
+  summary_data <- asu_summarize_tracts(replacement_data)
   
 
   list(data = replacement_data, summary = summary_data)
@@ -2705,31 +2704,31 @@ shiny::outputOptions(output, "has_selection", suspendWhenHidden = FALSE)
 output$summary_count <- shiny::renderText({
   shiny::req(selected_tracts())
   preview_result <- preview_data()
-  paste("Number of selected tracts:", preview_result$summary$tracts)
+  paste("Number of selected tracts:", preview_result$summary$Tracts)
 })
 
 output$summary_total_pop <- shiny::renderText({
   shiny::req(selected_tracts())
   preview_result <- preview_data()
-  paste("Total population:", format(preview_result$summary$population, big.mark = ","))
+  paste("Total population:", format(preview_result$summary$Population, big.mark = ","))
 })
 
 output$summary_total_labor_force <- shiny::renderText({
   shiny::req(selected_tracts())
   preview_result <- preview_data()
-  paste("Total labor force:", format(preview_result$summary$lf, big.mark = ","))
+  paste("Total labor force:", format(preview_result$summary$`Labor Force`, big.mark = ","))
 })
 
 output$summary_avg_unemployment_rate <- shiny::renderText({
   shiny::req(selected_tracts())
   preview_result <- preview_data()
-  paste("Average unemployment rate:", preview_result$summary$ur, "%")
+  paste("Aggregate unemployment rate:", preview_result$summary$`Unemployment Rate`, "%")
 })
 
 output$summary_total_unemployment <- shiny::renderText({
   shiny::req(selected_tracts())
   preview_result <- preview_data()
-  paste("Total unemployment:", format(preview_result$summary$unemp, big.mark = ","))
+  paste("Total unemployment:", format(preview_result$summary$Unemployment, big.mark = ","))
 })
 
 # Detailed table — interactive DT with bidirectional map-highlight sync
@@ -2896,7 +2895,8 @@ changes.
 *Generate ASU Summary* will show a table of all ASUs, and whether they
 pass or fail the unemployment, population, and contiguity tests. The
 qualification calculation uses the unrounded aggregate rate, even though
-the displayed rate is rounded.
+the displayed rate is rounded. Once generated, the table stays synchronized
+with subsequent assignment edits and threshold changes.
 
 Note, you *may* go back and forth between the selection and review
 screens.
@@ -2926,18 +2926,24 @@ shiny::actionButton("review_txt", "Create Summary CSV")
 ```{r}
 DT::dataTableOutput("asu_review")
 
-summarized_asu <- shiny::reactiveVal(NULL)
+review_summary_requested <- shiny::reactiveVal(FALSE)
 
 shiny::observeEvent(input$run_asu_summary, {
+  review_summary_requested(TRUE)
+})
 
-  shiny::req(full_data())
+summarized_asu <- shiny::reactive({
+  shiny::req(review_summary_requested(), full_data(), input$asu_ur, input$asu_pop)
 
-  asu_sf <- full_data() |> dplyr::filter(asunum > 0.5)
+  asu_sf <- full_data() |>
+    dplyr::mutate(.review_asunum = suppressWarnings(as.integer(as.character(asunum)))) |>
+    dplyr::filter(!is.na(.review_asunum), .review_asunum > 0L)
+  summary_table <- asu_summarize_tracts(full_data(), by_asu = TRUE)
 
   # Contiguity check: use the island-fixed full-state neighbor graph built at
   # load time so that island tracts connected via centroid distance are handled
   # consistently with how the solver built the ASUs.
-  asu_ids <- sort(unique(asu_sf$asunum))
+  asu_ids <- summary_table$asunum
 
   nb_check <- nb_adjacency()
   if (is.null(nb_check)) {
@@ -2955,32 +2961,27 @@ shiny::observeEvent(input$run_asu_summary, {
   }
 
   contiguous_flag <- vapply(asu_ids, function(id) {
-    grp_geoids <- asu_sf |> dplyr::filter(asunum == id) |> dplyr::pull(GEOID)
+    grp_geoids <- asu_sf |>
+      dplyr::filter(.review_asunum == id) |>
+      dplyr::pull(GEOID)
     asu_is_contiguous(grp_geoids, nb_check)
   }, logical(1L))
 
   contiguity_df <- data.frame(asunum = asu_ids, contiguous = contiguous_flag)
 
-  summary_table <- asu_sf |>
-    sf::st_drop_geometry() |>
-    dplyr::group_by(asunum) |>
-    dplyr::summarize(
-      Tracts = dplyr::n(),
-      Population = sum(tract_pop_cur, na.rm = TRUE),
-      `Labor Force` = sum(tract_ASU_clf, na.rm = TRUE),
-      Unemployment = sum(tract_ASU_unemp, na.rm = TRUE),
-      `Unemployment Rate` = round((Unemployment / `Labor Force`) * 100, 5),
-      .groups = "drop"
-    ) |>
+  summary_table |>
     dplyr::left_join(contiguity_df, by = "asunum") |>
     dplyr::mutate(
-      ur_qualified   = dplyr::if_else(`Unemployment Rate` >= input$asu_ur, TRUE, FALSE),
+      ur_qualified   = dplyr::if_else(
+        !is.na(`Unemployment Rate Exact`) &
+          `Unemployment Rate Exact` >= input$asu_ur,
+        TRUE, FALSE
+      ),
       pop_qualified  = dplyr::if_else(Population >= input$asu_pop, TRUE, FALSE),
       contiguous     = contiguous,
       asu_qualified  = ur_qualified & pop_qualified & contiguous
-    )
-
-  summarized_asu(summary_table)
+    ) |>
+    dplyr::select(-`Unemployment Rate Exact`)
 })
 
 output$asu_review <- DT::renderDataTable({

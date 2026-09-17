@@ -116,6 +116,19 @@
 #'   available to later ASUs. New touching ASUs are merged transitively and
 #'   the polish repeats until no new merge occurs. `NA_real_` uses
 #'   `standalone_expansion_time_limit`, and zero disables the final polish
+#'   and partition bridge phase. After polishing, partitioning jointly solves
+#'   every ASU pair within three tract-adjacency edges, including unassigned
+#'   one-hop neighbors, with this time limit per pair. Other ASUs stay fixed;
+#'   pairs run from highest to lowest combined `q_surplus`, and only valid
+#'   increases in total captured unemployment are accepted. Each bridge solve
+#'   runs bounded connectivity cuts before exact flow and retains those cuts in
+#'   the exact model; both stages share this per-pair time limit. The bridge's
+#'   exact-flow solve also uses the configured incumbent stall limit.
+#'   A skip request skips only the current bridge pair; later pairs continue.
+#' @param bridge_pair optional two-element integer vector of positive ASU IDs.
+#'   When supplied in partition mode, the bridge phase tries only this pair,
+#'   regardless of the automatic three-hop distance limit. The IDs refer to the
+#'   assignments that exist after final polishing. `NULL` uses automatic pairs.
 #' @param max_nodes_per_asu optional integer cap on the number of tracts per
 #'   ASU (`NA_integer_` disables the cap, the default). When set, ASUs are
 #'   built up to this size, then touching capped ASUs are combined and
@@ -173,6 +186,7 @@ build_asu <- function(
     use_buffer_asu_merge = FALSE,
     buffer_asu_merge_time_limit = NA_real_,
     final_asu_polish_time_limit = NA_real_,
+    bridge_pair = NULL,
     max_nodes_per_asu = NA_integer_,
     exact_nodes_per_asu = NA_integer_,
     combine_capped_asus = TRUE,
@@ -204,6 +218,19 @@ build_asu <- function(
       paste(enabled_removed_options, collapse = ", "),
       call. = FALSE
     )
+  }
+
+  if (!is.null(bridge_pair)) {
+    bridge_pair <- suppressWarnings(as.integer(bridge_pair))
+    if (length(bridge_pair) != 2L || anyNA(bridge_pair) ||
+        any(bridge_pair <= 0L) || bridge_pair[1] == bridge_pair[2]) {
+      stop("`bridge_pair` must contain two distinct positive ASU IDs.", call. = FALSE)
+    }
+    bridge_pair <- sort(bridge_pair)
+    if (!isTRUE(harvest_connectivity_free_asus)) {
+      stop("`bridge_pair` requires `harvest_connectivity_free_asus = TRUE`.",
+           call. = FALSE)
+    }
   }
 
   # Normalize neighbor indexing to 0-based
@@ -254,6 +281,7 @@ build_asu <- function(
     harvest_all_connectivity_free_components = isTRUE(harvest_all_connectivity_free_components),
     standalone_expansion_time_limit = as.numeric(standalone_expansion_time_limit),
     final_asu_polish_time_limit = if (is.na(final_asu_polish_time_limit)) NULL else as.numeric(final_asu_polish_time_limit),
+    bridge_pair = bridge_pair,
     max_nodes_per_asu = if (is.na(max_nodes_per_asu)) NULL else as.integer(max_nodes_per_asu),
     exact_nodes_per_asu = if (is.na(exact_nodes_per_asu)) NULL else as.integer(exact_nodes_per_asu),
     combine_capped_asus = isTRUE(combine_capped_asus),

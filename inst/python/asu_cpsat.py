@@ -6889,6 +6889,120 @@ def _regional_exchange_windows(assignments, nb, u, *, hops=2, halo_hops=1, eligi
             yield group, sorted(region)
 
 
+def _bridge_windows(assignments, nb, requested_pair=None):
+    """All ASU pairs within three tract edges, with an unassigned one-hop halo.
+
+    A third ASU blocks discovery and is never included in a pair's window.
+    An explicit requested pair bypasses distance discovery.
+    """
+    ids = sorted(set(int(k) for k in assignments if k > 0))
+    units = {k: set(np.flatnonzero(assignments == k).tolist()) for k in ids}
+    if requested_pair is not None:
+        pair = tuple(sorted(map(int, requested_pair)))
+        if all(k in units for k in pair):
+            region = units[pair[0]] | units[pair[1]]
+            halo = {w for v in region for w in nb[v] if assignments[w] <= 0}
+            yield pair, sorted(region | halo)
+        return
+    for anchor in ids:
+        neighbors = set()
+        frontier = units[anchor]
+        reached = set(frontier)
+        for _ in range(3):
+            following = set()
+            for node in frontier:
+                for other in nb[node]:
+                    owner = int(assignments[other])
+                    if owner > anchor:
+                        neighbors.add(owner)
+                    if owner <= 0 and other not in reached:
+                        following.add(other)
+            reached.update(following)
+            frontier = following
+        for other in sorted(neighbors):
+            region = units[anchor] | units[other]
+            halo = {w for v in region for w in nb[v] if assignments[w] <= 0}
+            yield (anchor, other), sorted(region | halo)
+
+
+def _bridge_pass(assignments, nb, u, E, P, tau, pop_thresh, seconds, workers,
+                 *, max_nodes=None, exact_nodes=None, stop_path=None,
+                 skip_path=None, log=False, progress_callback=None,
+                 cut_cache=None, incumbent_stall_seconds=None,
+                 requested_pair=None):
+    """Solve nearby pairs once, highest combined q_surplus first."""
+    current = assignments.copy()
+    attempted = set()
+    cut_cache = cut_cache if cut_cache is not None else _JointConnectivityCutCache()
+    num, den = as_fraction_tau(tau)
+    q_surplus = den * u.astype(np.int64) - num * E.astype(np.int64)
+    if seconds <= 0:
+        return current
+    while not _stop_requested(stop_path):
+        candidates = [(ids, nodes) for ids, nodes in _bridge_windows(
+                          current, nb, requested_pair=requested_pair)
+                      if ids not in attempted]
+        if not candidates:
+            if log and requested_pair is not None and not attempted:
+                print(f"[STAGE] BRIDGE_REQUESTED_PAIR asus={tuple(requested_pair)} "
+                      "outcome=missing_asu", flush=True)
+            break
+        def priority(item):
+            ids, _ = item
+            pair_nodes = np.flatnonzero(np.isin(current, ids))
+            combined_unemployment = int(u[pair_nodes].sum())
+            combined_surplus = int(q_surplus[pair_nodes].sum())
+            return (-combined_surplus, -combined_unemployment, ids)
+        chosen = min(candidates, key=priority)
+        ids, nodes = chosen
+        attempted.add(ids)
+        if _stop_requested(skip_path):
+            _consume_flag(skip_path)
+            if log:
+                print(f"[BRIDGE] skipped before solve: asus={ids}", flush=True)
+            continue
+        units = [np.flatnonzero(current == k).tolist() for k in ids]
+        combined_surplus = sum(int(q_surplus[node]) for unit in units for node in unit)
+        if log:
+            print(f"[STAGE] BRIDGE attempt={len(attempted)} asus={ids} "
+                  f"tracts={len(nodes)} combined_q_surplus={combined_surplus} "
+                  f"seconds={seconds:.1f}", flush=True)
+        candidate, status = _solve_regional_exchange(
+            units, nodes, nb, u, E, P, tau, pop_thresh, seconds, workers,
+            max_nodes=max_nodes, exact_nodes=exact_nodes,
+            stop_path=stop_path, skip_path=skip_path, log=log,
+            use_joint_cuts=True,
+            tighten_model=True,
+            stage_prefix=f"BRIDGE_PAIR_{ids[0]}_{ids[1]}",
+            cut_cache=cut_cache,
+            accept_connected_cut_proof=True,
+            exact_flow_after_cuts=True,
+            incumbent_stall_seconds=incumbent_stall_seconds,
+        )
+        flat = [v for unit in candidate for v in unit]
+        valid = (len(candidate) == len(ids) and len(flat) == len(set(flat))
+                 and set(flat).issubset(nodes)
+                 and all(component_ok(unit, u, E, P, tau, pop_thresh, nb,
+                                      max_nodes=max_nodes, exact_nodes=exact_nodes)
+                         and bool(set(unit) & set(seed))
+                         for unit, seed in zip(candidate, units)))
+        before = sum(int(u[unit].sum()) for unit in units)
+        gain = int(u[flat].sum()) - before if valid else 0
+        if valid and gain > 0:
+            current[np.isin(current, ids)] = -1
+            for label, unit in zip(ids, candidate):
+                current[unit] = label
+            if progress_callback is not None:
+                progress_callback(current)
+        if log:
+            action = "accepted" if valid and gain > 0 else "retained incumbent"
+            print(f"[BRIDGE] {action}: asus={ids}, gain={gain}, status={status}",
+                  flush=True)
+        if status == "STOPPED":
+            break
+    return current
+
+
 def _joint_expansion_batches(territories, nb):
     """Greedily pool up to three touching territories, in seed-priority order.
 
@@ -8197,6 +8311,19 @@ def _solve_regional_exchange(units, nodes, nb, u, E, P, tau, pop_thresh,
         done.set()
         watcher.join()
     status_name = interrupted[0] if interrupted else solver.StatusName(status)
+    if log:
+        solved = status in (cp_model.FEASIBLE, cp_model.OPTIMAL)
+        objective_value = int(round(solver.ObjectiveValue())) if solved else None
+        raw_bound = solver.BestObjectiveBound()
+        best_bound = (math.ceil(raw_bound - 1e-6)
+                      if math.isfinite(raw_bound) and raw_bound < 2**53 else None)
+        relative_gap = (max(0, best_bound - objective_value) /
+                        max(1, abs(objective_value))
+                        if solved and best_bound is not None else None)
+        print(f"[STAGE] {stage_prefix}_COMPLETE status={status_name} "
+              f"objective={objective_value} best_bound={best_bound} "
+              f"relative_gap={relative_gap if relative_gap is not None else 'NA'}",
+              flush=True)
     if status not in (cp_model.FEASIBLE, cp_model.OPTIMAL):
         if status_name in ("STOPPED", "SKIPPED") and heuristic_improved and not heuristic_confirmed:
             return interruption_fallback, status_name
@@ -9637,6 +9764,7 @@ def build_many_asus_cpsat(
     partition_seed_strategy: str = "connectivity_free",
     joint_partition_expansion: bool = False,
     final_asu_polish_time_limit: Optional[float] = None,
+    bridge_pair: Optional[Sequence[int]] = None,
     use_flow_first_search: bool = False,
     use_tract_capacity_search: bool = False,
     use_flow_capacity_hybrid_search: bool = False,
@@ -9719,6 +9847,21 @@ def build_many_asus_cpsat(
     The polish uses
     `final_asu_polish_time_limit` seconds per ASU, or the standalone expansion time
     limit when that option is `None`.
+
+    Partitioning then runs a bridge phase: every pair of ASUs within three
+    tract-adjacency edges is jointly optimized with its unassigned one-hop
+    halo, using the polish time limit per pair. Other ASUs remain fixed and
+    only valid strict gains in total unemployment are accepted. Pairs run by
+    descending combined q_surplus. Each pair is attempted once, with priorities
+    and neighborhoods refreshed after accepted gains. Each bridge solve first
+    adds bounded connectivity cuts, then retains them in its exact-flow model;
+    both steps share the per-pair polish time limit. The exact-flow portion also
+    uses `incumbent_stall_seconds` when configured.
+
+    `bridge_pair`, when supplied, must contain two distinct positive ASU IDs.
+    The bridge phase then tries only that pair, even when it lies beyond the
+    automatic three-hop discovery radius. Both ASUs must still exist after
+    polishing; otherwise the requested bridge solve is logged and skipped.
 
     `exact_nodes_per_asu`, when given, fixes every per-ASU CP-SAT solve (the
     main window solve and, if enabled, the standalone-expansion closure) to
@@ -9819,6 +9962,15 @@ def build_many_asus_cpsat(
     """
     if partition_seed_strategy not in ("connectivity_free", "surplus_prune"):
         raise ValueError("partition_seed_strategy must be connectivity_free or surplus_prune")
+    if bridge_pair is not None:
+        bridge_pair = tuple(map(int, bridge_pair))
+        if len(bridge_pair) != 2 or bridge_pair[0] <= 0 or bridge_pair[1] <= 0:
+            raise ValueError("bridge_pair must contain exactly two positive ASU IDs")
+        if bridge_pair[0] == bridge_pair[1]:
+            raise ValueError("bridge_pair must contain two distinct ASU IDs")
+        bridge_pair = tuple(sorted(bridge_pair))
+        if not harvest_connectivity_free_asus:
+            raise ValueError("bridge_pair requires the partitioning strategy")
     if partition_seed_strategy == "surplus_prune":
         if statewide_joint:
             raise ValueError("surplus_prune seeds require the partitioning strategy")
@@ -12403,6 +12555,23 @@ def build_many_asus_cpsat(
 
     _run_final_polish()
 
+    if harvest_connectivity_free_asus and polish_time_limit > 0 and not _stop_requested(stop_flag_path):
+        def _bridge_progress(updated):
+            nonlocal asu_id, remaining
+            asu_id = updated.copy()
+            remaining = asu_id < 0
+            _emit_progress("BRIDGE")
+
+        asu_id = _bridge_pass(
+            asu_id, nb, u, E, P, tau, pop_thresh, polish_time_limit, workers,
+            max_nodes=polish_max_nodes, exact_nodes=exact_nodes_per_asu,
+            stop_path=stop_flag_path, skip_path=skip_flag_path, log=verbose,
+            progress_callback=_bridge_progress,
+            incumbent_stall_seconds=incumbent_stall_seconds,
+            requested_pair=bridge_pair,
+        )
+        remaining = asu_id < 0
+
     # ---- Single-ASU full-visibility takeover pass ----
     # After polish/merge settles, let the single biggest (by unemployment
     # captured) committed ASU re-solve against every tract in the state --
@@ -13020,6 +13189,14 @@ def main():
         ),
     )
     ap.add_argument(
+        "--bridge-pair", type=int, nargs=2, metavar=("ASU1", "ASU2"),
+        default=None,
+        help=(
+            "In partition mode, run the bridge phase only for these two ASU "
+            "IDs, regardless of their graph distance"
+        ),
+    )
+    ap.add_argument(
         "--max-nodes-per-asu",
         type=int,
         default=None,
@@ -13229,6 +13406,7 @@ def main():
         statewide_graph_cuts=args.statewide_graph_cuts,
         standalone_expansion_time_limit=args.standalone_expansion_time_limit,
         final_asu_polish_time_limit=args.final_asu_polish_time_limit,
+        bridge_pair=args.bridge_pair,
         max_nodes_per_asu=args.max_nodes_per_asu,
         exact_nodes_per_asu=args.exact_nodes_per_asu,
         combine_capped_asus=not args.no_combine_capped_asus,

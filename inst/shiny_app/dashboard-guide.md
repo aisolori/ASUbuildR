@@ -133,20 +133,14 @@ Set these before starting. Changing a control does not reconfigure a running sol
 | UR threshold (τ) | Minimum aggregate rate as a **fraction**. Default `0.0645` means **6.45%**. Do not enter `6.45` here. |
 | Population threshold | Minimum combined population of a candidate. Default `10000`. |
 | Use saved ASUs as a warm start / Warm-start RDS | Available for CP-SAT strategies, off by default. Upload a saved dashboard `.rds` (`sf` or data frame) containing `GEOID`/`geoid` and `asunum`/`asu_id`. Groups are matched to the current data by GEOID and validated before starting. Disable the checkbox to run without the uploaded file. |
-| Statewide joint multi-ASU (experimental) | Separate CP-SAT strategy, not the partitioning checkbox. Builds one joint model over all loaded tracts with up to Max ASUs group slots. Valid component seeds provide a fallback; unused slots can form new ASUs anywhere. Large states and high Max ASUs values can require substantial memory. |
-| Statewide seed search (sec) | Shown only for statewide joint. Default `60`; separate connectivity-free initialization budget. `0` skips the relaxation but still uses cheap valid high-rate components as seeds. |
-| Statewide joint solve (sec) | Shown only for statewide joint. Default `1800`; one shared budget for model construction and the joint solve, not a per-ASU limit. `0` returns the valid seed fallback. Seed search and data loading are separate. |
-| Hint all relaxation-selected tracts | Statewide only; on by default. Supplies partial hints that relaxation-selected tracts belong to some ASU, without choosing ownership or flows. A hint is not a requirement. If the relaxation returns no selection, feasible-seed hints are used instead. Turn off to compare against feasible-seed hints. |
-| Tighten statewide joint model | Statewide only; on by default. Adds population-derived minimum tract counts, disconnected-region restrictions, and tighter flow/count bounds. These are necessary conditions, not an artificial tract cap. Turn off for comparison. |
-| Graph cuts + connectivity pre-pass (experimental) | Statewide only; off by default for comparison. Adds small-separator cuts and seed-distance/count constraints, followed by a bounded cut-only pre-pass. All cuts carry into the final exact flow solve. Works independently of the tightening and relaxed-hint toggles. |
 | Joint multi-ASU expansion (experimental) | Only shown for the partitioning strategy; off by default. Pools up to three neighboring seed territories and jointly assigns their tracts. Each active ASU must independently satisfy connectivity, population, and rate requirements. Batches run sequentially with all workers and 1800 seconds per batch, not per ASU. May use more memory. |
 | Max ASUs | Limit used by the ASU creation loop. Default `30`. It is not a target count; fewer groups may be feasible and merges reduce the count. |
 | Time limit (sec) per window | Budget for an individual main candidate window (the tracts considered in that solve). Default `18000` is five hours. **Not a whole-run limit.** Use positive seconds. Partition expansion has a separate built-in 1800-second budget per solve, also used by default for final polishing. |
 | Incumbent stall limit (sec) | Stops the applicable search after this long without improving its best solution. Default `300` is five minutes; `0` disables it. Bound improvements alone do not reset this timer. |
 | Total CP-SAT workers (detected cores - 2) | Threads available to CP-SAT; initialized from detected physical cores with a minimum of one. More workers use more CPU and may use more memory; they do not guarantee better results. |
 | Concurrent ASU solves | Maximum simultaneous main candidate solves. Default `1`. Main windows share the worker budget. Partition expansions are sequential and receive the full worker budget. |
-| Relative gap (optional) | Allows earlier termination when the solution is close to its bound. `0.01` means approximately 1%. Blank leaves this optional tolerance unset. The gap concerns the current model, not proof of the best statewide arrangement. |
-| Limit tracts per ASU (cap + combine) | Optional restriction, **off by default**. Leave off for unrestricted sizes. Legacy combination can exceed the initial cap; partition touching-joint and statewide joint solves keep it. |
+| Relative gap (optional) | Allows earlier termination when the solution is close to its bound. `0.01` means approximately 1%. Blank leaves this optional tolerance unset. The gap concerns the current model, not proof of the best overall arrangement. |
+| Limit tracts per ASU (cap + combine) | Optional restriction, **off by default**. Leave off for unrestricted sizes. Legacy combination can exceed the initial cap; partition touching-joint solves keep it. |
 | Max tracts per ASU | Appears with the cap enabled. Default `500`. Caps groups except during legacy uncapped combination. |
 | Combine/re-solve time limit (sec, optional) | Appears with the cap enabled. Legacy-only budget for combining capped groups; blank uses the main per-window budget. Partition touching checks instead use the expansion/polish budget. |
 
@@ -183,6 +177,7 @@ infeasibility.
 <<<<<<< HEAD
 | FINAL_POLISH | Reconsidering ASUs from most to least unemployment captured, with ASU number breaking ties. Each can reconsider its own and unassigned tracts; the order is recomputed after a merge. |
 | FINAL_POLISH_MERGE | Restarting polishing after a merge. |
+| BRIDGE | After partition polishing, jointly optimizing each ASU pair within three tract-adjacency edges, including nearby unassigned tracts. Pairs run from highest to lowest combined `q_surplus`. The model uses aggregate and per-ASU unemployment caps, population-derived tract-count bounds, component and seed-distance restrictions, deficit-tract limits, and a bounded connectivity-cut pass to tighten the upper bound before exact flow. A connected optimum from the cut pass is accepted as a proof. The exact solve uses the incumbent stall limit, other ASUs stay fixed, and only valid total unemployment gains are accepted. The optional bridge-pair override tries only the specified post-polish ASU IDs and bypasses the three-hop filter. Skip advances to the next pair. |
 | REGIONAL_EXCHANGE | Letting two or three nearby ASUs exchange tracts together, while keeping every affected ASU valid. Only increases in combined unemployment are accepted. |
 =======
 | FINAL_POLISH | Reconsidering each ASU with unassigned tracts; additions and removals are possible. |
@@ -210,21 +205,6 @@ tract missing from the current data is an error. Duplicate GEOIDs, conflicting
 ID columns, invalid groups, or too many groups for Max ASUs stop the run with
 an explanation; groups are not silently truncated or discarded.
 
-In **Statewide joint**, imported groups replace automatic seed search and the
-relaxed-selection hint. Valid assignment and spanning-tree flow hints are
-supplied instead. The saved groups provide the unemployment baseline and
-their boundaries may change. When merging is enabled, imported group slots
-may deactivate, allowing consolidation and expansion in the same solve. Every
-remaining ASU must still meet connectivity, population, and rate requirements;
-total unemployment coverage cannot fall below the imported baseline. An active
-seeded slot retains at least one of its original tracts. This protects total
-coverage, not individual tracts or ASU identities: some saved tracts may be
-replaced with others. With merging disabled, all imported slots stay active.
-Remaining unseeded slots can form new groups. A timeout with no new solution
-retains the validated starting solution (with the usual final touching-merge
-check when enabled). The statewide time limit still applies. Invalid imported
-groups are still rejected before solving, not repaired by consolidation.
-
 In **Legacy single-ASU** and **Partitioning**, saved groups initialize the
 existing assignments. New ASUs are sought in remaining tracts; the normal
 later polishing, exchange, and merge rules can reconsider saved groups.
@@ -233,87 +213,6 @@ Max ASUs counts both imported and newly created groups.
 The `WARM_START` stage reports imported ASUs, assigned tracts, and baseline
 unemployment. The original RDS is never modified. The edit tab's existing
 **Load Data** control remains separate from this solver warm-start upload.
-The statewide model stage reports `seed_consolidation` and `mandatory_groups`;
-the completion stage reports `deactivated_seed_slots` separately from post-solve
-touching `merges`. Deactivated slots count emptied seed labels, not necessarily
-one-to-one pairwise mergers.
-
-For **Statewide joint multi-ASU (experimental)**, Max ASUs limits the number
-of simultaneous group slots (also bounded by the number of input tracts),
-not the number of batches or a required output count. All loaded tracts are
-available to every group; when multiple states are loaded, the entire loaded
-graph is considered, with connectivity still enforced for each ASU.
-
-**Optional statewide graph cuts.** Enable **Graph cuts + connectivity pre-pass
-(experimental)** to use all three additions:
-
-- Small separators: selecting tracts on both sides of a bottleneck requires
-  selecting at least one connector. These cuts do not fix the ASU's root.
-- Seed-distance/count rows: selecting a tract at least `d` adjacency steps
-  from every original seed tract requires at least `d + 1` selected tracts.
-  Unseeded slots have no seed-distance restriction. These are derived bounds,
-  not user-imposed tract caps, and allow imported seed consolidation.
-- Connectivity cut pre-pass: jointly optimize without flow variables, inspect
-  disconnected groups, add root-aware boundary cuts, and repeat for at most
-  eight rounds. The pre-pass uses at most 60 seconds and 15% of the remaining
-  joint budget, not additional time. Its disconnected trial solutions are not
-  published or accepted. Valid improvements strengthen the fallback and hints.
-
-The final solve still enforces exact flow connectivity and preserves the best
-validated combined unemployment baseline. Stop/Skip work during the pre-pass;
-each solve uses the custom portfolio and configured workers. The stage log
-reports separator/distance row counts, `STATEWIDE_JOINT_CUT_ROUND` statistics
-(relaxed vs. valid unemployment, disconnected components, and cuts added), and
-`STATEWIDE_JOINT_FLOW` when the final flow phase begins. Cuts are capped and
-deduplicated; compare runtime, objective, and bounds with the toggle off, since
-more constraints are not guaranteed to improve performance.
-
-Valid components from the relaxation and cheap high-rate components are
-ranked by signed `q_surplus`, then unemployment. Nonoverlapping valid seeds
-are retained up to Max ASUs, and remaining slots are optional, unseeded groups.
-Automatically selected valid seeds stay active and retain at least one original tract. Their combined
-unemployment is the objective floor, but individual groups may shrink. This
-is a seed-constrained optimization, not a guarantee of the unrestricted
-statewide optimum. Invalid relaxed components do not become committed ASUs;
-their tracts remain available to the joint model. If no valid seeds are found,
-all slots are optional and the fallback is an empty assignment.
-
-The relaxed-selection hint includes tracts from components that are not valid
-ASUs on their own. It suggests membership in any ASU, leaving ownership, roots,
-flows, and unmentioned selections open. The solver may change the hint to make
-the result feasible. In this mode, the previous assignment/flow hints are not
-also installed, avoiding contradictory hints. Valid seed groups remain the
-fallback and still supply the objective floor; the relaxed objective is never
-used as that floor.
-
-The tightening option uses these necessary conditions:
-
-- If even the largest `m-1` tract populations cannot reach the population
-  threshold, each active ASU needs at least `m` tracts. Other active groups must
-  also have room for their minimum counts.
-- A connected ASU stays within one connected component of the full tract
-  graph. A seeded ASU must use a component containing part of its seed.
-  Components with insufficient population cannot host an ASU.
-- A spanning-tree flow for an ASU with `c` tracts needs at most `c-1` units on
-  any edge. Flow domains also use the size of the graph component, and root
-  injection is linked directly to the ASU's tract count.
-
-These bounds preserve feasible tract assignments; they may discard unnecessary
-circulating-flow representations. They do not introduce a user tract cap.
-For comparisons, keep data, Max ASUs, workers, and both time budgets fixed and
-toggle the hint and tightening separately. Improvements in runtime or final
-unemployment are not guaranteed.
-
-Statewide joint uses all configured workers and the custom joint portfolio.
-Relative gap, incumbent stall, Stop, and Skip apply to the joint search.
-Stop or Skip during initialization returns valid seeds without launching the
-joint model; Skip during the joint solve ends that solve and finishes this
-strategy. Incumbent previews do not trigger early merging. Touching groups
-are checked for merging only after the solve, respecting enabled tract limits.
-There are no subsequent partition, polishing, takeover, residual, or uncapped
-combine solves. The normal per-window and concurrent-solve controls do not
-apply. This keeps the statewide experiment's work separate and predictable.
-
 To compare expansion strategies, choose **Partitioning strategy**, then run
 with **Joint multi-ASU expansion (experimental)** off and on using the same
 data and thresholds. Compare total unemployment, valid ASUs, elapsed time,
@@ -356,7 +255,7 @@ with fresh territories/order. Late-stage changes receive the same check.
 
 Touching-ASU solves automatically enable small-separator cuts, seed-distance/
 cardinality constraints, and the connectivity cut pre-pass. These do not depend
-on the optional joint-expansion checkbox or the statewide graph-cuts checkbox.
+on the optional joint-expansion checkbox.
 The pre-pass uses at most eight rounds, 60 seconds, and 15% of the remaining
 joint budget; it does not add time to that budget. Only validated connected
 solutions are retained. Cuts carry into the final exact flow model.
@@ -393,7 +292,7 @@ main-build, and polishing solves finish under their normal stopping conditions
 before touching checks use the returned selection. Stop/Skip and
 configured time, gap, and stall limits still apply. When a completed expansion
 or polish leads to an accepted touching-joint update, its round restarts before
-the next stale solve. Legacy and statewide merging behavior is unchanged.
+the next stale solve. Legacy merging behavior is unchanged.
 
 If a later polish releases tracts that enlarge an earlier ASU's reachable
 window, that ASU can receive a follow-up solve even without a merge. Follow-ups
