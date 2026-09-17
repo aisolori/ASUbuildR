@@ -1031,16 +1031,6 @@ shiny::conditionalPanel(
         "cpsat_joint_partition_expansion",
         "Joint multi-ASU expansion (experimental)", value = FALSE
       ),
-      shiny::checkboxInput(
-        "cpsat_use_bridge_pair",
-        "Try only a specific bridge pair", value = FALSE
-      ),
-      shiny::conditionalPanel(
-        condition = "input.cpsat_use_bridge_pair === true",
-        shiny::numericInput("cpsat_bridge_asu1", "First ASU ID", value = 1, min = 1, step = 1),
-        shiny::numericInput("cpsat_bridge_asu2", "Second ASU ID", value = 2, min = 1, step = 1),
-        shiny::helpText("These IDs are evaluated after final polishing. The requested pair is tried even when it is more than three hops apart; all other bridge pairs are skipped.")
-      ),
       shiny::helpText("When enabled, up to three neighboring seed territories are pooled into one solve. Batches run sequentially with all workers and a shared 1800-second limit per batch. May use more memory; invalid seeds may remain inactive."),
       shiny::helpText("In partitioning, touching ASUs are jointly reoptimized with all reachable unassigned tracts instead of automatically merged. Roots and boundaries can move; the solver may keep separate groups or consolidate them. Combined unemployment cannot decrease. Graph cuts and a connectivity pre-pass are enabled automatically for these touching solves, independent of the joint-expansion checkbox. Each touching-cluster solve uses all workers and the expansion/polish budget (1800 seconds in this dashboard); the pre-pass shares that budget.")
     ),
@@ -1283,23 +1273,6 @@ if (identical(algo_choice, "cpsat")) {
     cpsat_strategy <- if (is.null(input$cpsat_strategy) || identical(input$cpsat_strategy, "")) "partition" else as.character(input$cpsat_strategy)
     use_partitioning <- identical(cpsat_strategy, "partition")
     partition_seed_strategy <- if (use_partitioning && identical(input$cpsat_partition_seed_strategy, "surplus_prune")) "surplus_prune" else "connectivity_free"
-    bridge_pair <- NULL
-    if (use_partitioning && isTRUE(input$cpsat_use_bridge_pair)) {
-      bridge_pair <- suppressWarnings(as.integer(c(input$cpsat_bridge_asu1,
-                                                    input$cpsat_bridge_asu2)))
-      if (length(bridge_pair) != 2L || anyNA(bridge_pair) ||
-          any(bridge_pair <= 0L) || bridge_pair[1] == bridge_pair[2]) {
-        shiny::showModal(shiny::modalDialog(
-          title = "Invalid bridge pair",
-          "Choose two distinct positive ASU IDs.", easyClose = TRUE
-        ))
-        cpsat_running(FALSE)
-        return(invisible(NULL))
-      }
-      bridge_pair <- sort(bridge_pair)
-      append_cpsat_log(sprintf("[run] requested bridge pair: ASU %d + ASU %d",
-                               bridge_pair[1], bridge_pair[2]))
-    }
     expansion_incumbent_stall_seconds <- if (is.null(input$cpsat_expansion_incumbent_stall_seconds) || is.na(input$cpsat_expansion_incumbent_stall_seconds)) 300L else max(0L, as.integer(input$cpsat_expansion_incumbent_stall_seconds))
     joint_partition_expansion <- use_partitioning && isTRUE(input$cpsat_joint_partition_expansion)
     if (use_partitioning) append_cpsat_log(sprintf("[run] partition expansion mode: %s",
@@ -1555,7 +1528,6 @@ kwargs = dict(
     connectivity_free_time_limit=120.0,
     harvest_connectivity_free_asus=%s,
     partition_seed_strategy='%s',
-    bridge_pair=%s,
     final_consolidation=%s,
     polish_consolidated_asus=%s,
     harvest_all_connectivity_free_components=%s,
@@ -1596,7 +1568,6 @@ print('[runner] OK', flush=True)
         format(tau, scientific = FALSE), pop_thr, max_asus, tlimit, workers, parallel_asus,
   if (use_partitioning) "True" else "False",
   partition_seed_strategy,
-  if (is.null(bridge_pair)) "None" else sprintf("[%d, %d]", bridge_pair[1], bridge_pair[2]),
   if (!identical(input$cpsat_final_consolidation, FALSE)) "True" else "False",
   if (isTRUE(input$cpsat_polish_consolidated_asus)) "True" else "False",
   if (use_partitioning) "True" else "False",
@@ -1743,12 +1714,13 @@ print('[runner] OK', flush=True)
 
           if (valid_progress && !identical(progress_asu, last_progress_asu())) {
             # The JSON is cheap to read on every tick. The assignment comparison
-            # ensures the expensive paint update runs only when tract membership
-            # or compact ASU numbering actually changed.
+            # updates the map, committed data, and summary table only when tract
+            # membership or compact ASU numbering actually changed. Expansion
+            # results must be available for saving before polishing finishes.
             if (isTRUE(apply_asu_assignments(
               progress_asu,
               update_reset = FALSE,
-              map_only = TRUE
+              map_only = FALSE
             ))) {
               last_progress_asu(progress_asu)
             }

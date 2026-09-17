@@ -177,7 +177,6 @@ infeasibility.
 <<<<<<< HEAD
 | FINAL_POLISH | Reconsidering ASUs from most to least unemployment captured, with ASU number breaking ties. Each can reconsider its own and unassigned tracts; the order is recomputed after a merge. |
 | FINAL_POLISH_MERGE | Restarting polishing after a merge. |
-| BRIDGE | After partition polishing, jointly optimizing each ASU pair within three tract-adjacency edges, including nearby unassigned tracts. Pairs run from highest to lowest combined `q_surplus`. The model uses aggregate and per-ASU unemployment caps, population-derived tract-count bounds, component and seed-distance restrictions, deficit-tract limits, and a bounded connectivity-cut pass to tighten the upper bound before exact flow. A connected optimum from the cut pass is accepted as a proof. The exact solve uses the incumbent stall limit, other ASUs stay fixed, and only valid total unemployment gains are accepted. The optional bridge-pair override tries only the specified post-polish ASU IDs and bypasses the three-hop filter. Skip advances to the next pair. |
 | REGIONAL_EXCHANGE | Letting two or three nearby ASUs exchange tracts together, while keeping every affected ASU valid. Only increases in combined unemployment are accepted. |
 =======
 | FINAL_POLISH | Reconsidering each ASU with unassigned tracts; additions and removals are possible. |
@@ -187,6 +186,41 @@ infeasibility.
 | FINAL_RESIDUAL_CHECK | Checking remaining tract components near the end. |
 
 Stages may repeat or be skipped depending on the strategy and results.
+
+The post-polish bridge-pair pass has been removed (both cuts and flow).
+Supernode polishing starts with connectivity cuts on the contracted graph.
+Its rounds check ASUs from least to most total unemployment, breaking ties by
+ASU ID and recomputing the order after merges. Ordinary polishing with merging
+disabled retains highest-unemployment-first order.
+`FINAL_POLISH_SUPERNODES_CUT_ROUND` reports the upper bound and its stall count.
+The first cut pass stops after 25 cut rounds or five consecutive rounds without a
+better upper bound, whichever happens first. A better bound resets the stall
+count, not the total round count. There is no individual-cut-count cap.
+Proof, cancellation, and the overall polish time limit can stop it sooner.
+Exact flow retains the cuts and best connected solution and uses the remaining
+time. If the primary flow solve reaches its incumbent stall limit without a
+proof, another flow-free cut pass runs with both limits doubled: 50/10, 100/20,
+200/40, and so on. Each flow solve is rebuilt from the accumulated cuts; valid
+incumbents and certified bounds carry forward. All cycles share the original
+per-ASU time budget, and Stop/Skip ends the cycle sequence. Ordinary time-limit
+termination and stalls during post-proof tie-breaking do not trigger retries.
+`FINAL_POLISH_SUPERNODES_CYCLE` and `FINAL_POLISH_SUPERNODES_RETRY_CUTS` report
+the active cycle and cut limits. Other cut passes retain their existing rules.
+
+Committed expansion assignments update the live ASU data, summary table, and
+map before polishing starts.
+
+Every stage includes `total_unemp` for committed statewide coverage,
+`checking_asus`, and `asus_remaining`. During polishing these are ASU IDs
+and the number still waiting in the current pass, excluding the current ASU.
+Joint checks list all participating IDs. Stage fields `asu`, `checking_asu`,
+and `checking_asus` use the same compact IDs as the current dashboard snapshot,
+including after absorption. When different, `internal_*` fields retain the
+solver IDs for tracing earlier messages. Before commitment, expansion groups
+use `candidate_tract_N` labels, where N is a zero-based member tract index,
+not an ASU ID. Queues are recomputed after repartitioning or merges; counts
+are not a promise of how many future solves remain. Stages with no applicable
+ASU queue report `checking_asus=none asus_remaining=NA`.
 
 ### Starting from a saved RDS solution
 

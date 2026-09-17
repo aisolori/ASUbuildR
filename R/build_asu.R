@@ -116,19 +116,9 @@
 #'   available to later ASUs. New touching ASUs are merged transitively and
 #'   the polish repeats until no new merge occurs. `NA_real_` uses
 #'   `standalone_expansion_time_limit`, and zero disables the final polish
-#'   and partition bridge phase. After polishing, partitioning jointly solves
-#'   every ASU pair within three tract-adjacency edges, including unassigned
-#'   one-hop neighbors, with this time limit per pair. Other ASUs stay fixed;
-#'   pairs run from highest to lowest combined `q_surplus`, and only valid
-#'   increases in total captured unemployment are accepted. Each bridge solve
-#'   runs bounded connectivity cuts before exact flow and retains those cuts in
-#'   the exact model; both stages share this per-pair time limit. The bridge's
-#'   exact-flow solve also uses the configured incumbent stall limit.
-#'   A skip request skips only the current bridge pair; later pairs continue.
-#' @param bridge_pair optional two-element integer vector of positive ASU IDs.
-#'   When supplied in partition mode, the bridge phase tries only this pair,
-#'   regardless of the automatic three-hop distance limit. The IDs refer to the
-#'   assignments that exist after final polishing. `NULL` uses automatic pairs.
+#'   phase. The former post-polish bridge-pair pass is no longer run.
+#' @param bridge_pair deprecated compatibility argument; ignored because the
+#'   bridge-pair phase has been removed.
 #' @param max_nodes_per_asu optional integer cap on the number of tracts per
 #'   ASU (`NA_integer_` disables the cap, the default). When set, ASUs are
 #'   built up to this size, then touching capped ASUs are combined and
@@ -221,16 +211,8 @@ build_asu <- function(
   }
 
   if (!is.null(bridge_pair)) {
-    bridge_pair <- suppressWarnings(as.integer(bridge_pair))
-    if (length(bridge_pair) != 2L || anyNA(bridge_pair) ||
-        any(bridge_pair <= 0L) || bridge_pair[1] == bridge_pair[2]) {
-      stop("`bridge_pair` must contain two distinct positive ASU IDs.", call. = FALSE)
-    }
-    bridge_pair <- sort(bridge_pair)
-    if (!isTRUE(harvest_connectivity_free_asus)) {
-      stop("`bridge_pair` requires `harvest_connectivity_free_asus = TRUE`.",
-           call. = FALSE)
-    }
+    warning("`bridge_pair` is ignored: the bridge-pair phase was removed.", call. = FALSE)
+    bridge_pair <- NULL
   }
 
   # Normalize neighbor indexing to 0-based

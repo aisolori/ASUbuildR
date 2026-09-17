@@ -110,6 +110,27 @@ class ScoutBeforeCutsTest(unittest.TestCase):
         self.assertNotIn('scout:', log)
         self.assertIn('primary optimum proved', log)
 
+    def test_single_cut_pass_stops_after_ten_unchanged_upper_bounds(self):
+        real_solve = solver.cp_model.CpSolver.Solve
+        cut_models = []
+
+        def repeat_relaxation(instance, model, *args, **kwargs):
+            if not self.has_flow(model):
+                cut_models.append(model.Clone())
+                # Simulate repeated disconnected search responses with a
+                # fixed valid upper bound, independently of separator effects.
+                instance.BooleanValue = lambda var: var.name in ('x_0', 'x_2', 'x_3')
+                instance.BestObjectiveBound = lambda: 18
+                return solver.cp_model.FEASIBLE
+            return real_solve(instance, model, *args, **kwargs)
+
+        with patch.object(solver.cp_model.CpSolver, 'Solve', new=repeat_relaxation):
+            result, _, log = self.run_window(scout_before_cuts=False)
+        self.assertEqual(len(cut_models), 11)
+        self.assertEqual((result.obj, result.status), (16, 'OPTIMAL'))
+        self.assertIn('upper_bound_stall=10/10', log)
+        self.assertIn('stop_reason=UPPER_BOUND_STALL', log)
+
     def test_matching_verified_bound_skips_all_primary_solves(self):
         with patch.object(solver.cp_model.CpSolver, 'Solve',
                           side_effect=AssertionError('unnecessary primary solve')):

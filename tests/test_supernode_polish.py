@@ -2,6 +2,7 @@
 import contextlib
 import io
 import itertools
+import re
 from pathlib import Path
 import sys
 from tempfile import TemporaryDirectory
@@ -16,6 +17,120 @@ import asu_cpsat as solver
 
 
 class SupernodePolishTest(unittest.TestCase):
+    def test_cut_proof_skips_flow_when_ties_disabled(self):
+        models = []
+        real_solve = solver.cp_model.CpSolver.Solve
+
+        def capture(engine, model, *args, **kwargs):
+            models.append(model.Clone())
+            return real_solve(engine, model, *args, **kwargs)
+
+        with patch.object(solver.cp_model.CpSolver, 'Solve', new=capture):
+            result = self.solve([10, 5, 20], [0, 0, 0], [1, -1, 2], deterministic_ties=False)
+        self.assertEqual((result.obj, result.status), (15, 'OPTIMAL'))
+        self.assertTrue(models)
+        self.assertFalse(any(v.name.startswith('polish_flow_')
+                             for model in models for v in model.Proto().variables))
+
+    def test_five_stalled_bound_rounds_reset_on_improvement_even_without_new_cuts(self):
+        bounds = [30, 30, 29, 29, 29, 29, 29, 29]
+        cut_models, flow_models, reports = [], [], []
+        real_solve = solver.cp_model.CpSolver.Solve
+
+        def capture(engine, model, *args, **kwargs):
+            if not any(v.name.startswith('polish_flow_') for v in model.Proto().variables):
+                cut_models.append(model.Clone())
+                bound = bounds[len(cut_models) - 1]
+                engine.BooleanValue = lambda var: True
+                engine.BestObjectiveBound = lambda: bound
+                return solver.cp_model.FEASIBLE
+            flow_models.append(model.Clone())
+            engine.parameters.log_to_stdout = False
+            return real_solve(engine, model, *args, **kwargs)
+
+        output = io.StringIO()
+        with (patch.object(solver.cp_model.CpSolver, 'Solve', new=capture),
+              contextlib.redirect_stdout(output)):
+            result = self.solve([10, 5, 20], [0, 0, 0], [1, -1, 2],
+                                deterministic_ties=False, log=True,
+                                incumbent_report_callback=lambda selected, value: reports.append((selected, value)))
+        self.assertEqual(len(cut_models), 8)
+        self.assertEqual(len(flow_models), 1)
+        self.assertEqual((result.obj, result.status), (15, 'OPTIMAL'))
+        self.assertIn(([0, 1, 2], 15), reports)
+        self.assertIn('upper_bound_stall=5/5', output.getvalue())
+        self.assertIn('stop_reason=UPPER_BOUND_STALL', output.getvalue())
+        self.assertIn('bound_carried_to_flow=True', output.getvalue())
+
+    def test_disconnected_or_unknown_rounds_wait_for_bound_stall(self):
+        for unknown in (False, True):
+            with self.subTest(unknown=unknown):
+                cut_models, flow_models = [], []
+                real_solve = solver.cp_model.CpSolver.Solve
+
+                def capture(engine, model, *args, **kwargs):
+                    if not any(v.name.startswith('polish_flow_') for v in model.Proto().variables):
+                        cut_models.append(model.Clone())
+                        engine.BestObjectiveBound = lambda: 20
+
+                        def selected(var):
+                            if var.name.startswith('polish_supernode_'):
+                                return var.name != 'polish_supernode_1'
+                            return model.Proto().variables[var.index].domain[0] == 1
+
+                        engine.BooleanValue = selected
+                        return solver.cp_model.UNKNOWN if unknown else solver.cp_model.FEASIBLE
+                    flow_models.append(model.Clone())
+                    return real_solve(engine, model, *args, **kwargs)
+
+                with patch.object(solver.cp_model.CpSolver, 'Solve', new=capture):
+                    result = self.solve([10, 0, 5, 20], [0, 10, 0, 0], [1, -1, -1, 2],
+                                        deterministic_ties=False)
+                self.assertEqual(len(cut_models), 6)  # Baseline + five stalled rounds.
+                self.assertEqual(len(flow_models), 1)
+                self.assertEqual((result.obj, result.status), (15, 'OPTIMAL'))
+                if not unknown:
+                    self.assertGreater(len(cut_models[-1].Proto().constraints),
+                                       len(cut_models[0].Proto().constraints))
+                    # The flow model extends, rather than replaces, all cuts.
+                    prefix = flow_models[0].Proto().constraints
+                    for index, constraint in enumerate(cut_models[-1].Proto().constraints):
+                        self.assertEqual(str(prefix[index]), str(constraint))
+
+    def test_configured_round_cap_stops_even_when_every_bound_improves(self):
+        cut_models, flow_models = [], []
+        real_solve = solver.cp_model.CpSolver.Solve
+        real_cuts = solver._joint_connectivity_cut_pass
+        configured_limit = []
+
+        def cuts(*args, **kwargs):
+            configured_limit.append(kwargs['max_rounds'])
+            return real_cuts(*args, **kwargs)
+
+        def capture(engine, model, *args, **kwargs):
+            if not any(v.name.startswith('polish_flow_') for v in model.Proto().variables):
+                cut_models.append(model.Clone())
+                self.assertLessEqual(len(cut_models), configured_limit[0])
+                engine.BooleanValue = lambda var: True
+                bound = configured_limit[0] + 100 - len(cut_models)
+                engine.BestObjectiveBound = lambda: bound
+                return solver.cp_model.FEASIBLE
+            flow_models.append(model.Clone())
+            engine.parameters.log_to_stdout = False
+            return real_solve(engine, model, *args, **kwargs)
+
+        output = io.StringIO()
+        with (patch.object(solver.cp_model.CpSolver, 'Solve', new=capture),
+              patch.object(solver, '_joint_connectivity_cut_pass', side_effect=cuts),
+              contextlib.redirect_stdout(output)):
+            result = self.solve([10, 5, 20], [0, 0, 0], [1, -1, 2],
+                                deterministic_ties=False, log=True)
+        self.assertEqual(len(cut_models), configured_limit[0])
+        self.assertEqual(len(flow_models), 1)
+        self.assertEqual((result.obj, result.status), (15, 'OPTIMAL'))
+        self.assertIn('stop_reason=ROUND_LIMIT', output.getvalue())
+        self.assertIn('upper_bound_stall=0/5', output.getvalue())
+
     def solve(self, u, emp, ids, nb=None, **options):
         n = len(u)
         nb = nb or [[j for j in (i-1, i+1) if 0 <= j < n] for i in range(n)]
@@ -116,10 +231,44 @@ class SupernodePolishTest(unittest.TestCase):
         self.assertEqual(result['n_asu'], 1)
         self.assertEqual(len(set(result['asu_id'])), 1)
         self.assertIn('statewide_gain=25 absorbed_asus=1', output.getvalue())
-        # ASU 2 has more surplus, so its two tracts remain individual and
-        # the single-tract ASU 1 becomes the optional donor supernode.
-        self.assertIn('checking_asu=2 position=1/2', output.getvalue())
-        self.assertIn('model_nodes=5 donors=1', output.getvalue())
+        # ASU 1 has less unemployment and goes first. The two-tract ASU 2
+        # becomes a single optional donor supernode.
+        self.assertIn('checking_asu=1 position=1/2', output.getvalue())
+        self.assertIn('model_nodes=4 donors=1', output.getvalue())
+        stage_lines = [line for line in output.getvalue().splitlines() if '[STAGE]' in line]
+        self.assertTrue(stage_lines)
+        for line in stage_lines:
+            self.assertRegex(line, r'\btotal_unemp=\d+\b')
+            self.assertEqual(len(re.findall(r'\btotal_unemp=', line)), 1)
+        self.assertIn('total_unemp=30', stage_lines[0])
+        completed = next(line for line in stage_lines if '[STAGE] FINAL_POLISH_COMPLETE ' in line)
+        self.assertIn('total_unemp=55', completed)
+        self.assertIn('priority=unemployment_ascending', output.getvalue())
+
+    def test_surviving_asu_stage_id_matches_dashboard_after_donor_absorption(self):
+        frame = pd.DataFrame({'tract_ASU_unemp': [10, 20, 50],
+                              'tract_ASU_emp': [0, 0, 0], 'tract_pop2024': [10000]*3})
+        output = io.StringIO()
+        real_solve = solver.cp_model.CpSolver.Solve
+
+        def quiet(engine, model, *args, **kwargs):
+            engine.parameters.log_to_stdout = False
+            return real_solve(engine, model, *args, **kwargs)
+
+        with (contextlib.redirect_stdout(output),
+              patch.object(solver.cp_model.CpSolver, 'Solve', new=quiet),
+              patch.object(solver, '_merge_touching_asu_units',
+                           side_effect=lambda units, *args, **kwargs: (units, 0))):
+            result = solver.build_many_asus_cpsat(
+                frame, [[1], [0], []], .2, 10000, max_asus=3,
+                initial_asu_id=[1, 2, 3], harvest_connectivity_free_asus=True,
+                standalone_expansion_time_limit=0, final_asu_polish_time_limit=5,
+                final_consolidation=False, time_limit=0, workers=1, verbose=True)
+        self.assertEqual(list(result['asu_id']), [1, 1, 2])
+        line = next(line for line in output.getvalue().splitlines()
+                    if 'internal_checking_asu=3' in line)
+        self.assertIn('checking_asu=2 ', line)
+        self.assertIn('checking_asus=2 ', line)
 
     def test_merge_disabled_keeps_other_asus_protected(self):
         frame = pd.DataFrame({'tract_ASU_unemp': [10, 20, 5],
