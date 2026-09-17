@@ -16,7 +16,7 @@ import asu_cpsat as solver
 
 
 class SupernodeCutCyclesTest(unittest.TestCase):
-    def run_case(self, mode='repeat'):
+    def run_case(self, mode='repeat', stall_seconds=.01):
         cuts_seen, flows_seen, cut_models, seen_ids = [], [], [], []
         original_solve = solver.cp_model.CpSolver.Solve
         real_clock = time.monotonic
@@ -83,7 +83,7 @@ class SupernodeCutCyclesTest(unittest.TestCase):
                     np.array([10, 5, 5, 10, 20]), np.zeros(5, dtype=int),
                     np.array([10000]*5), .2, 10000, 0, 5, 1,
                     assignments=np.array([1, -1, -1, -1, 2]), asu_number=1, hint=[0],
-                    deterministic_ties=False, incumbent_stall_seconds=.01,
+                    deterministic_ties=False, incumbent_stall_seconds=stall_seconds,
                     stop_flag_path=str(stop), skip_flag_path=str(skip), log=True)
             if mode == 'skip':
                 self.assertFalse(skip.exists())
@@ -102,6 +102,18 @@ class SupernodeCutCyclesTest(unittest.TestCase):
         self.assertGreater(flows[1], flows[2])
         self.assertEqual((result.obj, result.status), (30, 'OPTIMAL'))
         self.assertEqual(log.count('[STAGE] FINAL_POLISH_SUPERNODES_RETRY_CUTS '), 2)
+        flow_lines = [line for line in log.splitlines()
+                      if '[STAGE] FINAL_POLISH_SUPERNODES_FLOW ' in line]
+        for line, seconds in zip(flow_lines, [.01, .02, .04]):
+            self.assertIn(f'incumbent_stall_seconds={seconds}', line)
+
+    def test_disabled_stall_limit_stays_disabled(self):
+        for seconds in (None, 0):
+            with self.subTest(seconds=seconds):
+                result, cuts, flows, _, log = self.run_case('ordinary_end', stall_seconds=seconds)
+                self.assertEqual((len(cuts), len(flows)), (1, 1))
+                self.assertEqual(result.status, 'FEASIBLE')
+                self.assertIn(f'incumbent_stall_seconds={seconds}', log)
 
     def test_no_retry_for_ordinary_end_stop_skip_or_exhausted_budget(self):
         for mode, status in [('ordinary_end', 'FEASIBLE'), ('stop', 'STOPPED_FEASIBLE'),

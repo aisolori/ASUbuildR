@@ -200,7 +200,10 @@ Proof, cancellation, and the overall polish time limit can stop it sooner.
 Exact flow retains the cuts and best connected solution and uses the remaining
 time. If the primary flow solve reaches its incumbent stall limit without a
 proof, another flow-free cut pass runs with both limits doubled: 50/10, 100/20,
-200/40, and so on. Each flow solve is rebuilt from the accumulated cuts; valid
+200/40, and so on. Each flow solve is rebuilt from the accumulated cuts.
+The primary flow incumbent-stall allowance also doubles on each retry:
+the configured limit, then 2x, 4x, and so on. A disabled stall limit stays
+disabled. Cycle/flow stage logs report the active allowance. Valid
 incumbents and certified bounds carry forward. All cycles share the original
 per-ASU time budget, and Stop/Skip ends the cycle sequence. Ordinary time-limit
 termination and stalls during post-proof tie-breaking do not trigger retries.

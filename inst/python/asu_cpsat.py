@@ -7220,6 +7220,7 @@ def _solve_supernode_polish(nb_local, u_g, E_g, P_g, tau, pop_thresh,
     root_rows = [[model.NewConstant(int(i == root)) for i in range(n)]]
     seen_cuts = set()
     cycle, cut_round_limit, cut_stall_limit = 1, 25, 5
+    flow_stall_limit = incumbent_stall_seconds
     while True:
         reason = interruption()
         if reason or time.monotonic() >= deadline:
@@ -7234,6 +7235,7 @@ def _solve_supernode_polish(nb_local, u_g, E_g, P_g, tau, pop_thresh,
             _stage_print(f'[STAGE] FINAL_POLISH_SUPERNODES_CYCLE asu={asu_number} '
                          f'cycle={cycle} max_cut_rounds={cut_round_limit} '
                          f'upper_bound_stall_limit={cut_stall_limit} '
+                         f'incumbent_stall_seconds={flow_stall_limit} '
                          f'remaining_seconds={max(0, deadline-time.monotonic()):.3f}', flush=True)
         best, best_obj, cut_status = _joint_connectivity_cut_pass(
             model, [x], root_rows,
@@ -7303,7 +7305,8 @@ def _solve_supernode_polish(nb_local, u_g, E_g, P_g, tau, pop_thresh,
         if log:
             _stage_print(f'[STAGE] FINAL_POLISH_SUPERNODES_FLOW asu={asu_number} '
                   f'tracts={len(assignments)} model_nodes={n} donors={len(donors)} '
-                  f'cycle={cycle} baseline_unemp={best_obj} upper_bound={upper}', flush=True)
+                  f'cycle={cycle} baseline_unemp={best_obj} upper_bound={upper} '
+                  f'incumbent_stall_seconds={flow_stall_limit}', flush=True)
         engine = cp_model.CpSolver()
         engine.parameters.max_time_in_seconds = remaining
         engine.parameters.num_search_workers = max(1, int(workers))
@@ -7336,9 +7339,9 @@ def _solve_supernode_polish(nb_local, u_g, E_g, P_g, tau, pop_thresh,
         def watch():
             while not done.wait(.1):
                 reason = interruption()
-                if (not reason and incumbent_stall_seconds is not None
-                        and incumbent_stall_seconds > 0
-                        and time.monotonic() - last_gain[0] >= incumbent_stall_seconds):
+                if (not reason and flow_stall_limit is not None
+                        and flow_stall_limit > 0
+                        and time.monotonic() - last_gain[0] >= flow_stall_limit):
                     reason = 'STALLED_FEASIBLE'
                 if reason:
                     stopped.append(reason)
@@ -7384,11 +7387,14 @@ def _solve_supernode_polish(nb_local, u_g, E_g, P_g, tau, pop_thresh,
             cycle += 1
             cut_round_limit *= 2
             cut_stall_limit *= 2
+            if flow_stall_limit is not None and flow_stall_limit > 0:
+                flow_stall_limit *= 2
             if log:
                 _stage_print(f'[STAGE] FINAL_POLISH_SUPERNODES_RETRY_CUTS asu={asu_number} '
                              f'reason=INCUMBENT_STALL cycle={cycle} '
                              f'max_cut_rounds={cut_round_limit} '
                              f'upper_bound_stall_limit={cut_stall_limit} '
+                             f'incumbent_stall_seconds={flow_stall_limit} '
                              f'valid_unemp={best_obj} upper_bound={upper}', flush=True)
             continue
         if not has_solution:
@@ -7397,6 +7403,9 @@ def _solve_supernode_polish(nb_local, u_g, E_g, P_g, tau, pop_thresh,
         primary_value = best_obj
         break
     if status == cp_model.OPTIMAL and deterministic_ties and rel_gap is None and not stopped:
+        # Cycle escalation is for primary flow only; preserve the original
+        # stall policy for the separately bounded post-proof tie-breaks.
+        flow_stall_limit = incumbent_stall_seconds
         # As in joint polishing, settle whole-ASU consolidation first, while
         # fixing captured unemployment exactly. Share a bounded cleanup budget.
         model.Add(objective == primary_value)
