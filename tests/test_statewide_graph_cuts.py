@@ -20,6 +20,7 @@ class StatewideGraphCutsTest(unittest.TestCase):
     def solve(self, nb, u, emp, pop, seeds, **options):
         models, reports = [], []
         real_solve = solver.cp_model.CpSolver.Solve
+        options.setdefault("deterministic_ties", False)
 
         def capture(instance, model, *args, **kwargs):
             models.append(model.Clone())
@@ -283,17 +284,31 @@ class StatewideGraphCutsTest(unittest.TestCase):
         self.assertEqual((groups, best, status), ([[0]], 10, "UNKNOWN"))
         self.assertEqual(len(model.Proto().constraints), 0)
 
-    def test_cut_pass_stops_after_five_rounds_without_valid_unemp_improvement(self):
+    def test_cut_pass_stops_after_ten_rounds_without_upper_bound_improvement(self):
+        self.check_bound_stall([100] * 11, 11)
+
+    def test_cut_pass_resets_stall_when_upper_bound_improves(self):
+        self.check_bound_stall([100] * 10 + [90] * 11, 21)
+
+    def test_cut_pass_continues_while_bound_improves_despite_valid_unemp_stall(self):
+        self.check_bound_stall(list(range(100, 85, -1)) + [86] * 10, 25)
+
+    def test_cut_pass_counts_unusable_bounds_as_no_improvement(self):
+        self.check_bound_stall([float('nan')] * 10, 10)
+
+    def check_bound_stall(self, bounds, expected_rounds):
+        n = len(bounds) + 2
         model = solver.cp_model.CpModel()
-        row = [model.NewBoolVar(f"x_{i}") for i in range(8)]
-        roots = [model.NewBoolVar(f"root_{i}") for i in range(8)]
-        selections = [{0, i} for i in range(2, 8)]
+        row = [model.NewBoolVar(f"x_{i}") for i in range(n)]
+        roots = [model.NewBoolVar(f"root_{i}") for i in range(n)]
+        selections = [{0, i} for i in range(2, n)]
         created = []
 
         class FakeSolver:
             def __init__(self):
                 self.parameters = type("Parameters", (), {})()
                 self.selection = selections[len(created)]
+                self.bound = bounds[len(created)]
                 created.append(self)
 
             def Solve(self, unused_model):
@@ -307,7 +322,7 @@ class StatewideGraphCutsTest(unittest.TestCase):
                 return int(index) in (self.selection if prefix == "x" else {0})
 
             def BestObjectiveBound(self):
-                return 100
+                return self.bound
 
         output = io.StringIO()
         with (patch.object(solver.cp_model, "CpSolver", FakeSolver),
@@ -315,14 +330,14 @@ class StatewideGraphCutsTest(unittest.TestCase):
               contextlib.redirect_stdout(output)):
             groups, best, status = solver._joint_connectivity_cut_pass(
                 model, [row], [roots],
-                [[1], [0, 2], [1, 3], [2, 4], [3, 5], [4, 6], [5, 7], [6]],
-                np.ones(8, dtype=int), [[0]], lambda groups: False,
-                time.monotonic()+20, 2, lambda: None, log=True)
+                [[j for j in (i - 1, i + 1) if 0 <= j < n] for i in range(n)],
+                np.ones(n, dtype=int), [[0]], lambda groups: False,
+                time.monotonic()+20, 2, lambda: None, log=True, objective=sum(row))
 
         self.assertEqual((groups, best, status), ([[0]], 1, "FEASIBLE"))
-        self.assertEqual(len(created), 5)
-        self.assertIn("valid_unemp_stall=5/5", output.getvalue())
-        self.assertIn("stop_reason=VALID_UNEMP_STALL", output.getvalue())
+        self.assertEqual(len(created), expected_rounds)
+        self.assertIn("upper_bound_stall=10/10", output.getvalue())
+        self.assertIn("stop_reason=UPPER_BOUND_STALL", output.getvalue())
 
 
 if __name__ == "__main__":

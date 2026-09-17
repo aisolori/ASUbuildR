@@ -56,7 +56,9 @@ class InitialAsuWarmStartTest(unittest.TestCase):
                 statewide_joint_time_limit=5, statewide_relaxed_hint=True,
                 merge_adjacent=False, workers=2, verbose=False)
         self.assertEqual(result["asu_id"], [1, 1, 2])
-        self.assertEqual(len(models), 1)
+        # The first solve proves the primary unemployment objective; a bounded
+        # second solve may improve surplus without changing that objective.
+        self.assertGreaterEqual(len(models), 1)
         proto = models[0].Proto()
         hints = {proto.variables[i].name: value for i, value in
                  zip(proto.solution_hint.vars, proto.solution_hint.values)}

@@ -139,6 +139,118 @@ class JointHintsAndBoundsTest(unittest.TestCase):
         variables = {v.name: list(v.domain) for v in proto.variables}
         self.assertEqual(variables['regional_objective_unemployment'], [45, 45])
 
+    def test_joint_hint_uses_objective_when_deficit_is_already_affordable(self):
+        # At tau=.1, q=9u-e. The seed can already afford tract 2 (q=-1),
+        # so its 100 unemployed should beat the safe but low-value tract 1.
+        groups, safe_added, deficit_added = solver._joint_capacity_grow_hint(
+            [[0]], [[0]], [[1, 2], [0], [0]],
+            np.array([10, 1, 100]), np.array([0, 0, 901]),
+            np.array([10000] * 3), .1, 10000, total_bound=2, group_bound=2,
+        )
+        self.assertEqual(groups, [[0, 2]])
+        self.assertEqual((safe_added, deficit_added), (0, 1))
+
+    def test_equal_surplus_root_prefers_more_unemployment_before_population(self):
+        # At tau=.2 both q values are 40; population favors tract 0, but the
+        # primary objective correctly favors tract 1.
+        root = solver._pick_capacity_root(
+            [0, 1], np.array([10, 20]), np.array([0, 40]),
+            np.array([20000, 10000]), .2,
+        )
+        self.assertEqual(root, 1)
+
+    def test_joint_profitable_closure_is_union_level_and_uncapped_only(self):
+        nb = [[1], [0, 2], [1]]
+
+        def closure_rows(model):
+            proto = model.Proto()
+            positions = {v.name: i for i, v in enumerate(proto.variables)}
+            if not all(f"joint_selected_{i}" in positions for i in range(3)):
+                return []
+            selected = {positions[f"joint_selected_{i}"] for i in range(3)}
+            return [
+                row for row in proto.constraints
+                if len(row.linear.vars) == 2
+                and set(row.linear.vars).issubset(selected)
+                and set(row.linear.coeffs) == {-1, 1}
+                and list(row.linear.domain)[0] == 0
+            ]
+
+        _, uncapped = self.capture(
+            nb, [10] * 3, [0] * 3, [10000] * 3, [[0], []],
+            tighten_model=True,
+        )
+        _, capped = self.capture(
+            nb, [10] * 3, [0] * 3, [10000] * 3, [[0], []],
+            tighten_model=True, max_nodes=1,
+        )
+        self.assertEqual(len(closure_rows(uncapped)), 4)
+        self.assertEqual(closure_rows(capped), [])
+
+    def test_group_objective_bounds_use_reachable_seed_component(self):
+        _, model = self.capture(
+            [[1], [0], [3], [2]], [10, 1, 100, 1], [0] * 4,
+            [10000] * 4, [[0], [2]], tighten_model=True,
+        )
+        proto = model.Proto()
+        positions = {v.name: i for i, v in enumerate(proto.variables)}
+
+        def has_group_bound(group, bound):
+            active = positions[f"regional_active_{group}"]
+            for constraint in proto.constraints:
+                coeffs = dict(zip(constraint.linear.vars, constraint.linear.coeffs))
+                if coeffs.get(active) != -bound:
+                    continue
+                if all(coeffs.get(positions[f"regional_{group}_{i}"]) == value
+                       for i, value in enumerate([10, 1, 100, 1])):
+                    return True
+            return False
+
+        self.assertTrue(has_group_bound(0, 11))
+        self.assertTrue(has_group_bound(1, 101))
+
+    def test_cached_rate_count_bounds_dominate_exhaustive_optima(self):
+        cases = [
+            ([10, 8, 5], [4, -3, -7], 2),
+            ([20, 1, 30, 4], [-10, 8, -3, 0], 3),
+            ([5, 7, 9], [-6, -2, 10], 1),
+        ]
+        for u, q, limit in cases:
+            with self.subTest(u=u, q=q, limit=limit):
+                total, conditional = solver._rate_count_objective_bounds(u, q, limit)
+                feasible = []
+                for mask in itertools.product((False, True), repeat=len(u)):
+                    chosen = [i for i, selected in enumerate(mask) if selected]
+                    if len(chosen) <= limit and sum(q[i] for i in chosen) >= 0:
+                        feasible.append((set(chosen), sum(u[i] for i in chosen)))
+                self.assertGreaterEqual(total, max(value for _, value in feasible))
+                for i in range(len(u)):
+                    forced_values = [value for chosen, value in feasible if i in chosen]
+                    expected = max(forced_values, default=-1)
+                    self.assertGreaterEqual(conditional[i], expected)
+
+    def test_joint_tie_prefers_surplus_after_primary_objective(self):
+        solve_calls = 0
+        real_solve = solver.cp_model.CpSolver.Solve
+
+        def counted_solve(instance, model, *args, **kwargs):
+            nonlocal solve_calls
+            solve_calls += 1
+            return real_solve(instance, model, *args, **kwargs)
+
+        with patch.object(solver.cp_model.CpSolver, "Solve", new=counted_solve):
+            groups, status = solver._solve_regional_exchange(
+                [[0], []], [0, 1, 2], [[], [], []],
+                np.array([5, 10, 10]), np.array([0, 0, 20]),
+                np.array([10000] * 3), .2, 10000, 5, 2,
+                max_nodes=1, allow_inactive_seeds=True,
+                allow_unseeded_groups=True, max_groups=None,
+                tighten_model=True,
+            )
+        self.assertEqual(status, "OPTIMAL")
+        self.assertEqual(groups, [[0], [1]])
+        self.assertGreaterEqual(solve_calls, 2)
+
     def test_joint_model_caps_globally_affordable_deficit_tract_count(self):
         # At tau=.2, q=4u-e: the q=40 supply tract can fund at most one
         # of the two q=-30 deficit tracts, even across separate group slots.
@@ -195,7 +307,10 @@ class JointHintsAndBoundsTest(unittest.TestCase):
         tested = 0
         for nb, u, emp, pop, seeds, options in cases:
             arrays = [np.array(values) for values in (u, emp, pop)]
-            _, template = self.capture(nb, u, emp, pop, seeds, tighten_model=True, **options)
+            _, template = self.capture(
+                nb, u, emp, pop, seeds, tighten_model=True,
+                use_joint_profitable_closure=False, **options,
+            )
             template.ClearHints()
             positions = {v.name: i for i, v in enumerate(template.Proto().variables)}
             objective_floor = template.Proto().variables[

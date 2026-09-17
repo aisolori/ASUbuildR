@@ -81,25 +81,23 @@ def ur_of(u_sum: int, E_sum: int) -> float:
 
 
 def _capacity_root_order(candidates, u, E, P, tau):
-    """Highest exact rate capacity first; ties use population, then tract index."""
+    """Highest exact rate capacity first; ties favor objective, then population."""
     num, den = as_fraction_tau(tau)
     return sorted(
         map(int, candidates),
         key=lambda node: (den * int(u[node]) - num * int(E[node]),
-                          int(P[node]), -node),
+                          int(u[node]), int(P[node]), -node),
         reverse=True,
     )
 
 
 def _polish_asu_order(asu_id, u, E, tau):
-    """Highest aggregate signed surplus first, then unemployment and ASU ID."""
-    num, den = as_fraction_tau(tau)
+    """Lowest total unemployment first, with ASU ID breaking ties."""
     ids = np.unique(asu_id[asu_id > 0]).astype(int).tolist()
     def priority(asu_number):
         nodes = np.flatnonzero(asu_id == asu_number)
         unemployed = sum(int(u[node]) for node in nodes)
-        employed = sum(int(E[node]) for node in nodes)
-        return (-(den * unemployed - num * employed), -unemployed, asu_number)
+        return (unemployed, asu_number)
     return sorted(ids, key=priority)
 
 
@@ -176,7 +174,7 @@ def _partition_standalone_expansion_territories(
     """Assign reachable allowed tracts to the nearest standalone ASU seed.
 
     Ties (equal graph distance to two or more seeds) go to the unit with the
-    most unemployment already captured in its own seed; `unit_index` is only
+    least unemployment already captured in its own seed; `unit_index` is only
     the final, fully-deterministic tiebreaker.
     """
     n = len(nb)
@@ -187,8 +185,8 @@ def _partition_standalone_expansion_territories(
     if u is None:
         unit_priority = [0] * len(standalone_units)
     else:
-        # Negated so a lower tuple value (min-heap win) means more unemployment.
-        unit_priority = [-int(u[np.array(nodes, dtype=int)].sum()) for nodes in standalone_units]
+        # Lower seed unemployment wins only when graph distances are equal.
+        unit_priority = [int(u[np.array(nodes, dtype=int)].sum()) for nodes in standalone_units]
 
     owner = np.full(n, -1, dtype=int)
     distance = np.full(n, -1, dtype=np.int64)
@@ -1310,10 +1308,11 @@ _ASU_FULL_SUBSOLVER_PATTERN = (
     "max_lp",
     "lb_tree_search",
     "objective_lb_search_max_lp",
+    "objective_lb_search_no_lp",
 
     "variables_shaving_max_lp",
     "quick_restart_no_lp",
-    "variables_shaving",
+    "lb_tree_search",
     "asu_probe_deep",
     "asu_probe_standard",
 
@@ -1321,9 +1320,9 @@ _ASU_FULL_SUBSOLVER_PATTERN = (
     "variables_shaving_no_lp",
     "objective_shaving_max_lp",
     "reduced_costs",
-
     "pseudo_costs",
     "core_max_lp",
+    
     "core",
     "objective_shaving_no_lp",
     "asu_probe_mega_deep"
@@ -2502,6 +2501,80 @@ def _lagrangian_conditional_bounds(u, q, forced):
         tuple(map(int, u)), tuple(map(int, q)), tuple(sorted(map(int, forced)))
     )
     return list(bounds)
+
+
+def _lagrangian_rate_price(u, q, forced=()):
+    """Return an exact optimal multiplier for the rate-only relaxation.
+
+    With rate row `sum(q_i*x_i) >= 0`, the relaxed coefficient of tract i is
+    `u_i + lambda*q_i`.  Breakpoints occur at `u_i / -q_i` for optional
+    deficit tracts.  The smallest breakpoint with nonnegative remaining slope
+    is an optimal dual multiplier and is also a principled incumbent-ordering
+    price for one unit of rate capacity.
+    """
+    u_values = list(map(int, u))
+    q_values = list(map(int, q))
+    forced_set = set(map(int, forced))
+    slope = sum(q_values)
+    if slope >= 0:
+        return Fraction(0)
+    events = sorted(
+        (Fraction(u_values[i], -q_values[i]), i)
+        for i in range(len(q_values))
+        if i not in forced_set and q_values[i] < 0
+    )
+    last = Fraction(0)
+    position = 0
+    while position < len(events):
+        price = events[position][0]
+        last = price
+        while position < len(events) and events[position][0] == price:
+            slope -= q_values[events[position][1]]
+            position += 1
+        if slope >= 0:
+            return price
+    # Forced deficits may make the relaxation infeasible.  The caller uses the
+    # price only for ordering, so retain the largest meaningful breakpoint.
+    return last
+
+
+@lru_cache(maxsize=128)
+def _rate_count_objective_bounds_cached(u_tuple, q_tuple, limit):
+    """Rate-and-cardinality objective bounds, globally and with each node forced."""
+    u_values = tuple(map(int, u_tuple))
+    q_values = tuple(map(int, q_tuple))
+    n = len(u_values)
+    limit = min(n, max(0, int(limit)))
+    rate_total, rate_conditionals = _compute_lagrangian_bounds(
+        u_values, q_values, (), conditionals=True
+    )
+    order = sorted(range(n), key=lambda i: (-u_values[i], i))
+    count_total = sum(u_values[i] for i in order[:limit])
+    rank = [0] * n
+    for position, node in enumerate(order):
+        rank[node] = position
+    count_conditionals = []
+    for i in range(n):
+        if limit == 0:
+            count_conditionals.append(-1)
+        elif rank[i] < limit:
+            count_conditionals.append(count_total)
+        else:
+            count_conditionals.append(
+                count_total - u_values[order[limit - 1]] + u_values[i]
+            )
+    total = -1 if rate_total < 0 else min(rate_total, count_total)
+    conditionals = tuple(
+        -1 if rate_bound < 0 else min(rate_bound, count_bound)
+        for rate_bound, count_bound in zip(rate_conditionals, count_conditionals)
+    )
+    return total, conditionals
+
+
+def _rate_count_objective_bounds(u, q, limit):
+    return _rate_count_objective_bounds_cached(
+        tuple(map(int, u)), tuple(map(int, q)), int(limit)
+    )
 
 
 def _bridge_subtree_zero_fix(
@@ -6929,7 +7002,7 @@ def _bridge_pass(assignments, nb, u, E, P, tau, pop_thresh, seconds, workers,
                  *, max_nodes=None, exact_nodes=None, stop_path=None,
                  skip_path=None, log=False, progress_callback=None,
                  cut_cache=None, incumbent_stall_seconds=None,
-                 requested_pair=None):
+                 requested_pair=None, deterministic_ties=True):
     """Solve nearby pairs once, highest combined q_surplus first."""
     current = assignments.copy()
     attempted = set()
@@ -6978,6 +7051,7 @@ def _bridge_pass(assignments, nb, u, E, P, tau, pop_thresh, seconds, workers,
             accept_connected_cut_proof=True,
             exact_flow_after_cuts=True,
             incumbent_stall_seconds=incumbent_stall_seconds,
+            deterministic_ties=deterministic_ties,
         )
         flat = [v for unit in candidate for v in unit]
         valid = (len(candidate) == len(ids) and len(flat) == len(set(flat))
@@ -7067,12 +7141,14 @@ def _joint_minimum_tract_count(population, pop_thresh):
 
 def _joint_capacity_grow_hint(units, seeds, nb, u, emp, pop, tau, pop_thresh,
                               total_bound, group_bound):
-    """Grow a disjoint connected incumbent by banking exact UR surplus.
+    """Grow a disjoint connected incumbent using priced exact UR surplus.
 
-    Nonnegative-surplus frontier tracts are taken before deficit tracts. A
-    deficit tract is admitted only when its group can pay its exact q cost.
-    This is deliberately an incumbent heuristic: contested frontier tracts are
-    assigned once, but the CP-SAT model remains free to choose another owner.
+    Feasible frontier tracts are ranked by `u + lambda*q`, where lambda is the
+    exact optimal multiplier of the rate-only relaxation.  Unlike a hard
+    safe-first rule, this takes a high-unemployment deficit tract as soon as its
+    ASU can afford it, while still valuing safe tracts that unlock good deficit
+    tracts. This is deliberately an incumbent heuristic: contested frontier
+    tracts are assigned once, but CP-SAT remains free to choose another owner.
     """
     groups = [set(map(int, unit)) for unit in units]
     original = [sorted(group) for group in groups]
@@ -7091,6 +7167,7 @@ def _joint_capacity_grow_hint(units, seeds, nb, u, emp, pop, tau, pop_thresh,
 
     num, den = as_fraction_tau(tau)
     q = den * np.asarray(u, dtype=np.int64) - num * np.asarray(emp, dtype=np.int64)
+    rate_price = _lagrangian_rate_price(u, q)
     slack = [int(q[list(group)].sum()) if group else 0 for group in groups]
     population = [int(np.asarray(pop)[list(group)].sum()) if group else 0
                   for group in groups]
@@ -7123,11 +7200,9 @@ def _joint_capacity_grow_hint(units, seeds, nb, u, emp, pop, tau, pop_thresh,
                 next_population = population[k] + int(pop[node])
                 if next_population < int(pop_thresh):
                     continue
-                if node_q >= 0:
-                    key = (1, float(node_q), int(u[node]), int(pop[node]), -k, -node)
-                else:
-                    key = (0, int(u[node]) / -node_q, int(u[node]), node_q,
-                           int(pop[node]), -k, -node)
+                priced_objective = Fraction(int(u[node])) + rate_price * node_q
+                key = (priced_objective, int(u[node]), node_q,
+                       int(pop[node]), -k, -node)
                 if best is None or key > best[0]:
                     best = (key, k, node, node_q, next_population)
         if best is None:
@@ -7252,7 +7327,7 @@ def _joint_connectivity_cut_pass(model, x, root_rows, nb, u,
                                  fallback, valid_candidate, deadline, workers,
                                  cancellation, *, log=False, report=None,
                                  max_rounds=50, cut_limit=5000,
-                                 valid_unemp_stall_rounds=5,
+                                 upper_bound_stall_rounds=10,
                                  stage_prefix="STATEWIDE_JOINT", objective=None,
                                  cut_cache=None, global_nodes=None,
                                  proof_out=None):
@@ -7266,7 +7341,7 @@ def _joint_connectivity_cut_pass(model, x, root_rows, nb, u,
     best = [list(unit) for unit in fallback]
     best_obj = sum(int(u[unit].sum()) for unit in best)
     seen, rows, rounds, status_name = set(), 0, 0, "DISABLED"
-    valid_unemp_stall = 0
+    upper_bound_stall = 0
     stop_reason = None
     proved_connected_optimal = False
     cached = None
@@ -7335,7 +7410,7 @@ def _joint_connectivity_cut_pass(model, x, root_rows, nb, u,
         groups = [[i for i, var in enumerate(row) if scout.BooleanValue(var)] for row in x]
         connected = valid_candidate(groups)
         value = sum(int(u[unit].sum()) for unit in groups)
-        previous_best_obj = best_obj
+        previous_upper_bound = upper_bound
         # This is an upper bound on the relaxation, hence also on every
         # connected solution. Never substitute the relaxed incumbent value.
         # Round upward conservatively; ignore unusable/default response bounds.
@@ -7350,10 +7425,11 @@ def _joint_connectivity_cut_pass(model, x, root_rows, nb, u,
             best, best_obj = groups, value
             if report is not None:
                 report([i for unit in best for i in unit], value)
-        if best_obj > previous_best_obj:
-            valid_unemp_stall = 0
+        if upper_bound is not None and (
+                previous_upper_bound is None or upper_bound < previous_upper_bound):
+            upper_bound_stall = 0
         else:
-            valid_unemp_stall += 1
+            upper_bound_stall += 1
         if connected and status == cp_model.OPTIMAL:
             # A connected optimum of the relaxation is feasible for the exact
             # flow model and also matches its best possible objective.
@@ -7390,11 +7466,11 @@ def _joint_connectivity_cut_pass(model, x, root_rows, nb, u,
                   f"status={status_name} relaxed_unemp={value} connected={connected} "
                   f"detached_components={detached} cuts_added={added} cuts_total={rows} "
                   f"valid_unemp={best_obj} upper_bound={upper_bound} "
-                  f"valid_unemp_stall={valid_unemp_stall}/{valid_unemp_stall_rounds} "
+                  f"upper_bound_stall={upper_bound_stall}/{upper_bound_stall_rounds} "
                   f"elapsed={time.monotonic()-started:.3f}s", flush=True)
-        if (valid_unemp_stall_rounds is not None
-                and valid_unemp_stall >= max(1, int(valid_unemp_stall_rounds))):
-            stop_reason = "VALID_UNEMP_STALL"
+        if (upper_bound_stall_rounds is not None
+                and upper_bound_stall >= max(1, int(upper_bound_stall_rounds))):
+            stop_reason = "UPPER_BOUND_STALL"
             break
         if interrupted or connected or not added:
             break
@@ -7550,6 +7626,7 @@ def _reoptimize_touching_asu_units(
     source="partition", preview_factory=None, deferrals=None, peer_units=None,
     cut_cache=None, sweep=None, exact_flow_after_cuts=True,
     max_cluster_groups=None, max_cluster_attempts=None,
+    deterministic_ties=True,
 ):
     """Reoptimize one touching cluster; never replace a failed solve by a union.
 
@@ -7677,6 +7754,7 @@ def _reoptimize_touching_asu_units(
             cut_cache=cut_cache,
             accept_connected_cut_proof=True,
             exact_flow_after_cuts=exact_flow_after_cuts,
+            deterministic_ties=deterministic_ties,
         )
         selected = [int(v) for unit in candidate for v in unit]
         valid = (len(candidate) == len(seeds)
@@ -7728,7 +7806,9 @@ def _solve_regional_exchange(units, nodes, nb, u, E, P, tau, pop_thresh,
                               tighten_model=False, allow_seed_consolidation=False,
                               use_joint_cuts=False, stage_prefix=None, cut_cache=None,
                               accept_connected_cut_proof=False,
-                              exact_flow_after_cuts=True):
+                              exact_flow_after_cuts=True,
+                              use_joint_profitable_closure=True,
+                              deterministic_ties=True):
     """Jointly maximize unemployment in 2/3 disjoint ASUs with movable roots.
 
     Each group retains an incumbent tract for identity, but its root can move
@@ -7927,6 +8007,68 @@ def _solve_regional_exchange(units, nodes, nb, u, E, P, tau, pop_thresh,
         ]
     if group_bound < 1:
         return fallback, "NO_CAPACITY"
+
+    # Bound each slot on only the graph components that it can occupy.  A seeded
+    # slot must contain at least one of its seed tracts, so the maximum of those
+    # conditional bounds is valid.  This is stronger than applying the global
+    # union relaxation to every slot independently and reuses the same cached
+    # Lagrangian/cardinality calculation for slots sharing a component.
+    component_relaxations = {}
+    for c, component in enumerate(components):
+        if not component:
+            continue
+        sub_u = local_u[component]
+        sub_q = q[component]
+        total_ub, conditional_ub = _rate_count_objective_bounds(
+            sub_u, sub_q, min(group_bound, len(component))
+        )
+        component_relaxations[c] = (
+            total_ub,
+            {node: conditional_ub[position]
+             for position, node in enumerate(component)},
+        )
+
+    group_objective_bounds = []
+    for k in range(len(seeds)):
+        candidates = []
+        seed_set = set(local_seeds[k])
+        for c in allowed_components[k]:
+            total_ub, conditional_ub = component_relaxations[c]
+            if seed_set:
+                seed_bounds = [conditional_ub[node] for node in seed_set
+                               if component_of[node] == c]
+                if seed_bounds:
+                    candidates.append(max(seed_bounds))
+            else:
+                candidates.append(total_ub)
+        group_objective_bounds.append(max(candidates, default=-1))
+
+    # If assigning i to slot k cannot reach the incumbent even after giving all
+    # other slots their independent optimistic upper bounds, that assignment is
+    # dead.  Inter-slot overlap is deliberately ignored, so the sum remains a
+    # valid (usually loose) upper bound.
+    group_relaxation_fixed_zero = set()
+    if tighten_model:
+        optimistic_other = [max(0, bound) for bound in group_objective_bounds]
+        total_group_ub = sum(optimistic_other)
+        for k in range(len(seeds)):
+            for i in range(n):
+                c = component_of[i]
+                if c not in allowed_components[k]:
+                    continue
+                own_conditional = min(
+                    group_objective_bounds[k],
+                    component_relaxations[c][1][i],
+                )
+                assignment_ub = (
+                    own_conditional + total_group_ub - optimistic_other[k]
+                    if own_conditional >= 0 else -1
+                )
+                if conditional_bounds:
+                    assignment_ub = min(assignment_ub, conditional_bounds[i])
+                if assignment_ub < baseline:
+                    group_relaxation_fixed_zero.add((k, i))
+
     flow_bound = group_bound - 1
     model = cp_model.CpModel()
     x = []
@@ -7939,25 +8081,54 @@ def _solve_regional_exchange(units, nodes, nb, u, E, P, tau, pop_thresh,
                 reason = cancellation()
                 if reason or time.monotonic() >= deadline:
                     return construction_fallback(reason), reason or "UNKNOWN"
-            can_assign = component_of[i] in allowed_components[k]
+            can_assign = (component_of[i] in allowed_components[k]
+                          and (k, i) not in group_relaxation_fixed_zero)
             row.append(model.NewIntVar(0, int(can_assign), f"regional_{k}_{i}"))
             allowed.append(can_assign)
         x.append(row)
         assignment_allowed.append(allowed)
+    profitable_closure_enabled = (
+        tighten_model and use_joint_profitable_closure
+        and max_nodes is None and exact_nodes is None
+    )
+    needs_union_variables = partial_hint or profitable_closure_enabled
     selected_any = []
+    selected_expression = []
     for i in range(n):
         if i % 256 == 0:
             reason = cancellation()
             if reason or time.monotonic() >= deadline:
                 return construction_fallback(reason), reason or "UNKNOWN"
-        if partial_hint:
+        assignment_sum = sum(row[i] for row in x)
+        if needs_union_variables:
             selected_var = model.NewBoolVar(f"joint_selected_{i}")
-            model.Add(selected_var == sum(row[i] for row in x))
+            model.Add(selected_var == assignment_sum)
             selected_any.append(selected_var)
-            if i in relaxed_hint:
+            selected_expression.append(selected_var)
+            if partial_hint and i in relaxed_hint:
                 model.AddHint(selected_var, 1)
         else:
-            model.Add(sum(row[i] for row in x) <= 1)
+            # The union variable is only useful for a partial hint or the
+            # profitable-closure rows.  Preserve disjointness directly in
+            # capped models and avoid one variable plus one equality per tract.
+            model.Add(assignment_sum <= 1)
+            selected_expression.append(assignment_sum)
+
+    # In an uncapped optimum, a positive-objective, nonnegative-surplus tract
+    # touching the selected union can be added to the touching ASU: rate,
+    # population, connectivity, and the objective all weakly improve.  Express
+    # the closure on union variables so it does not choose an ASU owner or add
+    # O(groups * edges) rows.  User-imposed tract caps invalidate this reduction.
+    profitable_closure_rows = 0
+    if profitable_closure_enabled:
+        for node in range(n):
+            if int(q[node]) < 0 or int(local_u[node]) <= 0:
+                continue
+            for neighbor in local_nb[node]:
+                if neighbor == node:
+                    continue
+                model.Add(selected_expression[node] >= selected_expression[neighbor])
+                profitable_closure_rows += 1
     model.Add(sum(var for row in x for var in row) <= total_bound)
     joint_deficit_rows = 0
     if joint_deficit_count_bound < min(len(deficit_indices), total_bound):
@@ -7966,7 +8137,6 @@ def _solve_regional_exchange(units, nodes, nb, u, E, P, tau, pop_thresh,
         joint_deficit_rows += 1
     previous_free_group = None
     active_groups, group_counts, root_rows = [], [], []
-    group_objective_bounds = []
     group_deficit_bounds = []
     distance_rows = separator_rows = 0
     for k, seed in enumerate(seeds):
@@ -8031,19 +8201,7 @@ def _solve_regional_exchange(units, nodes, nb, u, E, P, tau, pop_thresh,
             model.Add(sum(row[i] for i in deficit_indices)
                       <= int(group_deficit_bound) * active)
             joint_deficit_rows += 1
-        # An active seeded group contains at least one of its seed tracts.  The
-        # maximum of their conditional rate-relaxation bounds is therefore a
-        # valid cap for this slot; an unseeded slot uses the global cap.
-        group_objective_bound = min(
-            rate_objective_bound,
-            count_objective_bound(group_bound),
-        ) if rate_objective_bound >= 0 else -1
-        if conditional_bounds and local_seeds[k]:
-            group_objective_bound = min(
-                group_objective_bound,
-                max(conditional_bounds[i] for i in local_seeds[k]),
-            )
-        group_objective_bounds.append(group_objective_bound)
+        group_objective_bound = group_objective_bounds[k]
         if group_objective_bound < 0:
             model.Add(active == 0)
         else:
@@ -8087,6 +8245,8 @@ def _solve_regional_exchange(units, nodes, nb, u, E, P, tau, pop_thresh,
               f"seed_distance_rows={distance_rows} "
               f"graph_components={len(components)} fixed_zero_assignments={blocked} "
               f"relaxation_fixed_zero={len(relaxation_fixed_zero)} "
+              f"group_relaxation_fixed_zero={len(group_relaxation_fixed_zero)} "
+              f"profitable_closure_rows={profitable_closure_rows} "
               f"deficit_tracts={len(deficit_indices)} "
               f"joint_deficit_count_upper={joint_deficit_count_bound} "
               f"group_deficit_upper_min={min(group_deficit_bounds)} "
@@ -8095,9 +8255,8 @@ def _solve_regional_exchange(units, nodes, nb, u, E, P, tau, pop_thresh,
               f"group_unemp_upper_min={min(group_objective_bounds)} "
               f"group_unemp_upper_max={max(group_objective_bounds)}", flush=True)
 
-    objective_expression = (
-        sum(int(local_u[i]) * selected_any[i] for i in range(n)) if partial_hint
-        else sum(int(local_u[i]) * row[i] for row in x for i in range(n))
+    objective_expression = sum(
+        int(local_u[i]) * selected_expression[i] for i in range(n)
     )
     # Every active group satisfies q*x_k >= 0 and assignments are disjoint, so
     # their union also satisfies q*selected_any >= 0. Dropping connectivity,
@@ -8311,6 +8470,88 @@ def _solve_regional_exchange(units, nodes, nb, u, E, P, tau, pop_thresh,
         done.set()
         watcher.join()
     status_name = interrupted[0] if interrupted else solver.StatusName(status)
+    solution_solver = solver
+    tie_messages = []
+
+    # Preserve the primary objective exactly before improving the shape of a
+    # proved-optimal joint solution.  Consolidation remains the first secondary
+    # criterion when enabled; surplus is optimized only after the active-ASU
+    # count is fixed.  A shared cap prevents deterministic cleanup from taking
+    # over a long joint run.
+    if (status == cp_model.OPTIMAL and deterministic_ties and rel_gap is None
+            and not cancellation() and deadline - time.monotonic() > 0.05):
+        primary_objective = int(round(solver.ObjectiveValue()))
+        model.Add(objective == primary_objective)
+        tie_deadline = min(deadline, time.monotonic() + 15.0)
+
+        def seed_tie_hints(source_solver):
+            model.ClearHints()
+            for variable_index in range(len(model.Proto().variables)):
+                variable = model.GetIntVarFromProtoIndex(variable_index)
+                model.AddHint(variable, int(source_solver.Value(variable)))
+
+        def solve_tie_stage(label, expression, maximize):
+            remaining = tie_deadline - time.monotonic()
+            if remaining <= 0.05 or cancellation():
+                return None, None
+            seed_tie_hints(solution_solver)
+            if maximize:
+                model.Maximize(expression)
+            else:
+                model.Minimize(expression)
+            tie_solver = cp_model.CpSolver()
+            tie_solver.parameters.max_time_in_seconds = remaining
+            tie_solver.parameters.num_search_workers = max(1, int(workers))
+            tie_solver.parameters.log_search_progress = False
+            tie_done = threading.Event()
+
+            def watch_tie():
+                while not tie_done.wait(0.1):
+                    if cancellation():
+                        tie_solver.StopSearch()
+                        return
+
+            tie_watcher = threading.Thread(target=watch_tie, daemon=True)
+            tie_watcher.start()
+            try:
+                tie_status = tie_solver.Solve(model)
+            finally:
+                tie_done.set()
+                tie_watcher.join()
+            if tie_status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                tie_messages.append(f"{label}={tie_solver.StatusName(tie_status)}")
+                return tie_solver, tie_status
+            value = int(round(tie_solver.ObjectiveValue()))
+            tie_messages.append(f"{label}={value}:{tie_solver.StatusName(tie_status)}")
+            return tie_solver, tie_status
+
+        continue_to_surplus = True
+        if allow_seed_consolidation:
+            active_expression = sum(active_groups)
+            active_solver, active_status = solve_tie_stage(
+                "active_asus", active_expression, maximize=False
+            )
+            if active_status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                solution_solver = active_solver
+            if active_status == cp_model.OPTIMAL:
+                model.Add(active_expression == int(round(active_solver.ObjectiveValue())))
+            else:
+                # Do not trade an unproved active-ASU improvement for surplus.
+                continue_to_surplus = False
+
+        if continue_to_surplus and tie_deadline - time.monotonic() > 0.05:
+            surplus_expression = sum(
+                int(q[i]) * selected_expression[i] for i in range(n)
+            )
+            surplus_solver, surplus_status = solve_tie_stage(
+                "q_surplus", surplus_expression, maximize=True
+            )
+            if surplus_status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                solution_solver = surplus_solver
+
+        if log and tie_messages:
+            print(f"[STAGE] {stage_prefix}_TIE primary_unemp={primary_objective} "
+                  + " ".join(tie_messages), flush=True)
     if log:
         solved = status in (cp_model.FEASIBLE, cp_model.OPTIMAL)
         objective_value = int(round(solver.ObjectiveValue())) if solved else None
@@ -8328,7 +8569,8 @@ def _solve_regional_exchange(units, nodes, nb, u, E, P, tau, pop_thresh,
         if status_name in ("STOPPED", "SKIPPED") and heuristic_improved and not heuristic_confirmed:
             return interruption_fallback, status_name
         return fallback, status_name
-    candidate = [[nodes[i] for i in range(n) if solver.BooleanValue(row[i])] for row in x]
+    candidate = [[nodes[i] for i in range(n) if solution_solver.BooleanValue(row[i])]
+                 for row in x]
     flat = [v for unit in candidate for v in unit]
     if (len(flat) != len(set(flat)) or int(u[flat].sum()) < baseline
             or not all((not unit and not required_seeds[k]) or (
@@ -8348,7 +8590,7 @@ def _solve_statewide_joint(nb, u, E, P, tau, pop_thresh, max_asus, seconds, work
                            log=False, rel_gap=None, incumbent_stall_seconds=None,
                            seed_report_callback=None, incumbent_report_callback=None,
                            use_relaxed_hint=True, tighten_model=True, initial_units=None,
-                           use_graph_cuts=False):
+                           use_graph_cuts=False, deterministic_ties=True):
     """One all-tract joint solve, seeded with valid components plus free slots.
 
     Seed search has its own budget. No sequential expansion, polishing, takeover,
@@ -8455,6 +8697,7 @@ def _solve_statewide_joint(nb, u, E, P, tau, pop_thresh, max_asus, seconds, work
             use_joint_cuts=use_graph_cuts,
             incumbent_stall_seconds=incumbent_stall_seconds,
             incumbent_report_callback=incumbent_report_callback,
+            deterministic_ties=deterministic_ties,
         )
     elif _stop_requested(stop_path):
         status = "STOPPED"
@@ -8487,7 +8730,8 @@ def _regional_exchange_pass(assignments, nb, u, E, P, tau, pop_thresh,
                             seconds, workers, *, max_nodes=None, exact_nodes=None,
                             stop_path=None, skip_path=None, log=False,
                             exchange_state=None, eligible_ids=None,
-                            stop_after_gain=False, stage="REGIONAL_EXCHANGE"):
+                            stop_after_gain=False, stage="REGIONAL_EXCHANGE",
+                            deterministic_ties=True):
     """Share four neighborhood attempts and at most 180s across build stages.
 
     Each solve receives at most 60s. Only strict total gains are committed;
@@ -8534,6 +8778,7 @@ def _regional_exchange_pass(assignments, nb, u, E, P, tau, pop_thresh,
                 units, nodes, nb, u, E, P, tau, pop_thresh, seconds_left, workers,
                 max_nodes=max_nodes, exact_nodes=exact_nodes,
                 stop_path=stop_path, skip_path=skip_path,
+                deterministic_ties=deterministic_ties,
             )
             if status not in ("STOPPED", "SKIPPED", "DISABLED", "INVALID_SEED", "INVALID_RESULT"):
                 state.attempted.add(key)
@@ -10181,6 +10426,7 @@ def build_many_asus_cpsat(
             log=verbose, rel_gap=rel_gap, incumbent_stall_seconds=incumbent_stall_seconds,
             seed_report_callback=report_statewide_seeds,
             incumbent_report_callback=report_statewide_incumbent,
+            deterministic_ties=deterministic_ties,
         )
         _clear_incumbent_previews()
         asu_id[:] = -1
@@ -10324,6 +10570,7 @@ def build_many_asus_cpsat(
                 exact_flow_after_cuts=exact_flow,
                 max_cluster_groups=2 if expansion_phase else 3,
                 max_cluster_attempts=1,
+                deterministic_ties=deterministic_ties,
             )
             return result
         finally:
@@ -12418,12 +12665,12 @@ def build_many_asus_cpsat(
                     f"\n[STAGE] FINAL_POLISH round={polish_round} "
                     f"asus={len(polish_ids)} total_unemp={total_polish_unemp} "
                     f"mode={'followup' if pending_ids is not None else 'normal'} "
-                    "priority=q_surplus",
+                    "priority=unemployment_ascending",
                     flush=True,
                 )
                 print(
                     f"\n[FINAL POLISH] round {polish_round}: "
-                    f"{len(polish_ids)} ASU(s), highest q_surplus first, "
+                    f"{len(polish_ids)} ASU(s), lowest total unemployment first, "
                     "each seeing all currently "
                     f"unassigned tracts (up to {polish_time_limit:.1f}s each); "
                     f"total unemployment currently captured={total_polish_unemp}",
@@ -12569,6 +12816,7 @@ def build_many_asus_cpsat(
             progress_callback=_bridge_progress,
             incumbent_stall_seconds=incumbent_stall_seconds,
             requested_pair=bridge_pair,
+            deterministic_ties=deterministic_ties,
         )
         remaining = asu_id < 0
 
