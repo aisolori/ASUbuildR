@@ -1,0 +1,110 @@
+"""A committed merge gets the next polish turn, then normal ordering resumes."""
+import contextlib
+import io
+from pathlib import Path
+import sys
+import unittest
+from unittest.mock import patch
+
+import numpy as np
+import pandas as pd
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "inst" / "python"))
+import asu_cpsat as solver
+
+
+class FinalPolishMergePriorityTest(unittest.TestCase):
+    def run_build(self, replacements, *, status="STALLED_FEASIBLE", reverse=False):
+        # Four saved ASUs, separated by unassigned connector tracts. Population
+        # encodes global indices so the mocked solve can inspect real windows.
+        u = [10, 0, 60, 0, 20, 0, 30]
+        if reverse:
+            u = [20, 0, 30, 0, 60, 0, 10]
+        frame = pd.DataFrame({
+            "tract_ASU_unemp": u,
+            "tract_ASU_emp": [0, 20, 0, 20, 0, 20, 0],
+            "tract_pop2024": [10000 + node for node in range(7)],
+        })
+        nb = [[neighbor for neighbor in (node - 1, node + 1)
+               if 0 <= neighbor < 7] for node in range(7)]
+        calls = []
+
+        def polish(**kwargs):
+            window = [int(pop) - 10000 for pop in kwargs["P_g"]]
+            hint = tuple(window[node] for node in kwargs["hint"])
+            calls.append((kwargs["asu_number"], hint))
+            selected = replacements.get(hint, hint)
+            local_selected = [window.index(node) for node in selected]
+            ownership = kwargs["assignments"]
+            objective = sum(u[window[node]] for node in local_selected
+                            if ownership[node] <= 0
+                            or ownership[node] == kwargs["asu_number"])
+            return solver.CpsatResult(
+                local_selected, kwargs["root_local"], objective, status,
+            )
+
+        output = io.StringIO()
+        with (
+            patch.object(solver, "_solve_supernode_polish", side_effect=polish),
+            # No statewide takeover change or residual ASU creation in this
+            # scheduling test; all individual polish results use the real
+            # validation, commit, merge, cache and queue logic.
+            patch.object(solver, "solve_one_asu_cpsat", return_value=None),
+            patch.object(solver, "_search_unassigned_asu", return_value=([], "INFEASIBLE")),
+            contextlib.redirect_stdout(output),
+        ):
+            result = solver.build_many_asus_cpsat(
+                frame, nb, .2, 10000, max_asus=4,
+                initial_asu_id=[1, -1, 2, -1, 3, -1, 4],
+                harvest_connectivity_free_asus=True,
+                standalone_expansion_time_limit=0, final_asu_polish_time_limit=2,
+                final_consolidation=False, time_limit=0, workers=1,
+                verbose=True, deterministic_ties=False,
+            )
+        ids = np.array(result["asu_id"])
+        for label in np.unique(ids[ids > 0]):
+            self.assertTrue(solver.component_ok(
+                np.flatnonzero(ids == label).tolist(), np.array(u),
+                frame["tract_ASU_emp"].to_numpy(),
+                frame["tract_pop2024"].to_numpy(), .2, 10000, nb,
+            ))
+        return calls, result, output.getvalue()
+
+    def test_absorbed_donor_resolves_first_then_returns_to_lowest_unemployment(self):
+        for status in ("STALLED_FEASIBLE", "FEASIBLE", "OPTIMAL"):
+            with self.subTest(status=status):
+                calls, result, log = self.run_build({(0,): (0, 1, 2)}, status=status)
+                # Merged U=70 exceeds both remaining ASUs (20, 30). It gets
+                # exactly one immediate turn, then those two run in U order.
+                self.assertEqual(calls, [(1, (0,)), (1, (0, 1, 2)),
+                                         (3, (4,)), (4, (6,))])
+                self.assertEqual(result["n_asu"], 3)
+                self.assertIn("merged_first=1", log)
+
+    def test_chained_merges_each_resolve_before_returning_to_normal_order(self):
+        calls, result, _ = self.run_build({
+            (0,): (0, 1, 2),
+            (0, 1, 2): (0, 1, 2, 3, 4),
+        })
+        self.assertEqual(calls, [(1, (0,)), (1, (0, 1, 2)),
+                                 (1, (0, 1, 2, 3, 4)), (4, (6,))])
+        self.assertEqual(result["n_asu"], 2)
+
+    def test_touching_union_uses_surviving_id_before_smaller_asus(self):
+        # ASU 4 takes connector 5, then the post-solve safe union joins it to
+        # ASU 3. Its new ID is 3, so prioritizing the former ID 4 would fail.
+        calls, result, log = self.run_build({(6,): (5, 6)}, reverse=True)
+        self.assertEqual(calls, [(4, (6,)), (3, (4, 5, 6)),
+                                 (1, (0,)), (2, (2,))])
+        self.assertEqual(result["n_asu"], 3)
+        self.assertIn("merged_first=3", log)
+
+    def test_without_merges_normal_unemployment_order_is_preserved(self):
+        calls, result, log = self.run_build({})
+        self.assertEqual(calls, [(1, (0,)), (3, (4,)), (4, (6,)), (2, (2,))])
+        self.assertEqual(result["n_asu"], 4)
+        self.assertNotIn("merged_first=1", log)
+
+
+if __name__ == "__main__":
+    unittest.main()
