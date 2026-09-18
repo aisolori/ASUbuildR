@@ -7101,6 +7101,76 @@ def repair_connectivity_free_selection(
     return sorted(best)
 
 
+def _surplus_priced_path_repair(nb, profit, q, relaxed, incumbent, valid,
+                                deadline, cancellation):
+    """Attach whole relaxed components through adaptively priced node paths.
+
+    Economics and objective are separate: a donor can supply surplus without
+    earning new capture. Only complete feasible attachments are accepted;
+    intermediate path prefixes need not satisfy the rate constraint.
+    """
+    current = set(incumbent)
+    if not current:
+        return sorted(current)
+
+    def expired():
+        return time.monotonic() >= deadline or bool(cancellation())
+
+    while not expired():
+        mask = np.zeros(len(nb), dtype=bool)
+        mask[list(set(relaxed) - current)] = True
+        components = _connected_components(nb, mask)
+        if not components or expired():
+            break
+        price = _lagrangian_rate_price(profit, q, current)
+        scores = [Fraction(int(p)) + price * int(s) for p, s in zip(profit, q)]
+        costs = [float(max(0, -score)) for score in scores]
+        distances = {node: (0.0, 0) for node in current}
+        parents = {}
+        queue = [(0.0, 0, node) for node in sorted(current)]
+        heapq.heapify(queue)
+        while queue and not expired():
+            cost, hops, node = heapq.heappop(queue)
+            if distances.get(node) != (cost, hops):
+                continue
+            for neighbor in nb[node]:
+                candidate = (cost + costs[neighbor], hops + 1)
+                if candidate < distances.get(neighbor, (math.inf, math.inf)):
+                    distances[neighbor] = candidate
+                    parents[neighbor] = node
+                    heapq.heappush(queue, (*candidate, neighbor))
+        if expired():
+            break
+        best = None
+        for component in components:
+            if expired():
+                break
+            reachable = [node for node in component if node in distances]
+            if not reachable:
+                continue
+            endpoint = min(reachable, key=lambda node: (*distances[node], node))
+            added = set(component)
+            node = endpoint
+            while node not in current:
+                added.add(node)
+                node = parents[node]
+            added -= current
+            candidate = sorted(current | added)
+            # Validate the entire bundle, including original tract-count caps.
+            if not valid(candidate):
+                continue
+            gain = sum(int(profit[node]) for node in added)
+            surplus = sum(int(q[node]) for node in added)
+            key = (Fraction(gain) + price * surplus, gain, surplus,
+                   -len(added), -endpoint)
+            if best is None or key > best[0]:
+                best = (key, candidate)
+        if best is None or expired():
+            break
+        current = set(best[1])
+    return sorted(current)
+
+
 def _reachable_polish_window(root, asu_number, assignments, nb, *, supernodes=False):
     """Root component, optionally traversing whole donor ASUs for contraction."""
     reached = {int(root)}
@@ -7133,13 +7203,16 @@ def _solve_supernode_polish(nb_local, u_g, E_g, P_g, tau, pop_thresh,
                            incumbent_stall_seconds=None,
                            incumbent_report_callback=None,
                            configure_subsolvers=True, deterministic_ties=True,
-                           tie_break_rank=None, **unused_options):
+                           tie_break_rank=None, use_surplus_path_repair=True,
+                           **unused_options):
     """Polish with optional whole donor ASUs; obj excludes already captured donors.
 
     Returns original local tract indices, never quotient-node indices. Donors
     must be complete connected valid ASUs within the supplied window. Selection
     of a donor contracts its whole connected subgraph and later absorbs it.
-    Quotient-graph cuts start at 25 rounds / 5 stalled upper-bound rounds.
+    Quotient-graph cuts start at 50 rounds / 5 stalled upper-bound rounds.
+    Adaptive surplus-priced path repair supplies feasible hints during cuts,
+    with cooperative limits of .25s per round and min(2s, 5% budget) overall.
     A primary flow incumbent stall retries cuts with both limits doubled.
     Proof, cancellation, or the shared deadline can stop sooner.
     Exact flow retains the cuts, incumbent, and bound, using the remaining time.
@@ -7216,6 +7289,27 @@ def _solve_supernode_polish(nb_local, u_g, E_g, P_g, tau, pop_thresh,
             incumbent_report_callback(expand([selected]), value)
 
     deadline = started + float(time_limit)
+    repair_remaining = [min(2.0, .05 * max(0.0, deadline - time.monotonic()))]
+    repair_interruption = [None]
+
+    def repair_cancelled():
+        # Skip consumes its flag; retain it for the cut pass and flow owner.
+        if repair_interruption[0] is None:
+            repair_interruption[0] = interruption()
+        return repair_interruption[0]
+
+    def repair_cut_candidate(groups, best):
+        if repair_remaining[0] <= 0 or repair_cancelled():
+            return best
+        repair_started = time.monotonic()
+        candidate = _surplus_priced_path_repair(
+            quotient, profit, q, groups[0], best[0],
+            lambda nodes: valid_cut_candidate([nodes]),
+            min(deadline, repair_started + min(.25, repair_remaining[0])),
+            repair_cancelled)
+        repair_remaining[0] = max(0.0, repair_remaining[0] - (time.monotonic() - repair_started))
+        return [candidate]
+
     cut_model = model
     root_rows = [[model.NewConstant(int(i == root)) for i in range(n)]]
     seen_cuts = set()
@@ -7240,12 +7334,13 @@ def _solve_supernode_polish(nb_local, u_g, E_g, P_g, tau, pop_thresh,
         best, best_obj, cut_status = _joint_connectivity_cut_pass(
             model, [x], root_rows,
             quotient, np.asarray(profit, dtype=np.int64), [sorted(selected_hint)],
-            valid_cut_candidate, deadline, workers, interruption,
+            valid_cut_candidate, deadline, workers, repair_cancelled,
             log=log, report=report_cut_candidate, objective=objective,
             max_rounds=cut_round_limit, cut_limit=math.inf,
             upper_bound_stall_rounds=cut_stall_limit, bound_stall_only=True,
             seen_cuts=seen_cuts, initial_upper_bound=upper if cycle > 1 else None,
-            stage_prefix='FINAL_POLISH_SUPERNODES', proof_out=cut_proof, bound_out=cut_bounds)
+            stage_prefix='FINAL_POLISH_SUPERNODES', proof_out=cut_proof, bound_out=cut_bounds,
+            repair_candidate=repair_cut_candidate if use_surplus_path_repair else None)
         if cut_bounds and cut_bounds[0] is not None:
             upper = min(upper, cut_bounds[0])
         selected_hint = set(best[0])
@@ -7805,7 +7900,8 @@ def _joint_connectivity_cut_pass(model, x, root_rows, nb, u,
                                  stage_prefix="STATEWIDE_JOINT", objective=None,
                                  cut_cache=None, global_nodes=None,
                                  proof_out=None, bound_stall_only=False, bound_out=None,
-                                 seen_cuts=None, initial_upper_bound=None):
+                                 seen_cuts=None, initial_upper_bound=None,
+                                 repair_candidate=None):
     """Solve/add root-aware cuts before flows; never publish disconnected groups.
 
     For v in C: x[v] <= sum(root[C]) + sum(x[boundary(C)]). A connected
@@ -7927,6 +8023,30 @@ def _joint_connectivity_cut_pass(model, x, root_rows, nb, u,
             best, best_obj = groups, value
             if report is not None:
                 report([i for unit in best for i in unit], value)
+        if not connected and not interrupted and repair_candidate is not None:
+            repaired = repair_candidate(groups, best)
+            reason = cancellation()
+            if reason:
+                interrupted.append(reason)
+                status_name = reason
+            elif valid_candidate(repaired):
+                repaired_value = sum(int(u[unit].sum()) for unit in repaired)
+                if repaired_value > best_obj:
+                    previous = best_obj
+                    best, best_obj = repaired, repaired_value
+                    if objective is not None:
+                        model.Add(objective >= best_obj)
+                        model.ClearHints()
+                        model.AddHint(objective, best_obj)
+                        for row, unit in zip(x, best):
+                            selected = set(unit)
+                            for i, var in enumerate(row):
+                                model.AddHint(var, int(i in selected))
+                    if report is not None:
+                        report([i for unit in best for i in unit], best_obj)
+                    if log:
+                        _stage_print(f'[STAGE] {stage_prefix}_CUT_REPAIR round={round_number} '
+                                     f'valid_unemp={best_obj} gain={best_obj-previous}', flush=True)
         bound_stall.observe(upper_bound)
         if connected and status == cp_model.OPTIMAL:
             # A connected optimum of the relaxation is feasible for the exact
