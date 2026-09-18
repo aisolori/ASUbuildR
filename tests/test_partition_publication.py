@@ -43,7 +43,7 @@ class PartitionPublicationTest(unittest.TestCase):
                     full_graph_window=True, harvest_connectivity_free_asus=True,
                     standalone_expansion_time_limit=1, final_asu_polish_time_limit=1,
                     merge_adjacent=False, final_consolidation=False,
-                    combine_capped_asus=False, verbose=True, bridge_pair=[1, 2],
+                    verbose=True, bridge_pair=[1, 2],
                     progress_out_path=str(progress))
         before_polish = next(s for s in snapshots if s['phase'] == 'PRE_POLISH')
         self.assertEqual(before_polish['n_asu'], 2)

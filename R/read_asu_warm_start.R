@@ -1,8 +1,7 @@
 # Internal dashboard helper: read data only, align by tract ID, then validate
 # against the current solver inputs. Saved geometry/economic columns are ignored.
 asu_read_warm_start <- function(path, geoids, data = NULL, neighbors = NULL,
-                               tau = NULL, pop_thresh = NULL, max_asus = NULL,
-                               max_nodes = NULL) {
+                               tau = NULL, pop_thresh = NULL, max_asus = NULL) {
   saved <- tryCatch(readRDS(path), error = function(e) {
     stop("Cannot read warm-start RDS: ", conditionMessage(e), call. = FALSE)
   })
@@ -83,7 +82,6 @@ asu_read_warm_start <- function(path, geoids, data = NULL, neighbors = NULL,
         if ((10000 - threshold) * sum(u[unit]) - threshold * sum(emp[unit]) < 0 ||
             (tau > 0 && sum(u[unit] + emp[unit]) <= 0)) reason <- c(reason, "unemployment-rate threshold")
       }
-      if (!is.null(max_nodes) && is.finite(max_nodes) && length(unit) > max_nodes) reason <- c(reason, "tract cap")
       seen <- rep(FALSE, length(aligned)); seen[unit[1]] <- TRUE
       queue <- unit[1]; cursor <- 1L
       while (cursor <= length(queue)) {

@@ -1,4 +1,4 @@
-"""Imported statewide ASUs can consolidate without losing their objective floor."""
+"""Imported regional ASUs can consolidate without losing their objective floor."""
 import contextlib
 import io
 import itertools
@@ -22,11 +22,6 @@ class WarmStartConsolidationTest(unittest.TestCase):
     pop = np.array([10000]*3)
     seeds = [[0], [2]]
 
-    def statewide(self, **options):
-        args = dict(initial_units=self.seeds, merge_adjacent=True, seed_seconds=0)
-        args.update(options)
-        return solver._solve_statewide_joint(
-            self.nb, self.u, self.emp, self.pop, .2, 10000, 2, 5, 2, **args)
 
     def capture(self, nb=None, u=None, emp=None, pop=None, seeds=None, **options):
         models = []
@@ -48,18 +43,6 @@ class WarmStartConsolidationTest(unittest.TestCase):
         self.assertEqual(status, "OPTIMAL")
         return groups, models[0]
 
-    def test_dashboard_builder_consolidates_to_capture_previously_unaffordable_bridge(self):
-        frame = pd.DataFrame({"tract_ASU_unemp": self.u, "tract_ASU_emp": self.emp,
-                              "tract_pop2024": self.pop})
-        for tighten, merging in itertools.product((False, True), repeat=2):
-            with self.subTest(tighten=tighten, merging=merging):
-                result = solver.build_many_asus_cpsat(
-                    frame, self.nb, .2, 10000, max_asus=2, initial_asu_id=[4, 0, 9],
-                    statewide_joint=True, statewide_joint_time_limit=5,
-                    statewide_tighten_model=tighten, merge_adjacent=merging,
-                    workers=2, verbose=False)
-                self.assertEqual(result["joint_status"], "OPTIMAL")
-                self.assertEqual(result["asu_id"], [1, 1, 1] if merging else [1, -1, 2])
 
     def test_count_and_flow_bounds_do_not_reserve_space_for_deactivated_seeds(self):
         # Each seed needs two tracts for population. The full five-tract union
@@ -111,32 +94,11 @@ class WarmStartConsolidationTest(unittest.TestCase):
         self.assertEqual(check.Solve(model), solver.cp_model.OPTIMAL)
         self.assertEqual(check.ObjectiveValue(), 20)
 
-    def test_unknown_preserves_imported_baseline_and_bad_output_is_rejected(self):
-        with patch.object(solver.cp_model.CpSolver, "Solve", return_value=solver.cp_model.UNKNOWN):
-            groups, status = self.statewide()
-        self.assertEqual((groups, status), (self.seeds, "UNKNOWN"))
-        for invalid in ([[], []], [[0], []], [[0, 2], []], [[0], [0, 1, 2]]):
-            with self.subTest(invalid=invalid), patch.object(
-                    solver, "_solve_regional_exchange", return_value=(invalid, "FEASIBLE")):
-                groups, status = self.statewide()
-            self.assertEqual((groups, status), (self.seeds, "INVALID_RESULT"))
 
-    def test_consolidation_respects_connectivity_and_optional_tract_limits(self):
+    def test_consolidation_respects_connectivity(self):
         groups, _ = self.capture(nb=[[], [], []], tighten_model=True)
         self.assertEqual(groups, self.seeds)
-        groups, _ = self.capture(max_nodes=2, tighten_model=True)
-        self.assertEqual(groups, self.seeds)
 
-    def test_only_imported_seeds_opt_in_and_logs_distinguish_consolidation(self):
-        with patch.object(solver, "_solve_regional_exchange", wraps=solver._solve_regional_exchange) as joint:
-            self.statewide(initial_units=None)
-        self.assertFalse(joint.call_args.kwargs["allow_seed_consolidation"])
-        output = io.StringIO()
-        with contextlib.redirect_stdout(output):
-            groups, status = self.statewide(log=True)
-        self.assertEqual((groups, status), ([[0, 1, 2]], "OPTIMAL"))
-        self.assertIn("mandatory_groups=0 seed_consolidation=True", output.getvalue())
-        self.assertIn("merges=0 deactivated_seed_slots=1", output.getvalue())
 
 
 if __name__ == "__main__":

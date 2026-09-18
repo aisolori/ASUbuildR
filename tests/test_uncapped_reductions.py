@@ -130,23 +130,21 @@ class UncappedReductionsTest(unittest.TestCase):
             [huge, -1],
         )
 
-    def test_solve_equivalence_and_cap_bypass(self):
-        for cap, exact in ((None, None), (2, None), (None, 2)):
-            results = []
-            for enabled in (False, True):
-                result = solve_one_asu_cpsat(
-                    [[1], [0, 2], [1, 3], [2]],
-                    np.array([10, 1, 1, 1]), np.array([0, 50, 50, 50]),
-                    np.array([5000]*4), 0.10, 10000, 0,
-                    time_limit=5, workers=1, log=False,
-                    configure_subsolvers=False, max_nodes=cap,
-                    exact_nodes=exact,
-                    use_profitable_component_closure=enabled,
-                    use_lagrangian_variable_fixing=enabled,
-                )
-                self.assertIsNotNone(result)
-                results.append((result.obj, result.sel_idx_local))
-            self.assertEqual(results[0], results[1])
+    def test_solve_equivalence(self):
+        results = []
+        for enabled in (False, True):
+            result = solve_one_asu_cpsat(
+                [[1], [0, 2], [1, 3], [2]],
+                np.array([10, 1, 1, 1]), np.array([0, 50, 50, 50]),
+                np.array([5000]*4), 0.10, 10000, 0,
+                time_limit=5, workers=1, log=False,
+                configure_subsolvers=False,
+                use_profitable_component_closure=enabled,
+                use_lagrangian_variable_fixing=enabled,
+            )
+            self.assertIsNotNone(result)
+            results.append((result.obj, result.sel_idx_local))
+        self.assertEqual(results[0], results[1])
 
 
 if __name__ == "__main__":

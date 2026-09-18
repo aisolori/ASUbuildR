@@ -61,7 +61,7 @@ class HarvestValidationTest(unittest.TestCase):
                 harvest_all_connectivity_free_components=True,
                 standalone_expansion_time_limit=1,
                 final_asu_polish_time_limit=0,
-                combine_capped_asus=False,
+
                 progress_out_path=str(Path(progress_dir) / "progress.json"),
             )
         return result, log.getvalue(), solve.call_args_list, merge.call_args_list

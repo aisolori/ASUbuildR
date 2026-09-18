@@ -148,17 +148,13 @@ class SupernodePolishTest(unittest.TestCase):
         self.assertEqual(result.obj, 35)  # baseline 10 + newly captured 25
 
     def test_large_donor_cannot_pay_for_losing_already_captured_unemployment(self):
-        # Original ASU=[0,1]. A cap allows either that ASU or root+donor,
-        # but dropping tract 1 for donor 2 would lose 20 statewide.
+        # Absorbing a large donor must preserve the original captured U.
+        # Donor unemployment is discounted in the optimization objective.
         result = self.solve([10, 20, 1000], [0, 0, 0], [1, 1, 2],
-                            nb=[[1, 2], [0], [0]], max_nodes=2)
-        self.assertEqual(result.sel_idx_local, [0, 1])
+                            nb=[[1, 2], [0], [0]])
+        self.assertEqual(result.sel_idx_local, [0, 1, 2])
         self.assertEqual(result.obj, 30)
 
-    def test_cap_counts_every_donor_tract_and_disallows_partial_absorption(self):
-        result = self.solve([10, 10, 10, 5], [0, 0, 0, 0], [1, 2, 2, -1], max_nodes=2)
-        self.assertEqual(result.sel_idx_local, [0])
-        self.assertEqual(result.obj, 10)
 
     def test_ties_can_consolidate_without_inflating_gain(self):
         result = self.solve([10, 20, 20], [0, 0, 0], [1, 2, 2])
@@ -174,17 +170,17 @@ class SupernodePolishTest(unittest.TestCase):
         ids = [1, 1, -1, 2, 2, -1]
         u = [10, 5, 7, 20, 10, 30]
         nb = [[1, 3], [0, 2], [1, 3], [0, 2, 4], [3, 5], [4]]
-        for emp, cap in itertools.product(([0]*6, [0, 10, 100, 0, 0, 150]), (None, 3, 5)):
-            with self.subTest(emp=emp, cap=cap):
+        for emp in ([0]*6, [0, 10, 100, 0, 0, 150]):
+            with self.subTest(emp=emp):
                 optimum = 15
                 for bits in itertools.product((False, True), repeat=6):
                     if not bits[0] or bits[3] != bits[4]:
                         continue
                     selected = [i for i, value in enumerate(bits) if value]
                     if solver.component_ok(selected, np.array(u), np.array(emp),
-                                           np.array([10000]*6), .2, 10000, nb, max_nodes=cap):
+                                           np.array([10000]*6), .2, 10000, nb):
                         optimum = max(optimum, sum(u[i] for i in selected if ids[i] != 2))
-                result = self.solve(u, emp, ids, nb=nb, max_nodes=cap)
+                result = self.solve(u, emp, ids, nb=nb)
                 self.assertEqual(result.status, 'OPTIMAL')
                 self.assertEqual(result.obj, optimum)
 
@@ -204,7 +200,7 @@ class SupernodePolishTest(unittest.TestCase):
         ids = np.array([1, 2, 2, -1])
         self.assertEqual(solver._reachable_polish_window(0, 1, ids, nb), [0])
         self.assertEqual(solver._reachable_polish_window(0, 1, ids, nb, supernodes=True), [0, 1, 2, 3])
-        args = (0, [0], range(4), .2, 10000, None)
+        args = (0, [0], range(4), .2, 10000)
         self.assertNotEqual(solver._polish_attempt_key(*args, ownership=ids),
                             solver._polish_attempt_key(*args, ownership=[1, 2, 3, -1]))
 

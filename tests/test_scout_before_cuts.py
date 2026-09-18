@@ -8,13 +8,14 @@ import unittest
 from unittest.mock import patch
 
 import numpy as np
+import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'inst' / 'python'))
 import asu_cpsat as solver
 
 
 class ScoutBeforeCutsTest(unittest.TestCase):
-    def run_window(self, *, skip_first_scout=False, **options):
+    def run_window(self, *, skip_first_scout=False, economic_scale=1, **options):
         snapshots, output = [], io.StringIO()
         real_solve = solver.cp_model.CpSolver.Solve
 
@@ -34,8 +35,8 @@ class ScoutBeforeCutsTest(unittest.TestCase):
         with (patch.object(solver.cp_model.CpSolver, 'Solve', new=capture),
               contextlib.redirect_stdout(output)):
             result = solver.solve_one_asu_cpsat(
-                [[1], [0, 2], [1, 3], [2]], np.array([10, 1, 5, 2]),
-                np.array([0, 50, 0, 30]), np.array([10000]*4),
+                [[1], [0, 2], [1, 3], [2]], np.array([10, 1, 5, 2]) * economic_scale,
+                np.array([0, 50, 0, 30]) * economic_scale, np.array([10000]*4),
                 .2, 10000, 0, **defaults)
         return result, snapshots, output.getvalue()
 
@@ -53,8 +54,7 @@ class ScoutBeforeCutsTest(unittest.TestCase):
         self.assertNotIn('[cut-pass] round', log)
 
     def test_early_scout_supports_existing_connectivity_formulations(self):
-        for options in ({'use_signed_flow': False}, {'use_arborescence': True},
-                        {'max_nodes': 3}, {'exact_nodes': 3, 'hint': [0, 1, 2]}):
+        for options in ({'use_signed_flow': False}, {'use_arborescence': True}):
             with self.subTest(options=options):
                 result, _, _ = self.run_window(**options)
                 self.assertEqual((result.obj, result.status), (16, 'OPTIMAL'))
@@ -130,6 +130,71 @@ class ScoutBeforeCutsTest(unittest.TestCase):
         self.assertEqual((result.obj, result.status), (16, 'OPTIMAL'))
         self.assertIn('upper_bound_stall=10/10', log)
         self.assertIn('stop_reason=UPPER_BOUND_STALL', log)
+
+    def test_single_cut_pass_keeps_round_limit_when_upper_bound_improves(self):
+        real_solve = solver.cp_model.CpSolver.Solve
+        cuts = []
+
+        def improving_bound(instance, model, *args, **kwargs):
+            if not self.has_flow(model):
+                cuts.append(model.Clone())
+                instance.BooleanValue = lambda var: var.name in ('x_0', 'x_1')
+                instance.BestObjectiveBound = lambda: 1710 - len(cuts)
+                return solver.cp_model.FEASIBLE
+            return real_solve(instance, model, *args, **kwargs)
+
+        with patch.object(solver.cp_model.CpSolver, 'Solve', new=improving_bound):
+            result, models, _ = self.run_window(scout_before_cuts=False, economic_scale=100)
+        self.assertEqual(len(cuts), 100)
+        self.assertTrue(self.has_flow(models[-1][0]))
+        self.assertEqual((result.obj, result.status), (1600, 'OPTIMAL'))
+
+    def test_takeover_runs_cuts_before_flow_and_keeps_generated_constraints(self):
+        models = []
+        in_takeover = [False]
+        real_window = solver.solve_one_asu_cpsat
+        real_solve = solver.cp_model.CpSolver.Solve
+
+        def window(**kwargs):
+            takeover = 'objective_no_improve_stop' in kwargs
+            if not takeover:
+                return None
+            self.assertFalse(kwargs['scout_before_cuts'])
+            in_takeover[0] = True
+            try:
+                return real_window(**kwargs)
+            finally:
+                in_takeover[0] = False
+
+        def capture(instance, model, *args, **kwargs):
+            self.assertEqual(model.Validate(), '')
+            if in_takeover[0]:
+                models.append(model.Clone())
+            instance.parameters.log_to_stdout = False
+            return real_solve(instance, model, *args, **kwargs)
+
+        frame = pd.DataFrame({'tract_ASU_unemp': [10, 1, 5, 2],
+                              'tract_ASU_emp': [0, 50, 0, 30],
+                              'tract_pop2024': [10000]*4})
+        with (patch.object(solver, 'solve_one_asu_cpsat', side_effect=window),
+              patch.object(solver, '_solve_supernode_polish', return_value=None),
+              patch.object(solver, '_search_unassigned_asu', return_value=([], 'INFEASIBLE')),
+              patch.object(solver.cp_model.CpSolver, 'Solve', new=capture)):
+            result = solver.build_many_asus_cpsat(
+                frame, [[1], [0, 2], [1, 3], [2]], .2, 10000,
+                initial_asu_id=[1, -1, 2, -1], max_asus=2,
+                harvest_connectivity_free_asus=True, standalone_expansion_time_limit=0,
+                final_asu_polish_time_limit=10, final_consolidation=False,
+                deterministic_ties=True, configure_subsolvers=False,
+                use_small_root_separators=False, time_limit=0, workers=1, verbose=False)
+        self.assertEqual(result['asu_id'], [1, 1, 1, -1])
+        self.assertTrue(models)
+        self.assertFalse(self.has_flow(models[0]))
+        cuts = [model for model in models if not self.has_flow(model)]
+        flows = [model for model in models if self.has_flow(model)]
+        self.assertTrue(flows)
+        final_rows = {str(row) for row in flows[0].Proto().constraints}
+        self.assertTrue(all(str(row) in final_rows for row in cuts[-1].Proto().constraints))
 
     def test_matching_verified_bound_skips_all_primary_solves(self):
         with patch.object(solver.cp_model.CpSolver, 'Solve',

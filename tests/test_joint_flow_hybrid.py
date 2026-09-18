@@ -25,7 +25,7 @@ class JointFlowHybridTest(unittest.TestCase):
                 [[0], [3]], list(range(4)), [[1], [0, 2], [1, 3], [2]],
                 np.array([10, 3, 2, 10]), np.array([0, 30, 30, 0]),
                 np.array([10000] * 4), .2, 10000, 10, workers,
-                max_nodes=2, tighten_model=True, use_joint_cuts=True,
+                tighten_model=True, use_joint_cuts=True,
                 deterministic_ties=False, exact_flow_after_cuts=not cut_only,
                 use_flow_capacity_hybrid_search=enabled)
         return groups, status, snapshots

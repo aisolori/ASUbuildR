@@ -1024,7 +1024,7 @@ shiny::conditionalPanel(
                           "Expansion incumbent stall limit (sec)", value = 300, min = 0, step = 30),
       shiny::checkboxInput("cpsat_final_consolidation", "Consolidate touching ASUs at the end", value = TRUE),
       shiny::checkboxInput("cpsat_polish_consolidated_asus", "Polish consolidated groups", value = TRUE),
-      shiny::helpText("Final consolidation preserves every selected tract and respects tract-count limits. Optional polishing uses the final-polish budget and general stall limit, preserves selected tracts, then consolidates any new contacts. Stop still allows the quick consolidation but skips additional solves."),
+      shiny::helpText("Final consolidation preserves every selected tract. Optional polishing uses the final-polish budget and general stall limit, preserves selected tracts, then consolidates any new contacts. Stop still allows the quick consolidation but skips additional solves."),
       shiny::helpText("Finish retained-component repair and partition expansion solves after this many seconds without an incumbent improvement. Applies to sequential and joint expansion. 0 disables this limit; the solve time budget still applies. Final polishing uses the general stall limit."),
       shiny::helpText("Surplus pruning starts with all tracts and removes the lowest-surplus tracts while preserving population. A removal may split a component only if every resulting component meets the population threshold; each is then pruned independently toward the rate threshold. Stalled components are repaired using only retained tracts. Valid seeds then enter outward expansion and polishing, where pruned tracts become available again."),
       shiny::checkboxInput(
@@ -1042,12 +1042,6 @@ shiny::conditionalPanel(
     shiny::numericInput("cpsat_workers",   "Total CP-SAT workers (detected cores - 2)", value = max(1, parallel::detectCores(logical = FALSE)-2), min = 1, step = 1),
     shiny::numericInput("cpsat_parallel_asus", "Concurrent ASU solves", value = 1, min = 1, step = 1),
     shiny::numericInput("cpsat_relgap",        "Relative gap (optional)",    value = NULL, min = 0, step = 0.0001),
-    shiny::checkboxInput("cpsat_enable_max_nodes", "Limit tracts per ASU (cap + combine)", value = FALSE),
-    shiny::conditionalPanel(
-      condition = "input.cpsat_enable_max_nodes === true",
-      shiny::numericInput("cpsat_max_nodes",           "Max tracts per ASU",                     value = 500, min = 1, step = 1),
-      shiny::numericInput("cpsat_combine_timelimit",   "Combine/re-solve time limit (sec, optional)", value = NULL, min = 0, step = 60)
-    ),
     shiny::uiOutput("cpsat_log_link")
   )
 )
@@ -1082,22 +1076,6 @@ output$algo_blurb <- shiny::renderUI({
              <code>Relative gap</code>, <code>Total CP-SAT workers</code>, and
              <code>Concurrent ASU solves</code>.</li>
        </ul>
-       <p>
-         <strong>Limit tracts per ASU (cap + combine):</strong> leave this
-         toggle off for unrestricted ASU sizes (default). Enabling it reveals
-         two extra controls: <code>Max tracts per ASU</code>, which caps each
-         ASU built during the main pass at that many tracts (so the solver
-         builds as many separate, non-overlapping capped ASUs as it can), and
-         <code>Combine/re-solve time limit</code>, an optional separate CP-SAT
-         time budget for the final pass. Once no more capped ASUs can be
-         built in the legacy strategy, touching capped ASUs are automatically combined and re-solved
-         (uncapped) by CP-SAT -- repeating until no more touching ASUs remain
-         -- to improve the merged result. Leaving the combine time limit blank
-         reuses the main <code>Time limit</code> for that legacy pass.
-         Partitioning instead jointly reoptimizes touching groups while keeping
-         the cap; its touching solves use the expansion/polish budget, not the
-         combine time limit.
-       </p>
        <p>
          While solving, a live <em>CP-SAT log</em> panel appears (top-right)
          showing progress. Single-ASU and partition expansion incumbents are
@@ -1278,15 +1256,10 @@ if (identical(algo_choice, "cpsat")) {
     if (use_partitioning) append_cpsat_log(sprintf("[run] partition expansion mode: %s",
                             if (joint_partition_expansion) "joint (experimental)" else "sequential"))
     rel_gap  <- if (!is.null(input$cpsat_relgap) && !is.na(input$cpsat_relgap)) as.numeric(input$cpsat_relgap) else NA_real_
-    max_nodes_enabled <- isTRUE(input$cpsat_enable_max_nodes)
-    max_nodes_per_asu <- if (max_nodes_enabled && !is.null(input$cpsat_max_nodes) && !is.na(input$cpsat_max_nodes)) as.integer(input$cpsat_max_nodes) else NA_integer_
-    combine_timelimit <- if (max_nodes_enabled && !is.null(input$cpsat_combine_timelimit) && !is.na(input$cpsat_combine_timelimit)) as.integer(input$cpsat_combine_timelimit) else NA_integer_
-    append_cpsat_log(sprintf("[run] params: strategy=%s tau=%.6f pop=%d max=%d limit=%ds stall=%ds workers=%d concurrent_asus=%d rel_gap=%s max_nodes_per_asu=%s combine_time_limit=%s",
+    append_cpsat_log(sprintf("[run] params: strategy=%s tau=%.6f pop=%d max=%d limit=%ds stall=%ds workers=%d concurrent_asus=%d rel_gap=%s",
            cpsat_strategy,
            tau, pop_thr, max_asus, tlimit, incumbent_stall_seconds, workers, parallel_asus,
-                             if (is.na(rel_gap)) "None" else as.character(rel_gap),
-                             if (is.na(max_nodes_per_asu)) "None" else as.character(max_nodes_per_asu),
-                             if (is.na(combine_timelimit)) "None" else as.character(combine_timelimit)))
+                             if (is.na(rel_gap)) "None" else as.character(rel_gap)))
     # ---- 2) Build tracts + neighbors ----------------------------------
     shiny::incProgress(0.15, detail = "Downloading tracts & building neighbors")
     
@@ -1386,8 +1359,7 @@ if (identical(algo_choice, "cpsat")) {
         asu_read_warm_start(
           input$cpsat_warm_start$datapath, merged_df$GEOID, data = merged_df,
           neighbors = lapply(merged_sf$continuous, function(iv) as.integer(iv) - 1L),
-          tau = tau, pop_thresh = pop_thr, max_asus = max_asus,
-          max_nodes = if (is.na(max_nodes_per_asu)) NULL else max_nodes_per_asu)
+          tau = tau, pop_thresh = pop_thr, max_asus = max_asus)
       }, error = function(e) e)
       if (inherits(warm_start, "error")) {
         append_cpsat_log(paste0("[warm start] rejected: ", conditionMessage(warm_start)))
@@ -1544,13 +1516,6 @@ kwargs = dict(
 REL = %s
 if REL is not None and not (isinstance(REL, float) and math.isnan(REL)):
     kwargs['rel_gap'] = REL
-MAXN = %s
-if MAXN is not None and not (isinstance(MAXN, float) and math.isnan(MAXN)):
-    kwargs['max_nodes_per_asu'] = int(MAXN)
-    kwargs['combine_capped_asus'] = True
-COMBINE_TL = %s
-if COMBINE_TL is not None and not (isinstance(COMBINE_TL, float) and math.isnan(COMBINE_TL)):
-    kwargs['combine_time_limit'] = int(COMBINE_TL)
 print('[runner] window scope: all remaining tracts', flush=True)
 print('[runner] strategy: ' + ('partition' if kwargs['harvest_connectivity_free_asus'] else 'single'), flush=True)
 print('[runner] search: flow-capacity-hybrid', flush=True)
@@ -1577,8 +1542,6 @@ print('[runner] OK', flush=True)
         stop_file, skip_file,
       progress_json,
       if (is.na(rel_gap)) "None" else as.character(rel_gap),
-      if (is.na(max_nodes_per_asu)) "None" else as.character(max_nodes_per_asu),
-      if (is.na(combine_timelimit)) "None" else as.character(combine_timelimit),
       out_json
     )
     writeLines(runner_code, runner)
@@ -2011,6 +1974,8 @@ output$log_overlay <- shiny::renderUI({
       "skip_asu", "Skip to Next ASU",
       class = "btn-sm btn-info", style = "margin-right:4px;"
     ),
+    shiny::downloadButton("save_live_log", "Save log as...", class = "btn-sm asu-save-as",
+                          `data-asu-save-name` = "asu_solver.log"),
     shiny::actionButton("close_log", "Close", class = "btn-sm")
   )
 })
@@ -2052,7 +2017,9 @@ output$cpsat_log_link <- shiny::renderUI({
     shiny::div(style = "font-family:monospace; font-size:10px; word-break:break-all; color:#333; margin-bottom:6px;", lf),
     shiny::div(
       shiny::actionButton("open_log_folder2", "Open folder", class = "btn-xs btn-info", style = "margin-right:4px;"),
-      shiny::actionButton("open_log_file2",   "Open log",    class = "btn-xs btn-default")
+      shiny::actionButton("open_log_file2",   "Open log",    class = "btn-xs btn-default"),
+      shiny::downloadButton("save_finished_log", "Save log as...", class = "btn-xs asu-save-as",
+                            `data-asu-save-name` = "asu_solver.log")
     )
   )
 })
@@ -2064,6 +2031,28 @@ shiny::observeEvent(input$open_log_folder2, {
 shiny::observeEvent(input$open_log_file2, {
   lf <- cpsat_log_saved()
   if (!is.null(lf) && file.exists(lf)) try(shell.exec(normalizePath(lf)), silent = TRUE)
+})
+
+# Copy the complete on-disk log, rather than the shortened live display.
+cpsat_log_download <- function() shiny::downloadHandler(
+  filename = function() "asu_solver.log",
+  contentType = "text/plain",
+  content = function(file) {
+    lf <- cpsat_log_file() %||% cpsat_log_saved()
+    shiny::req(!is.null(lf), file.exists(lf))
+    if (!file.copy(lf, file, overwrite = TRUE)) stop("Could not prepare the solver log.")
+  }
+)
+output$save_live_log <- cpsat_log_download()
+output$save_finished_log <- cpsat_log_download()
+shiny::outputOptions(output, "save_live_log", suspendWhenHidden = FALSE)
+shiny::outputOptions(output, "save_finished_log", suspendWhenHidden = FALSE)
+
+shiny::observeEvent(input$asu_save_notice, {
+  notice <- input$asu_save_notice
+  shiny::showNotification(notice$message,
+                          type = if (identical(notice$type, "error")) "error" else "message",
+                          duration = if (identical(notice$type, "error")) NULL else 8)
 })
 
 # Make sure the log text stays updated
@@ -2770,19 +2759,22 @@ shiny::observe({
 These buttons allow you to save the map in progress so that you can load
 it again in the future to continue your work.
 
-First, choose a save directory. The default is your current working
-directory. After loading data, you can go directly to the ASU
-Modification tab to continue making edits.
+Use **Save Data As...** to choose a filename and folder on your computer.
+After loading data, go directly to the ASU Modification tab to continue
+making edits. The export directory below is used only for LSS and summary CSV files.
 
 ```{r}
-# Directory selection - Simple text input approach
-shiny::textInput("save_dir_path", "Save Directory Path:", value = getwd(), width = "100%")
-#shiny::actionButton("browse_dir", "Browse for Directory") # non-functional
+shiny::includeScript(file.path(dirname(knitr::current_input(dir = TRUE)), "save-as.js"))
+
+# Server-side directory for LSS and CSV exports
+shiny::textInput("save_dir_path", "LSS / CSV Export Directory (on the R server):", value = getwd(), width = "100%")
 shiny::textOutput("current_save_dir")
 shiny::textOutput("dir_status")
 shiny::br()
 
-shiny::actionButton("save_data", "Save Data")
+shiny::downloadButton("save_data", "Save Data As...", class = "asu-save-as",
+                      `data-asu-save-name` = "saved_data.rds")
+shiny::helpText("Choose a filename and folder in the save dialog. If your browser downloads immediately, enable Ask where to save each file in its download settings.")
 shiny::fileInput("load_data", "Load Data", accept = c(".rds"))
 
 # Reactive value to store the selected directory
@@ -2815,36 +2807,16 @@ output$dir_status <- shiny::renderText({
   }
 })
 
-# Observer for saving the data
-shiny::observeEvent(input$save_data, {
-  shiny::req(full_data())
-  
-  # Use the selected directory
-  save_path <- file.path(save_directory(), "saved_data.rds")
-  
-  # Check if directory exists, create if it doesn't
-  if (!dir.exists(save_directory())) {
-    dir.create(save_directory(), recursive = TRUE)
+# Prepare an RDS download; the browser chooses the destination.
+output$save_data <- shiny::downloadHandler(
+  filename = function() "saved_data.rds",
+  contentType = "application/octet-stream",
+  content = function(file) {
+    shiny::req(full_data())
+    saveRDS(full_data(), file)
   }
-  
-  # Save the full_data object to an RDS file
-  tryCatch({
-    saveRDS(full_data(), save_path)
-    
-    # Provide feedback to the user
-    shiny::showModal(shiny::modalDialog(
-      title = "Data Saved",
-      paste("Your data has been saved to:", save_path),
-      easyClose = TRUE
-    ))
-  }, error = function(e) {
-    shiny::showModal(shiny::modalDialog(
-      title = "Error Saving Data",
-      paste("Failed to save data:", e$message),
-      easyClose = TRUE
-    ))
-  })
-})
+)
+shiny::outputOptions(output, "save_data", suspendWhenHidden = FALSE)
 
 
 ```

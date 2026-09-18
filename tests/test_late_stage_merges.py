@@ -33,7 +33,7 @@ class LateStageMergeTest(unittest.TestCase):
         self.assertEqual(params.num_search_workers, 2)
         self.assertEqual(list(params.subsolvers), solver._asu_full_subsolvers(2))
 
-    def run_build(self, mode, *, merge_adjacent=True, max_nodes=None, joint_improve=True):
+    def run_build(self, mode, *, merge_adjacent=True, joint_improve=True):
         u = [20, 10 if mode == "residual" else 1, 1, 10, 1, 1]
         emp = [0, 0 if mode == "residual" else 50, 50, 0, 50, 50]
         nb = [[j for j in (i-1, i+1) if 0 <= j < 6] for i in range(6)]
@@ -98,7 +98,7 @@ class LateStageMergeTest(unittest.TestCase):
             self.assertTrue(kwargs["allow_seed_consolidation"])
             self.assertIsNone(kwargs["max_groups"])
             combined = sorted(v for unit in units for v in unit)
-            if not joint_improve or (max_nodes is not None and len(combined) > max_nodes):
+            if not joint_improve:
                 return units, "OPTIMAL"
             return [combined] + [[] for _ in units[1:]], "FEASIBLE"
 
@@ -110,6 +110,7 @@ class LateStageMergeTest(unittest.TestCase):
             patch.object(solver, "_partition_standalone_expansion_territories",
                          side_effect=lambda seeds, *a, **kw: [list(s) for s in seeds]),
             patch.object(solver, "solve_one_asu_cpsat", side_effect=solve),
+            patch.object(solver, "_solve_supernode_polish", side_effect=solve),
             patch.object(
                 solver, "_regional_exchange_pass",
                 side_effect=AssertionError("post-polish regional exchange must be skipped"),
@@ -126,8 +127,8 @@ class LateStageMergeTest(unittest.TestCase):
                 workers=1, verbose=True, full_graph_window=True,
                 harvest_connectivity_free_asus=True, final_consolidation=False,
                 standalone_expansion_time_limit=1, final_asu_polish_time_limit=1,
-                merge_adjacent=merge_adjacent, max_nodes_per_asu=max_nodes,
-                combine_capped_asus=False,
+                merge_adjacent=merge_adjacent,
+
                 progress_out_path=str(Path(progress_dir) / "progress.json"),
             )
         ids = np.array(result["asu_id"])
@@ -135,7 +136,6 @@ class LateStageMergeTest(unittest.TestCase):
             self.assertTrue(solver.component_ok(
                 np.flatnonzero(ids == k).tolist(), np.array(u), np.array(emp),
                 frame["tract_pop2024"].to_numpy(), .1, 10000, nb,
-                max_nodes=max_nodes,
             ))
         return result, events, callbacks, log.getvalue()
 
@@ -179,11 +179,6 @@ class LateStageMergeTest(unittest.TestCase):
         self.assertNotIn("PARTITION_TOUCHING_JOINT source=FINAL_POLISH_MERGE", log)
         self.assertTrue(result["residual_check"]["exhausted"])
 
-    def test_late_merge_respects_tract_limit(self):
-        result, events, _, log = self.run_build("takeover", max_nodes=3)
-        self.assertEqual(result["asu_id"], [1, 1, 1, 2, -1, -1])
-        self.assertNotIn(("polish", (0, 1, 2, 3)), events)
-        self.assertIn("accepted=0 groups_before=2 groups_after=2", log)
 
     def test_nonimproving_late_joint_solve_keeps_touching_asus_separate(self):
         result, events, _, log = self.run_build("takeover", joint_improve=False)
@@ -195,7 +190,7 @@ class LateStageMergeTest(unittest.TestCase):
     def test_unchanged_late_stages_do_not_repeat_polish(self):
         result, events, _, log = self.run_build("unchanged")
         self.assertEqual([event[1] for event in events if event[0] == "polish"],
-                         [(0,), (3,)])
+                         [(3,), (0,)])
         self.assertEqual(result["n_asu"], 2)
         self.assertNotIn("REGIONAL_EXCHANGE_MERGE", log)
 

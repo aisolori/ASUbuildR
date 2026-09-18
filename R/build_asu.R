@@ -86,7 +86,7 @@
 #'   before finishing partition repair/expansion. NA inherits the solver default;
 #'   zero disables the limit. Does not change final polishing.
 #' @param final_consolidation merge touching partition ASUs after all search,
-#'   preserving selected tracts and respecting tract-count limits (default TRUE).
+#'   preserving selected tracts (default TRUE).
 #' @param polish_consolidated_asus optionally polish consolidated groups without
 #'   releasing selected tracts, then consolidate new contacts (default FALSE).
 #' @param standalone_expansion_time_limit seconds allowed for each exact CP-SAT
@@ -95,8 +95,7 @@
 #'   replaced. Touching expanded ASUs are merged and expansion is rerun until
 #'   stable; zero commits standalone components without initial expansion
 #' @param use_buffer_asu_merge logical; after the touching-ASU combine phase
-#'   (independent of `max_nodes_per_asu`/`combine_capped_asus` and
-#'   `harvest_connectivity_free_asus`), also group and pool ASUs that touch
+#'   (independent of `harvest_connectivity_free_asus`), also group and pool ASUs that touch
 #'   directly or share a common "buffer" ASU neighbor (at most one other ASU
 #'   apart) -- including that buffer -- into one CP-SAT combine solve per
 #'   group, mirroring the touching-ASU combine phase's window-expansion and
@@ -104,7 +103,7 @@
 #'   merge can create fresh touches/shared buffers
 #' @param buffer_asu_merge_time_limit optional seconds; CP-SAT time limit for
 #'   each buffer-ASU-merge combine solve (`NA_real_` falls back to
-#'   `combine_time_limit`, then `time_limit`, the default)
+#'   `time_limit`, the default)
 #' @param final_asu_polish_time_limit optional seconds for each final sequential
 #'   CP-SAT solve over one committed ASU plus every currently unassigned tract,
 #'   plus any other ASU's tract reachable through at most one unassigned tract
@@ -119,25 +118,6 @@
 #'   phase. The former post-polish bridge-pair pass is no longer run.
 #' @param bridge_pair deprecated compatibility argument; ignored because the
 #'   bridge-pair phase has been removed.
-#' @param max_nodes_per_asu optional integer cap on the number of tracts per
-#'   ASU (`NA_integer_` disables the cap, the default). When set, ASUs are
-#'   built up to this size, then touching capped ASUs are combined and
-#'   re-solved (uncapped) via CP-SAT in a final improvement pass -- see
-#'   `combine_capped_asus`
-#' @param exact_nodes_per_asu optional integer; when set, forces every ASU
-#'   built during the main loop to select exactly this many tracts instead of
-#'   at most `max_nodes_per_asu` (`NA_integer_` disables it, the default;
-#'   takes precedence over `max_nodes_per_asu` when both are set). Intended
-#'   for the legacy single-ASU-at-a-time build to test whether fixing the
-#'   tract count speeds up the search; the combine and buffer-merge phases are
-#'   force-disabled whenever it is set
-#' @param combine_capped_asus logical; when `max_nodes_per_asu` is set,
-#'   combine touching capped ASUs and improve them via an uncapped CP-SAT
-#'   re-solve after the main build loop finishes. Ignored if
-#'   `max_nodes_per_asu` is `NA`
-#' @param combine_time_limit optional seconds; CP-SAT time limit used
-#'   specifically for the uncapped combine/re-solve pass (`NA_integer_` uses
-#'   `time_limit`, the default)
 #' @param verbose logical; print CP-SAT logs
 #' @return df with added `asu_id` column (integer; -1 means unassigned)
 #' @export
@@ -177,10 +157,6 @@ build_asu <- function(
     buffer_asu_merge_time_limit = NA_real_,
     final_asu_polish_time_limit = NA_real_,
     bridge_pair = NULL,
-    max_nodes_per_asu = NA_integer_,
-    exact_nodes_per_asu = NA_integer_,
-    combine_capped_asus = TRUE,
-    combine_time_limit = NA_integer_,
     verbose = interactive(),
     parallel_asus = 1L,
     use_flow_first_search = FALSE,
@@ -263,11 +239,7 @@ build_asu <- function(
     harvest_all_connectivity_free_components = isTRUE(harvest_all_connectivity_free_components),
     standalone_expansion_time_limit = as.numeric(standalone_expansion_time_limit),
     final_asu_polish_time_limit = if (is.na(final_asu_polish_time_limit)) NULL else as.numeric(final_asu_polish_time_limit),
-    bridge_pair = bridge_pair,
-    max_nodes_per_asu = if (is.na(max_nodes_per_asu)) NULL else as.integer(max_nodes_per_asu),
-    exact_nodes_per_asu = if (is.na(exact_nodes_per_asu)) NULL else as.integer(exact_nodes_per_asu),
-    combine_capped_asus = isTRUE(combine_capped_asus),
-    combine_time_limit = if (is.na(combine_time_limit)) NULL else as.integer(combine_time_limit)
+    bridge_pair = bridge_pair
   )
 
   df$asu_id <- as.integer(reticulate::py_to_r(out[["asu_id"]]))

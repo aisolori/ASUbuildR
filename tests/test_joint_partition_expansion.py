@@ -59,8 +59,6 @@ class JointModelTest(unittest.TestCase):
         cases = [
             ([10, 1, 5, 1], [0, 0, 40, 0], [10000]*4, [[0], [3]], chain(4), {}),
             ([10]*4, [0]*4, [6000]*4, [[0], [2], [3]], chain(4), {}),
-            ([10]*4, [0]*4, [6000]*4, [[0], [3]], chain(4), {"exact_nodes": 2}),
-            ([10]*4, [0]*4, [6000]*4, [[0], [3]], chain(4), {"max_nodes": 2}),
             ([1, 9, 2, 5], [30, 0, 100, 0], [10000]*4, [[0], [3]], chain(4), {}),
             ([10]*4, [0]*4, [6000]*4, [[0], [3]], [[], [2], [1], []], {}),
         ]
@@ -157,7 +155,7 @@ class JointBuildTest(unittest.TestCase):
                 harvest_all_connectivity_free_components=True,
                 joint_partition_expansion=joint, standalone_expansion_time_limit=5,
                 final_asu_polish_time_limit=0, merge_adjacent=merge,
-                combine_capped_asus=False, progress_out_path=str(Path(folder) / "progress.json"),
+                progress_out_path=str(Path(folder) / "progress.json"),
             )
         return result, events, log.getvalue(), joint_solve.call_count
 

@@ -70,8 +70,6 @@ class ScreeningEfficiencyTest(unittest.TestCase):
             self.assertEqual(constructor.call_count, 2)
             self.assertEqual(screen(overlap=[]), "INFEASIBLE")
             self.assertEqual(constructor.call_count, 3)
-            self.assertEqual(screen(max_nodes=0), "INFEASIBLE")
-            self.assertEqual(constructor.call_count, 4)
 
     def test_unknown_not_cached_and_cache_is_bounded(self):
         cache = {}

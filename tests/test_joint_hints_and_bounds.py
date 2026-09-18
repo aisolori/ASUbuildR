@@ -112,15 +112,6 @@ class JointHintsAndBoundsTest(unittest.TestCase):
         self.assertEqual(variables['regional_objective_unemployment'], [0, expected])
         self.assertEqual(sum(u[i] for group in groups for i in group), 110)
 
-    def test_joint_objective_combines_rate_and_total_tract_count_bounds(self):
-        u = [100, 90, 80, 70]
-        groups, model = self.capture(
-            [[1], [0, 2], [1, 3], [2]], u, [0] * 4, [10000] * 4,
-            [[0], [1]], tighten_model=True, max_nodes=1,
-        )
-        variables = {v.name: list(v.domain) for v in model.Proto().variables}
-        self.assertEqual(sum(u[i] for group in groups for i in group), 190)
-        self.assertEqual(variables['regional_objective_unemployment'], [190, 190])
 
     def test_joint_hint_banks_safe_surplus_then_spends_it_on_deficit_tract(self):
         # At tau=.1, q=9u-e. Tract 2 cannot join tract 0 directly
@@ -159,7 +150,7 @@ class JointHintsAndBoundsTest(unittest.TestCase):
         )
         self.assertEqual(root, 1)
 
-    def test_joint_profitable_closure_is_union_level_and_uncapped_only(self):
+    def test_joint_profitable_closure_is_union_level(self):
         nb = [[1], [0, 2], [1]]
 
         def closure_rows(model):
@@ -180,12 +171,7 @@ class JointHintsAndBoundsTest(unittest.TestCase):
             nb, [10] * 3, [0] * 3, [10000] * 3, [[0], []],
             tighten_model=True,
         )
-        _, capped = self.capture(
-            nb, [10] * 3, [0] * 3, [10000] * 3, [[0], []],
-            tighten_model=True, max_nodes=1,
-        )
         self.assertEqual(len(closure_rows(uncapped)), 4)
-        self.assertEqual(closure_rows(capped), [])
 
     def test_group_objective_bounds_use_reachable_seed_component(self):
         _, model = self.capture(
@@ -243,7 +229,7 @@ class JointHintsAndBoundsTest(unittest.TestCase):
                 [[0], []], [0, 1, 2], [[], [], []],
                 np.array([5, 10, 10]), np.array([0, 0, 20]),
                 np.array([10000] * 3), .2, 10000, 5, 2,
-                max_nodes=1, allow_inactive_seeds=True,
+                allow_inactive_seeds=True,
                 allow_unseeded_groups=True, max_groups=None,
                 tighten_model=True,
             )
@@ -298,11 +284,10 @@ class JointHintsAndBoundsTest(unittest.TestCase):
 
     def test_tightening_preserves_every_feasible_partition_up_to_free_label_symmetry(self):
         cases = [
+            ([[1], [0, 2], [1, 3], [2]], [10]*4, [0]*4, [6000]*4, [[], []], {}),
             ([[1], [0, 2], [1, 3], [2]], [10, 2, 3, 8], [0, 40, 3, 0], [6000]*4, [[], []], {}),
             ([[1], [0], [3], [2]], [10]*4, [0]*4, [6000]*4, [[], []], {}),
             ([[1], [0, 2], [1, 3], [2]], [10]*4, [0]*4, [6000]*4, [[0, 1], []], {}),
-            ([[1], [0, 2], [1, 3], [2]], [10]*4, [0]*4, [6000]*4, [[], []], {"exact_nodes": 2}),
-            ([[1], [0, 2], [1, 3], [2]], [10]*4, [0]*4, [6000]*4, [[], []], {"max_nodes": 2}),
         ]
         tested = 0
         for nb, u, emp, pop, seeds, options in cases:
@@ -351,22 +336,6 @@ class JointHintsAndBoundsTest(unittest.TestCase):
                 tested += 1
         self.assertGreater(tested, 15)
 
-    def test_statewide_toggles_forward_full_relaxed_selection_and_keep_fallback_on(self):
-        for enabled in (False, True):
-            with (
-                self.subTest(enabled=enabled),
-                patch.object(solver, "solve_connectivity_free_relaxation",
-                             return_value=solver.ConnectivityFreeResult([0, 1, 2], 102, 102, "OPTIMAL", .1, [])),
-                patch.object(solver, "_solve_regional_exchange",
-                             return_value=([[0], [2]], "FEASIBLE")) as joint,
-            ):
-                solver._solve_statewide_joint(
-                    [[], [], []], np.array([100, 1, 1]), np.array([0, 200, 0]), np.array([10000]*3),
-                    .2, 10000, 2, 5, 2, seed_seconds=1, use_relaxed_hint=enabled, tighten_model=enabled)
-                self.assertEqual(joint.call_args.kwargs["relaxed_selection_hint"],
-                                 [0, 1, 2] if enabled else None)
-                self.assertEqual(joint.call_args.kwargs["tighten_model"], enabled)
-                self.assertEqual(joint.call_args.args[0], [[0], [2]])
 
 
 if __name__ == "__main__":

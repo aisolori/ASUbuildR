@@ -43,7 +43,6 @@ run_warm_start_tests <- function() {
   stopifnot(result$baseline_unemp == 20, identical(result$ids, c(1L, 1L)))
   expect_error(asu_read_warm_start(file, c(a, b), current, list(integer(), integer()), .2, 10000, 2), "connectivity")
   expect_error(asu_read_warm_start(file, c(a, b), current, list(1L, 0L), .2, 20000, 2), "population")
-  expect_error(asu_read_warm_start(file, c(a, b), current, list(1L, 0L), .2, 10000, 2, 1), "tract cap")
   current$tract_ASU_emp <- c(100, 100)
   expect_error(asu_read_warm_start(file, c(a, b), current, list(1L, 0L), .2, 10000, 2), "rate")
   cat("RDS warm-start import checks passed.\n")

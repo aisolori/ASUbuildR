@@ -105,6 +105,7 @@ class TouchingJointTest(unittest.TestCase):
               patch.object(solver, '_merge_touching_asu_units',
                            side_effect=lambda units, *args, **kwargs: (units, 0)),
               patch.object(solver, 'solve_one_asu_cpsat', side_effect=single),
+              patch.object(solver, '_solve_supernode_polish', side_effect=single),
               patch.object(solver, '_regional_exchange_pass', side_effect=lambda a, *args, **kw: a.copy()),
               patch.object(solver, '_search_unassigned_asu', return_value=([], 'INFEASIBLE'))):
             solver.build_many_asus_cpsat(
@@ -212,7 +213,6 @@ class TouchingJointTest(unittest.TestCase):
     def test_invalid_and_regressing_outputs_are_rejected(self):
         cases = [([[0], []], {}), ([[0, 1], [1, 2]], {}),
                  ([[0, 2], [1]], {}), ([[0], [1, 5]], {}),
-                 ([[1, 2], [0]], {}), ([[0, 1, 2], []], {"max_nodes": 2}),
                  ([[0], [1], [2]], {})]
         for candidate, options in cases:
             with self.subTest(candidate=candidate, options=options):
@@ -296,19 +296,18 @@ class TouchingJointTest(unittest.TestCase):
         self.assertIn("accepted=1 groups_before=2 groups_after=2", log.getvalue())
         self.assertIn("baseline_unemp=20 unemp=30 gain=10", log.getvalue())
 
-    def test_real_model_can_drop_original_root_and_keeps_custom_configuration(self):
+    def test_real_model_expands_touching_groups_and_keeps_custom_configuration(self):
         u, emp, pop = np.array([1, 5, 5, 10, 20]), np.array([0, 20, 0, 0, 0]), np.full(5, 10000)
         self.assertEqual(solver._pick_capacity_root([0, 1], u, emp, pop, .2), 0)
         with patch.object(solver, "_configure_asu_solver_portfolio",
                           wraps=solver._configure_asu_solver_portfolio) as configure:
             groups, updates = solver._reoptimize_touching_asu_units(
-                [[0, 1], [2, 3]], [4], chain(5), u, emp, pop, .2, 10000, 5, 2,
-                max_nodes=2)
+                [[0, 1], [2, 3]], [4], chain(5), u, emp, pop, .2, 10000, 5, 2)
         self.assertEqual(updates, 1)
-        self.assertEqual(sorted(v for group in groups for v in group), [1, 2, 3, 4])
-        self.assertEqual(sum(int(u[group].sum()) for group in groups), 40)
+        self.assertEqual(sorted(v for group in groups for v in group), [0, 1, 2, 3, 4])
+        self.assertEqual(sum(int(u[group].sum()) for group in groups), 41)
         self.assertTrue(all(solver.component_ok(group, u, emp, pop, .2, 10000,
-                                               chain(5), max_nodes=2) for group in groups))
+                                               chain(5)) for group in groups))
         # A connected optimum of the cut model now proves the exact model, so
         # this case needs only the configured cut-pass solver and no flow solve.
         self.assertGreaterEqual(configure.call_count, 1)

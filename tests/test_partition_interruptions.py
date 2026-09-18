@@ -70,7 +70,7 @@ class PartitionInterruptionsTest(unittest.TestCase):
                     full_graph_window=True, harvest_connectivity_free_asus=True, final_consolidation=False,
                     harvest_all_connectivity_free_components=True,
                     standalone_expansion_time_limit=5, final_asu_polish_time_limit=0,
-                    combine_capped_asus=False, stop_flag_path=str(stop))
+                    stop_flag_path=str(stop))
         self.assertEqual(result["n_asu"], 0 if action == "stop_no_valid" else 3)
         self.assertEqual(result["asu_id"][7], -1)
         self.assertEqual(result["residual_check"]["status"], "STOPPED")

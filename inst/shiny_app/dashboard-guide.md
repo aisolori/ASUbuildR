@@ -96,8 +96,7 @@ rate, population, and connectivity requirements before being committed.
 
 **Consolidate touching ASUs at the end** is enabled by default for partitioning.
 After the search stages, it deterministically unions eligible touching groups,
-preserving every selected tract and the total captured unemployment. It respects
-the tract cap; exact tract-count requirements prevent consolidation. This quick
+preserving every selected tract and the total captured unemployment. This quick
 cleanup also runs after Stop. It does not depend on a joint solve finding a merge.
 
 Touching-ASU joint solves reuse generated connectivity cuts within the current
@@ -140,9 +139,6 @@ Set these before starting. Changing a control does not reconfigure a running sol
 | Total CP-SAT workers (detected cores - 2) | Threads available to CP-SAT; initialized from detected physical cores with a minimum of one. More workers use more CPU and may use more memory; they do not guarantee better results. |
 | Concurrent ASU solves | Maximum simultaneous main candidate solves. Default `1`. Main windows share the worker budget. Partition expansions are sequential and receive the full worker budget. |
 | Relative gap (optional) | Allows earlier termination when the solution is close to its bound. `0.01` means approximately 1%. Blank leaves this optional tolerance unset. The gap concerns the current model, not proof of the best overall arrangement. |
-| Limit tracts per ASU (cap + combine) | Optional restriction, **off by default**. Leave off for unrestricted sizes. Legacy combination can exceed the initial cap; partition touching-joint solves keep it. |
-| Max tracts per ASU | Appears with the cap enabled. Default `500`. Caps groups except during legacy uncapped combination. |
-| Combine/re-solve time limit (sec, optional) | Appears with the cap enabled. Legacy-only budget for combining capped groups; blank uses the main per-window budget. Partition touching checks instead use the expansion/polish budget. |
 
 **Rate units differ between tabs:**
 
@@ -174,37 +170,37 @@ infeasibility.
 | PARTITION_EXPANSION_COMPLETE | Summarizing that round. Rejected seeds did not produce valid ASUs; the whole run can continue. |
 | PARTITION_TOUCHING_JOINT / PARTITION_TOUCHING_JOINT_COMPLETE | Jointly reoptimizing a touching partition cluster with reachable unassigned tracts. Reports source stage, group/window size, budget/workers, movable roots, baseline unemployment, gain, deactivated slots, acceptance, and elapsed time. `CACHED` skips an unchanged attempted neighborhood, not a proof of optimality. |
 | PARTITION_BUILD_MERGE / PARTITION_COMBINE | Legacy touching-group combining; partitioning uses the joint check instead. |
-<<<<<<< HEAD
-| FINAL_POLISH | Reconsidering ASUs from most to least unemployment captured, with ASU number breaking ties. Each can reconsider its own and unassigned tracts; the order is recomputed after a merge. |
+| FINAL_POLISH | With merging enabled, processes ASUs from least to most total unemployment. After a merge, the newly merged ASU gets the next solve, then normal ordering resumes. |
 | FINAL_POLISH_MERGE | Restarting polishing after a merge. |
-| REGIONAL_EXCHANGE | Letting two or three nearby ASUs exchange tracts together, while keeping every affected ASU valid. Only increases in combined unemployment are accepted. |
-=======
-| FINAL_POLISH | Reconsidering each ASU with unassigned tracts; additions and removals are possible. |
-| FINAL_POLISH_MERGE | Restarting polishing after a merge. |
->>>>>>> fe2b02e74c641ae8259311ba9ad97e23ed77101c
-| SINGLE_ASU_TAKEOVER / TAKEOVER_DONOR_REPAIR | Trying a larger replacement and repairing affected groups before accepting or rejecting the attempt. |
+| SINGLE_ASU_TAKEOVER / TAKEOVER_DONOR_REPAIR | Runs flow-free graph cuts before the takeover flow solve, then repairs affected groups before accepting or rejecting the attempt. |
 | FINAL_RESIDUAL_CHECK | Checking remaining tract components near the end. |
 
 Stages may repeat or be skipped depending on the strategy and results.
 
+The single-ASU takeover cut pass keeps its 100-round maximum and stops after
+ten rounds without an improved upper bound. It shares the solve time budget
+(up to 60 seconds and 15% of that budget for cuts, with a two-second minimum
+when time remains). All generated cuts strengthen the subsequent exact model.
+A proven optimum can skip further primary optimization; Stop and Skip remain active.
+
 The post-polish bridge-pair pass has been removed (both cuts and flow).
 Supernode polishing starts with connectivity cuts on the contracted graph.
 Its rounds check ASUs from least to most total unemployment, breaking ties by
-ASU ID and recomputing the order after merges. Ordinary polishing with merging
+ASU ID. After a merge, the newly merged ASU runs next before returning to this order. Ordinary polishing with merging
 disabled retains highest-unemployment-first order.
 `FINAL_POLISH_SUPERNODES_CUT_ROUND` reports the upper bound and its stall count.
-The first cut pass stops after 25 cut rounds or five consecutive rounds without a
+The first cut pass stops after 50 cut rounds or five consecutive rounds without a
 better upper bound, whichever happens first. A better bound resets the stall
 count, not the total round count. There is no individual-cut-count cap.
 Proof, cancellation, and the overall polish time limit can stop it sooner.
 Exact flow retains the cuts and best connected solution and uses the remaining
 time. If primary flow stalls with a valid incumbent that absorbs another ASU,
 that solution returns immediately for merge validation/commit and the polish
-queue restarts. Equal statewide unemployment is sufficient; coverage cannot
+queue restarts with the merged ASU first, then resumes lowest unemployment first. Equal statewide unemployment is sufficient; coverage cannot
 decrease. `FINAL_POLISH_SUPERNODES_STALL_MERGE` reports this handoff.
 Otherwise, if the primary flow solve reaches its incumbent stall limit without a
-proof, another flow-free cut pass runs with both limits doubled: 50/10, 100/20,
-200/40, and so on. Each flow solve is rebuilt from the accumulated cuts.
+proof, another flow-free cut pass runs with both limits doubled: 100/10, 200/20,
+400/40, and so on. Each flow solve is rebuilt from the accumulated cuts.
 The primary flow incumbent-stall allowance also doubles on each retry:
 the configured limit, then 2x, 4x, and so on. A disabled stall limit stays
 disabled. Cycle/flow stage logs report the active allowance. Valid
@@ -349,38 +345,6 @@ the connected solve screens once and can reuse a matching certificate from a
 bounded, run-local cache. Timeouts are not cached as infeasibility. Screening
 and model preparation count toward the connected solve's time budget.
 
-<<<<<<< HEAD
-Regional exchanges run after final polishing, before statewide takeover.
-The exchange pass has up to four neighborhood attempts per
-run, with at most 60 seconds per attempt and 180 seconds total (or the
-final-polish budget, if smaller). Time spent on ordinary expansion and polish
-does not use this exchange budget. Unchanged neighborhoods already attempted
-are skipped even if their ASU labels have changed. Other ASUs stay fixed.
-Stop and Skip also apply to these passes. If no improvement is found, existing
-assignments are retained and the build continues to its next stage.
-Attempts rotate through nearby anchor ASUs before trying their alternate
-pairs. They start with a one-hop halo of unassigned tracts, then widen to
-two hops after the smaller neighborhoods have been attempted. Regional roots
-can move between ASUs; each resulting ASU must retain at least one of its
-original tracts and independently meet the population and rate requirements.
-
-During a run, final polishing skips a previously attempted problem when its
-root, incumbent tracts, reachable window, and constraints are unchanged.
-The log marks these skips with `FINAL POLISH CACHE`. Changed inputs allow a
-new attempt; a cache hit does not mean optimality was proved.
-Partition expansion separately reuses proven-optimal territory results when
-the territory, root, and constraints match. Partial or gap-limited results
-are not cached as optimal territory solutions.
-
-Automatic CP-SAT roots use the eligible tract with the highest rate capacity:
-`den × unemployed − num × employed`, the exact scaled form of
-`unemployed − threshold × labor force`. Equal capacities favor higher
-population, then lower tract index. Individual polish solves keep their root.
-Regional exchanges and residual searches choose the highest-capacity tract
-within each selection they find, allowing them to replace the original root.
-
-=======
->>>>>>> fe2b02e74c641ae8259311ba9ad97e23ed77101c
 Pastel fills identify committed ASUs; colors can repeat, so check the tooltip's
 ASU number. Grey indicates unassigned tracts. During supported searches,
 translucent green/red fills show proposed additions/removals relative to the
@@ -393,7 +357,8 @@ map. Large-state maps may load after the log.
 | Stop Solve | Requests an orderly stop with the available incumbent. Wait for completion and the final map update before saving. |
 | Skip to Next ASU | Requests that the current search finish with its available incumbent so building can continue; it does not delete an ASU. |
 | Close | Hides the log panel; does not stop the Python process. |
-| Open log / Open folder | Opens the saved log or folder on the computer running R. |
+| Save log as... | Opens a save dialog for the complete log on your computer, during or after a run. |
+| Open log / Open folder | Opens the automatic log or folder on the computer running R. |
 
 Keep the browser session open while solving; ending the session terminates its
 solver process. Finish or stop the run before manual editing or saving results.
@@ -427,9 +392,15 @@ select it and update its value to `0`.
 
 | Control | Meaning |
 | --- | --- |
-| Save Directory Path | Existing folder on the computer running R. Check **Current save directory**: a nonexistent path does not switch the active folder. Exports use this folder too. |
-| Save Data | Writes current map data and assignments to `saved_data.rds`. Saving again overwrites it. Rename/copy checkpoints or use separate folders. |
+| LSS / CSV Export Directory | Existing folder on the machine running R, used for LSS and summary CSV exports. RDS and log saves choose their own location. |
+| Save Data As... | Opens a save dialog to choose a folder and filename for current map data and assignments. The suggested filename is `saved_data.rds`. Cancel leaves the data unchanged. |
 | Load Data / Browse | Restores a saved `.rds` map for editing. It does not restore a running search or all dashboard settings. |
+
+The native save dialog is available in supporting browsers such as Chrome and
+Edge over HTTPS or localhost. Other browsers and insecure remote HTTP sessions
+use ordinary downloads; enable **Ask where to save each file** in the browser
+to choose a destination each time. Saves go to your computer even when R runs
+in an EC2 container. Automatic run logs remain on the R server.
 
 Save after initialization and at editing milestones. After restoring an RDS,
 continue editing directly. Before LSS export, upload the matching workbook in
@@ -475,3 +446,7 @@ the same filenames in the active save directory.
 - **Reporting an issue:** retain the log and note the algorithm, strategy,
   state, boundary year, settings, and last stage.
 
+
+The experimental statewide joint strategy and user-imposed ASU tract limits
+have been removed from the dashboard, R wrapper, Python API and CLI. Partition
+joint expansion and connectivity cut passes remain available.
