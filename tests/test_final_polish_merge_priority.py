@@ -1,4 +1,4 @@
-"""Committed merges re-enter strict lowest-unemployment polish ordering."""
+"""Finish surviving queued ASUs before restarting after a committed merge."""
 import contextlib
 import io
 from pathlib import Path
@@ -14,12 +14,14 @@ import asu_cpsat as solver
 
 
 class FinalPolishMergePriorityTest(unittest.TestCase):
-    def run_build(self, replacements, *, status="STALLED_FEASIBLE", reverse=False):
+    def run_build(self, replacements, *, status="STALLED_FEASIBLE", reverse=False, unemployment=None):
         # Four saved ASUs, separated by unassigned connector tracts. Population
         # encodes global indices so the mocked solve can inspect real windows.
         u = [10, 0, 60, 0, 20, 0, 30]
         if reverse:
             u = [20, 0, 30, 0, 60, 0, 10]
+        if unemployment is not None:
+            u = unemployment
         frame = pd.DataFrame({
             "tract_ASU_unemp": u,
             "tract_ASU_emp": [0, 20, 0, 20, 0, 20, 0],
@@ -98,6 +100,25 @@ class FinalPolishMergePriorityTest(unittest.TestCase):
                                  (3, (4, 5, 6))])
         self.assertEqual(result["n_asu"], 3)
         self.assertIn("merged_first=none", log)
+
+    def test_remaining_queue_finishes_even_when_merged_group_would_sort_ahead(self):
+        for replacement in ((0, 1, 2), (0, 1)):
+            with self.subTest(replacement=replacement):
+                # U=10 merges with U=15. It must wait for BOTH pending U=20
+                # and U=90, although an immediate sort would put U=25 first
+                # ahead of U=90. Connector-only growth exercises safe union
+                # and compaction (pending IDs 3/4 become 2/3).
+                calls, result, log = self.run_build(
+                    {(0,): replacement}, unemployment=[10, 0, 15, 0, 20, 0, 90])
+                self.assertEqual([hint for _, hint in calls[:4]],
+                                 [(0,), (4,), (6,), (0, 1, 2)])
+                self.assertEqual(result['n_asu'], 3)
+                self.assertIn('action=continue_remaining restart=after_sweep', log)
+                checks = [line for line in log.splitlines()
+                          if '[STAGE] FINAL_POLISH round=1 ' in line and 'checking_asu=' in line]
+                self.assertEqual(len(checks), 3)
+                self.assertIn('asus_remaining=1', checks[1])
+                self.assertIn('asus_remaining=0', checks[2])
 
     def test_without_merges_normal_unemployment_order_is_preserved(self):
         calls, result, log = self.run_build({})

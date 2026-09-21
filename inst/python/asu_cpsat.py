@@ -12960,6 +12960,17 @@ def build_many_asus_cpsat(
             )
         return True
 
+    def _remaining_polish_queue(queued_units, checked_nodes):
+        """Preserve pass order across absorption and internal-ID compaction."""
+        checked_owners = {int(asu_id[v]) for v in checked_nodes if asu_id[v] > 0}
+        queued_ids, seen = [], set()
+        for unit in queued_units:
+            owners = {int(asu_id[v]) for v in unit if asu_id[v] > 0}
+            for label in sorted(owners - checked_owners - seen):
+                queued_ids.append(label)
+                seen.add(label)
+        return queued_ids
+
     polish_round = 0
 
     def _run_final_polish() -> None:
@@ -13012,7 +13023,16 @@ def build_many_asus_cpsat(
 
             polish_completed = True
             restart_after_merge = False
-            for polish_position, asu_number in enumerate(polish_ids, start=1):
+            queued_units = [np.flatnonzero(asu_id == label).tolist() for label in polish_ids]
+            checked_nodes = set()
+            polish_position = 0
+            while True:
+                remaining_ids = _remaining_polish_queue(queued_units, checked_nodes)
+                if not remaining_ids:
+                    break
+                asu_number = remaining_ids[0]
+                polish_position += 1
+                polish_count = polish_position + len(remaining_ids) - 1
                 if pending_ids is not None and polish_followup_seconds <= 0:
                     if verbose:
                         _stage_print("[STAGE] FINAL_POLISH_RECHECK_LIMIT reason=time_budget", flush=True)
@@ -13020,11 +13040,11 @@ def build_many_asus_cpsat(
                 attempt_started = time.monotonic()
                 asus_before_polish = len(np.unique(asu_id[asu_id > 0]))
                 turn_nodes = np.flatnonzero(asu_id == asu_number).tolist()
-                with _stage_checking([asu_number], len(polish_ids) - polish_position):
+                with _stage_checking([asu_number], len(remaining_ids) - 1):
                     completed = _polish_one_asu(
                         asu_number,
                         polish_position,
-                        len(polish_ids),
+                        polish_count,
                         polish_round,
                         seconds=polish_followup_seconds if pending_ids is not None else None,
                     )
@@ -13036,26 +13056,38 @@ def build_many_asus_cpsat(
                     polish_completed = False
                     break
                 touching_deferrals.note_turn([turn_nodes])
+                checked_nodes.update(turn_nodes)
+                checked_nodes.update(np.flatnonzero(asu_id == asu_number).tolist())
                 if len(np.unique(asu_id[asu_id > 0])) < asus_before_polish:
-                    # Retire stale donors, then rebuild the queue strictly from
-                    # current total unemployment.
+                    # Retire absorbed donors, but finish pending surviving ASUs
+                    # before reconsidering groups already checked this pass.
                     restart_after_merge = True
-                    break
+                    if verbose:
+                        _stage_print(f"[STAGE] FINAL_POLISH_MERGE round={polish_round} "
+                                     "action=continue_remaining restart=after_sweep "
+                                     f"asus_remaining={len(_remaining_polish_queue(queued_units, checked_nodes))}",
+                                     flush=True)
+                    continue
                 if not merge_adjacent:
                     continue
 
                 # A polish can make this ASU touch another one. Check now,
                 # before polishing ASUs whose assignments could become stale.
-                # A safe union restarts the queue using current total
-                # unemployment. Exact joint work waits for the completed sweep.
+                # Safe unions can renumber all IDs. Resolve pending membership
+                # afresh, but defer the sorted restart until this pass finishes.
+                # Exact joint work also waits for the completed sweep.
                 if _merge_committed_asus(
                     "FINAL_POLISH_MERGE",
-                    f"round={polish_round} checked={polish_position}/{len(polish_ids)} "
+                    f"round={polish_round} checked={polish_position}/{polish_count} "
                     f"after_asu={asu_number}",
                     allow_joint=False,
                 ):
                     restart_after_merge = True
-                    break
+                    if verbose:
+                        _stage_print(f"[STAGE] FINAL_POLISH_MERGE round={polish_round} "
+                                     "action=continue_remaining restart=after_sweep "
+                                     f"asus_remaining={len(_remaining_polish_queue(queued_units, checked_nodes))}",
+                                     flush=True)
 
             if not polish_completed or _stop_requested(stop_flag_path):
                 break

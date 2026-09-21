@@ -51,10 +51,13 @@ unemployment captured.
 
 ### CP-SAT parameters
 
-During polishing, ASUs with the highest total signed `q_surplus` get first
-access to the unassigned tracts. Ties favor higher total unemployment, then
-the lower ASU number. A merge restarts the round and recalculates this order
-from the updated assignments.
+Supernode polishing starts each pass with the least total unemployment first,
+breaking ties by ASU number. A merge is committed immediately, but surviving
+ASUs still waiting in that pass keep their turns. Absorbed ASUs are removed;
+groups containing an ASU already checked wait for the next pass. Once the
+remaining queue finishes, a new pass recalculates unemployment order from the
+updated assignments. Ordinary polishing with merging disabled keeps highest
+unemployment first.
 
 Partitioning's **Initial ASU seed method** defaults to connected components of
 the connectivity-free solution. The optional **Surplus pruning** method starts
@@ -171,7 +174,7 @@ infeasibility.
 | PARTITION_TOUCHING_JOINT / PARTITION_TOUCHING_JOINT_COMPLETE | Jointly reoptimizing a touching partition cluster with reachable unassigned tracts. Reports source stage, group/window size, budget/workers, movable roots, baseline unemployment, gain, deactivated slots, acceptance, and elapsed time. `CACHED` skips an unchanged attempted neighborhood, not a proof of optimality. |
 | PARTITION_BUILD_MERGE / PARTITION_COMBINE | Legacy touching-group combining; partitioning uses the joint check instead. |
 | FINAL_POLISH | With merging enabled, processes ASUs from least to most total unemployment. After a merge, the queue is rebuilt from updated unemployment totals without special merge priority. |
-| FINAL_POLISH_MERGE | Restarting polishing after a merge. |
+| FINAL_POLISH_MERGE | Committing a merge and finishing remaining queued ASUs before restarting polishing. |
 | SINGLE_ASU_TAKEOVER / TAKEOVER_DONOR_REPAIR | Runs flow-free graph cuts before the takeover flow solve, then repairs affected groups before accepting or rejecting the attempt. |
 | FINAL_RESIDUAL_CHECK | Checking remaining tract components near the end. |
 
@@ -186,7 +189,8 @@ A proven optimum can skip further primary optimization; Stop and Skip remain act
 The post-polish bridge-pair pass has been removed (both cuts and flow).
 Supernode polishing starts with connectivity cuts on the contracted graph.
 Its rounds check ASUs from least to most total unemployment, breaking ties by
-ASU ID. After a merge, the queue restarts in this same unemployment order. Ordinary polishing with merging
+ASU ID. After a merge, remaining surviving ASUs finish before the queue restarts
+in this same unemployment order. Ordinary polishing with merging
 disabled retains highest-unemployment-first order.
 `FINAL_POLISH_SUPERNODES_CUT_ROUND` reports the upper bound and its stall count.
 The first cut pass stops after 50 cut rounds or five consecutive rounds without a
@@ -196,7 +200,8 @@ Proof, cancellation, and the overall polish time limit can stop it sooner.
 Exact flow retains the cuts and best connected solution and uses the remaining
 time. If primary flow stalls with a valid incumbent that absorbs another ASU,
 that solution returns immediately for merge validation/commit and the polish
-queue restarts with the merged ASU first, then resumes lowest unemployment first. Equal statewide unemployment is sufficient; coverage cannot
+queue continues with remaining surviving ASUs before restarting in lowest
+unemployment order. Equal statewide unemployment is sufficient; coverage cannot
 decrease. `FINAL_POLISH_SUPERNODES_STALL_MERGE` reports this handoff.
 Otherwise, if the primary flow solve reaches its incumbent stall limit without a
 proof, another flow-free cut pass runs with both limits doubled: 100/10, 200/20,
@@ -328,12 +333,13 @@ Live incumbent previews do not interrupt a solve to merge ASUs. Expansion,
 main-build, and polishing solves finish under their normal stopping conditions
 before touching checks use the returned selection. Stop/Skip and
 configured time, gap, and stall limits still apply. When a completed expansion
-or polish leads to an accepted touching-joint update, its round restarts before
-the next stale solve. Legacy merging behavior is unchanged.
+leads to an accepted touching-joint update, expansion restarts before the next
+stale solve. During polishing, pending ASUs are tracked by tract membership
+across merges and renumbering; the remaining queue finishes before a restart.
 
 If a later polish releases tracts that enlarge an earlier ASU's reachable
 window, that ASU can receive a follow-up solve even without a merge. Follow-ups
-run in highest-`q_surplus` order and skip unchanged or merely smaller windows.
+use the same polish ordering and skip unchanged or merely smaller windows.
 The whole run allows at most three such follow-up rounds, sharing up to 180
 seconds (or the initial ASU count times the per-ASU polish limit, if smaller).
 These extra-work limits do not replace ordinary merge restarts. The log uses
