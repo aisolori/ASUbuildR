@@ -133,11 +133,224 @@ class SupernodePolishTest(unittest.TestCase):
 
     def solve(self, u, emp, ids, nb=None, **options):
         n = len(u)
+        workers = options.pop('workers', 2)
         nb = nb or [[j for j in (i-1, i+1) if 0 <= j < n] for i in range(n)]
         return solver._solve_supernode_polish(
             nb, np.array(u), np.array(emp), np.array([10000] * n),
-            .2, 10000, 0, 5, 2, assignments=np.array(ids), asu_number=1,
+            .2, 10000, 0, 5, workers, assignments=np.array(ids), asu_number=1,
             hint=[i for i, label in enumerate(ids) if label == 1], **options)
+
+    def test_hybrid_uses_quotient_capacity_without_magnitude_variables(self):
+        size = 30
+        nb = [[j for j in range(size) if j != i] for i in range(size)]
+        unemployment = list(range(1, size + 1))
+        assignments = [1] + [-1] * (size - 3) + [2, 2]
+        cut_models, flow_models, hybrid_inputs = [], [], []
+        real_groups = solver._asu_flow_capacity_hybrid_groups
+
+        def cuts(model, x, roots, graph, profit, fallback, valid, deadline,
+                 workers, cancellation, **kwargs):
+            cut_models.append(model.Clone())
+            self.assertFalse(any(
+                variable.name.startswith(('polish_flow_', 'polish_abs_flow_'))
+                for variable in model.Proto().variables
+            ))
+            kwargs['proof_out'].append(False)
+            kwargs['bound_out'].append(None)
+            value = sum(int(profit[group].sum()) for group in fallback)
+            return fallback, value, 'FEASIBLE'
+
+        def groups(*args, **kwargs):
+            hybrid_inputs.append((list(args[0]), list(args[1]), list(args[2])))
+            return real_groups(*args, **kwargs)
+
+        def capture(engine, model, *args, **kwargs):
+            self.assertEqual(model.Validate(), '')
+            flow_models.append((model.Clone(), list(engine.parameters.subsolvers)))
+            engine.BestObjectiveBound = lambda: float('inf')
+            return solver.cp_model.UNKNOWN
+
+        with (patch.object(solver, '_joint_connectivity_cut_pass', side_effect=cuts),
+              patch.object(solver, '_asu_flow_capacity_hybrid_groups', side_effect=groups),
+              patch.object(solver.cp_model.CpSolver, 'Solve', new=capture)):
+            self.solve(
+                unemployment,
+                [0] * size,
+                assignments,
+                nb=nb,
+                workers=6,
+                use_flow_capacity_hybrid_search=True,
+                deterministic_ties=False,
+            )
+
+        self.assertEqual(len(cut_models), 1)
+        self.assertEqual(len(flow_models), 1)
+        self.assertEqual(len(hybrid_inputs), 1)
+        model, subsolvers = flow_models[0]
+        flow_names = [
+            variable.name for variable in model.Proto().variables
+            if variable.name.startswith('polish_flow_')
+        ]
+        magnitude_names = [
+            variable.name for variable in model.Proto().variables
+            if variable.name.startswith('polish_abs_flow_')
+        ]
+        # The two donor tracts are one quotient node with aggregated economics.
+        quotient_edges, quotient_u, quotient_e = hybrid_inputs[0]
+        self.assertEqual(len(quotient_u), size - 1)
+        self.assertEqual(quotient_u[-1], unemployment[-2] + unemployment[-1])
+        self.assertEqual(quotient_e[-1], 0)
+        self.assertEqual(quotient_edges, [])
+        self.assertGreater(len(flow_names), solver._ASU_HYBRID_PREFIX_SIZE)
+        self.assertEqual(magnitude_names, [])
+        self.assertIn('asu_flow_capacity_hybrid', subsolvers)
+        self.assertGreaterEqual(len(model.Proto().search_strategy), 1)
+
+    def test_hybrid_exact_flow_preserves_small_optimum(self):
+        def cuts(model, x, roots, graph, profit, fallback, valid, deadline,
+                 workers, cancellation, **kwargs):
+            kwargs['proof_out'].append(False)
+            kwargs['bound_out'].append(None)
+            value = sum(int(profit[group].sum()) for group in fallback)
+            return fallback, value, 'FEASIBLE'
+
+        with patch.object(solver, '_joint_connectivity_cut_pass', side_effect=cuts):
+            result = self.solve(
+                [10, 5, 10, 10, 20],
+                [0, 80, 0, 0, 120],
+                [1, -1, 2, 2, -1],
+                workers=6,
+                use_flow_capacity_hybrid_search=True,
+                deterministic_ties=False,
+            )
+
+        self.assertEqual(result.status, 'OPTIMAL')
+        self.assertEqual(result.sel_idx_local, list(range(5)))
+        self.assertEqual(result.obj, 35)
+
+    def test_hybrid_is_not_installed_below_six_workers(self):
+        flow_models = []
+
+        def cuts(model, x, roots, graph, profit, fallback, valid, deadline,
+                 workers, cancellation, **kwargs):
+            kwargs['proof_out'].append(False)
+            kwargs['bound_out'].append(None)
+            value = sum(int(profit[group].sum()) for group in fallback)
+            return fallback, value, 'FEASIBLE'
+
+        def capture(engine, model, *args, **kwargs):
+            flow_models.append((model.Clone(), list(engine.parameters.subsolvers)))
+            engine.BestObjectiveBound = lambda: float('inf')
+            return solver.cp_model.UNKNOWN
+
+        with (patch.object(solver, '_joint_connectivity_cut_pass', side_effect=cuts),
+              patch.object(solver, '_asu_flow_capacity_hybrid_groups') as groups,
+              patch.object(solver.cp_model.CpSolver, 'Solve', new=capture)):
+            self.solve(
+                [10, 5, 20], [0, 0, 0], [1, -1, 2],
+                workers=5,
+                use_flow_capacity_hybrid_search=True,
+                deterministic_ties=False,
+            )
+
+        groups.assert_not_called()
+        self.assertEqual(len(flow_models), 1)
+        model, subsolvers = flow_models[0]
+        self.assertFalse(any(
+            variable.name.startswith('polish_abs_flow_')
+            for variable in model.Proto().variables
+        ))
+        self.assertNotIn('asu_flow_capacity_hybrid', subsolvers)
+
+    def test_path_tightenings_hold_for_every_connected_feasible_subset(self):
+        nb = [[1, 3], [0, 2], [1], [0]]
+        profit = [5, 0, 10, 10]
+        q = [10, -10, 30, -100]
+        positive_supply, surplus_distance = solver._surplus_path_tightening_data(
+            nb, q, 0
+        )
+        denominator, upper, reduced_distance, _ = (
+            solver._reduced_cost_path_tightening_data(nb, profit, q, 0)
+        )
+        self.assertEqual(positive_supply, 40)
+        self.assertGreater(reduced_distance[2], 0)
+        checked = 0
+        for bits in itertools.product((False, True), repeat=len(nb)):
+            selected = {i for i, value in enumerate(bits) if value}
+            if 0 not in selected or sum(q[i] for i in selected) < 0:
+                continue
+            reached = {0}
+            stack = [0]
+            while stack:
+                node = stack.pop()
+                for neighbor in nb[node]:
+                    if neighbor in selected and neighbor not in reached:
+                        reached.add(neighbor)
+                        stack.append(neighbor)
+            if reached != selected:
+                continue
+            selected_positive = sum(max(0, q[i]) for i in selected)
+            objective = sum(profit[i] for i in selected)
+            for node in selected:
+                self.assertLessEqual(surplus_distance[node], selected_positive)
+                self.assertLessEqual(
+                    denominator * objective + reduced_distance[node], upper
+                )
+                checked += 1
+        self.assertGreater(checked, 0)
+
+    def test_surplus_path_rows_share_one_sparse_aggregate(self):
+        models = []
+        real_solve = solver.cp_model.CpSolver.Solve
+
+        def capture(engine, model, *args, **kwargs):
+            models.append(model.Clone())
+            engine.parameters.log_to_stdout = False
+            return real_solve(engine, model, *args, **kwargs)
+
+        with patch.object(solver.cp_model.CpSolver, 'Solve', new=capture):
+            result = self.solve(
+                [10, 5, 10, 5], [0, 30, 10, 20], [1, -1, -1, -1],
+                nb=[[1], [0, 2], [1, 3], [2]],
+                deterministic_ties=False,
+            )
+        self.assertEqual(result.status, 'OPTIMAL')
+        self.assertTrue(models)
+        proto = models[0].Proto()
+        aggregate = next(
+            i for i, variable in enumerate(proto.variables)
+            if variable.name == 'polish_positive_q_selected'
+        )
+        containing = [
+            constraint.linear for constraint in proto.constraints
+            if aggregate in constraint.linear.vars
+        ]
+        self.assertGreater(len(containing), 1)
+        self.assertEqual(sum(len(row.vars) > 2 for row in containing), 1)
+        self.assertEqual(sum(len(row.vars) == 2 for row in containing), len(containing) - 1)
+
+    def test_unaffordable_corridor_is_removed_before_cut_proof(self):
+        output = io.StringIO()
+        real_solve = solver.cp_model.CpSolver.Solve
+
+        def quiet(engine, model, *args, **kwargs):
+            engine.parameters.log_to_stdout = False
+            return real_solve(engine, model, *args, **kwargs)
+
+        with (patch.object(solver.cp_model.CpSolver, 'Solve', new=quiet),
+              contextlib.redirect_stdout(output)):
+            result = self.solve(
+                [10, 0, 20], [0, 50, 100], [1, -1, -1],
+                nb=[[1], [0, 2], [1]], log=True,
+                deterministic_ties=False,
+            )
+        self.assertEqual((result.sel_idx_local, result.obj), ([0], 10))
+        first_stage = next(
+            line for line in output.getvalue().splitlines()
+            if '[STAGE] FINAL_POLISH_SUPERNODES ' in line
+        )
+        self.assertIn('fixed_zero=2', first_stage)
+        self.assertIn('max_selected=1', first_stage)
 
     def test_donor_connects_and_finances_new_tracts_without_counting_its_objective(self):
         # q=4u-e: the target cannot pay the bridge deficit of 60 alone.

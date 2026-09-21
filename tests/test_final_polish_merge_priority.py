@@ -1,4 +1,4 @@
-"""A committed merge gets the next polish turn, then normal ordering resumes."""
+"""Committed merges re-enter strict lowest-unemployment polish ordering."""
 import contextlib
 import io
 from pathlib import Path
@@ -70,40 +70,40 @@ class FinalPolishMergePriorityTest(unittest.TestCase):
             ))
         return calls, result, output.getvalue()
 
-    def test_absorbed_donor_resolves_first_then_returns_to_lowest_unemployment(self):
+    def test_absorbed_donor_waits_behind_lower_unemployment_asus(self):
         for status in ("STALLED_FEASIBLE", "FEASIBLE", "OPTIMAL"):
             with self.subTest(status=status):
                 calls, result, log = self.run_build({(0,): (0, 1, 2)}, status=status)
-                # Merged U=70 exceeds both remaining ASUs (20, 30). It gets
-                # exactly one immediate turn, then those two run in U order.
-                self.assertEqual(calls, [(1, (0,)), (1, (0, 1, 2)),
-                                         (3, (4,)), (4, (6,))])
+                # Merged U=70 waits behind the remaining ASUs at U=20 and U=30.
+                self.assertEqual(calls, [(1, (0,)), (3, (4,)), (4, (6,)),
+                                         (1, (0, 1, 2))])
                 self.assertEqual(result["n_asu"], 3)
-                self.assertIn("merged_first=1", log)
+                self.assertIn("merged_first=none", log)
 
-    def test_chained_merges_each_resolve_before_returning_to_normal_order(self):
+    def test_chained_merges_recalculate_unemployment_order_each_time(self):
         calls, result, _ = self.run_build({
             (0,): (0, 1, 2),
             (0, 1, 2): (0, 1, 2, 3, 4),
         })
-        self.assertEqual(calls, [(1, (0,)), (1, (0, 1, 2)),
-                                 (1, (0, 1, 2, 3, 4)), (4, (6,))])
+        self.assertEqual(calls, [(1, (0,)), (3, (4,)), (4, (6,)),
+                                 (1, (0, 1, 2)), (4, (6,)),
+                                 (1, (0, 1, 2, 3, 4))])
         self.assertEqual(result["n_asu"], 2)
 
-    def test_touching_union_uses_surviving_id_before_smaller_asus(self):
-        # ASU 4 takes connector 5, then the post-solve safe union joins it to
-        # ASU 3. Its new ID is 3, so prioritizing the former ID 4 would fail.
+    def test_touching_union_waits_behind_smaller_asus(self):
+        # ASU 4 takes connector 5 and joins ASU 3. The resulting U=70 ASU
+        # waits behind the ASUs at U=20 and U=30 after the queue restarts.
         calls, result, log = self.run_build({(6,): (5, 6)}, reverse=True)
-        self.assertEqual(calls, [(4, (6,)), (3, (4, 5, 6)),
-                                 (1, (0,)), (2, (2,))])
+        self.assertEqual(calls, [(4, (6,)), (1, (0,)), (2, (2,)),
+                                 (3, (4, 5, 6))])
         self.assertEqual(result["n_asu"], 3)
-        self.assertIn("merged_first=3", log)
+        self.assertIn("merged_first=none", log)
 
     def test_without_merges_normal_unemployment_order_is_preserved(self):
         calls, result, log = self.run_build({})
         self.assertEqual(calls, [(1, (0,)), (3, (4,)), (4, (6,)), (2, (2,))])
         self.assertEqual(result["n_asu"], 4)
-        self.assertNotIn("merged_first=1", log)
+        self.assertIn("merged_first=none", log)
 
 
 if __name__ == "__main__":

@@ -2617,6 +2617,85 @@ def _lagrangian_rate_price(u, q, forced=()):
     return last
 
 
+def _node_weighted_root_distances(nb, root, node_cost, excluded=()):
+    '''Minimum nonnegative node cost of a root-to-node path.'''
+    n = len(nb)
+    root = int(root)
+    blocked = set(map(int, excluded))
+    if not (0 <= root < n) or root in blocked:
+        return [None] * n
+    costs = list(map(int, node_cost))
+    if len(costs) != n or any(value < 0 for value in costs):
+        raise ValueError('node-weighted distances require nonnegative costs')
+    distances = [None] * n
+    distances[root] = costs[root]
+    queue = [(costs[root], root)]
+    while queue:
+        distance, node = heapq.heappop(queue)
+        if distances[node] != distance:
+            continue
+        for neighbor in nb[node]:
+            if neighbor in blocked:
+                continue
+            candidate = distance + costs[neighbor]
+            if distances[neighbor] is None or candidate < distances[neighbor]:
+                distances[neighbor] = candidate
+                heapq.heappush(queue, (candidate, int(neighbor)))
+    return distances
+
+
+def _surplus_path_tightening_data(nb, q, root, excluded=()):
+    '''Return optimistic positive supply and mandatory path deficits.
+
+    Every connected feasible selection containing root and v satisfies
+    path_deficit[v] * x[v] <= sum(max(q[i], 0) * x[i]). Positive surplus is
+    deliberately credited regardless of location; requiring prefix feasibility
+    along a path would be invalid.
+    '''
+    blocked = set(map(int, excluded))
+    q_values = list(map(int, q))
+    positive_supply = sum(
+        max(0, value) for i, value in enumerate(q_values) if i not in blocked
+    )
+    distances = _node_weighted_root_distances(
+        nb, root, [max(0, -value) for value in q_values], blocked
+    )
+    return int(positive_supply), distances
+
+
+def _reduced_cost_path_tightening_data(nb, profit, q, root, excluded=()):
+    '''Exact-integer Lagrangian path bound for connected selections.
+
+    For multiplier a/b, reduced[i] = b*profit[i] + a*q[i]. Requiring v
+    incurs the cheapest negative reduced cost on any root-to-v path, yielding
+    b*objective + distance[v]*x[v] <= upper.
+    '''
+    n = len(nb)
+    root = int(root)
+    blocked = set(map(int, excluded))
+    active = [i for i in range(n) if i not in blocked]
+    if root not in active:
+        return 1, -1, [None] * n, Fraction(0)
+    active_index = {node: i for i, node in enumerate(active)}
+    price = _lagrangian_rate_price(
+        [int(profit[i]) for i in active],
+        [int(q[i]) for i in active],
+        {active_index[root]},
+    )
+    numerator, denominator = int(price.numerator), int(price.denominator)
+    reduced = [
+        denominator * int(profit[i]) + numerator * int(q[i])
+        for i in range(n)
+    ]
+    upper = reduced[root] + sum(
+        max(0, reduced[i]) for i in active if i != root
+    )
+    costs = [max(0, -value) for value in reduced]
+    costs[root] = 0
+    distances = _node_weighted_root_distances(nb, root, costs, blocked)
+    return denominator, int(upper), distances, price
+
+
 @lru_cache(maxsize=128)
 def _rate_count_objective_bounds_cached(u_tuple, q_tuple, limit):
     """Rate-and-cardinality objective bounds, globally and with each node forced."""
@@ -7124,7 +7203,9 @@ def _solve_supernode_polish(nb_local, u_g, E_g, P_g, tau, pop_thresh,
                            log=False, stop_flag_path=None, skip_flag_path=None,
                            incumbent_stall_seconds=None,
                            incumbent_report_callback=None,
-                           configure_subsolvers=True, deterministic_ties=True,
+                           configure_subsolvers=True,
+                           use_flow_capacity_hybrid_search=False,
+                           deterministic_ties=True,
                            tie_break_rank=None, use_surplus_path_repair=True,
                            **unused_options):
     """Polish with optional whole donor ASUs; obj excludes already captured donors.
@@ -7132,12 +7213,16 @@ def _solve_supernode_polish(nb_local, u_g, E_g, P_g, tau, pop_thresh,
     Returns original local tract indices, never quotient-node indices. Donors
     must be complete connected valid ASUs within the supplied window. Selection
     of a donor contracts its whole connected subgraph and later absorbs it.
-    Quotient-graph cuts start at 50 rounds / 5 stalled upper-bound rounds.
+    Quotient-graph cuts start at 10 rounds / 5 stalled upper-bound rounds.
+    Before separation, surplus, reduced-cost path, conditional objective,
+    separator, distance/count, and bridge-block bounds prune unreachable nodes.
     Adaptive surplus-priced path repair supplies feasible hints during cuts,
     with cooperative limits of .25s per round and min(2s, 5% budget) overall.
     A primary flow incumbent stall retries cuts with both limits doubled.
     Proof, cancellation, or the shared deadline can stop sooner.
     Exact flow retains the cuts, incumbent, and bound, using the remaining time.
+    When requested, its hybrid worker branches on quotient-node capacity and
+    root distance; flow-free cut rounds stay flow-free.
     """
     started = time.monotonic()
     baseline = sum(int(u_g[i]) for i in hint)
@@ -7188,13 +7273,241 @@ def _solve_supernode_polish(nb_local, u_g, E_g, P_g, tau, pop_thresh,
     objective = model.NewIntVar(baseline, int(upper), 'polish_new_capture_objective')
     model.Add(objective == sum(profit[i] * x[i] for i in range(n)))
     model.Maximize(objective)
+
+    # Necessary local support strengthens the flow-free cut pass too.
+    for node in range(n):
+        if node == root:
+            continue
+        if quotient[node]:
+            model.Add(x[node] <= sum(x[w] for w in quotient[node]))
+        else:
+            model.Add(x[node] == 0)
+
+    # Incumbent-aware analytical fixing on the active quotient graph. Repeating
+    # lets removal of unreachable positive nodes reduce the optimistic supply
+    # available to finance other isolated branches.
+    fixed_zero = {node for node in range(n) if node != root and not quotient[node]}
+    pruning_rounds = 0
+    bridge_fixed = surplus_fixed = reduced_fixed = conditional_fixed = 0
+    while pruning_rounds < 8:
+        pruning_rounds += 1
+        reachable = set()
+        stack = [] if root in fixed_zero else [root]
+        reachable.update(stack)
+        while stack:
+            node = stack.pop()
+            for neighbor in quotient[node]:
+                if neighbor not in fixed_zero and neighbor not in reachable:
+                    reachable.add(neighbor)
+                    stack.append(neighbor)
+        new_fixed = set(range(n)) - reachable - fixed_zero
+        active = sorted(reachable)
+        if not active:
+            break
+        active_index = {node: i for i, node in enumerate(active)}
+        active_nb = [
+            sorted(active_index[w] for w in quotient[node] if w in active_index)
+            for node in active
+        ]
+        active_profit = np.asarray([profit[node] for node in active], dtype=np.int64)
+        active_q = np.asarray([q[node] for node in active], dtype=np.int64)
+        active_root = active_index[root]
+
+        conditional = _lagrangian_conditional_bounds(
+            active_profit, active_q, {active_root}
+        )
+        for node, bound in zip(active, conditional):
+            if node != root and bound < baseline:
+                if node not in new_fixed:
+                    conditional_fixed += 1
+                new_fixed.add(node)
+
+        positive_supply, path_deficit = _surplus_path_tightening_data(
+            quotient, q, root, fixed_zero
+        )
+        for node in active:
+            distance = path_deficit[node]
+            if node != root and (distance is None or distance > positive_supply):
+                if node not in new_fixed:
+                    surplus_fixed += 1
+                new_fixed.add(node)
+
+        reduced_den, reduced_upper, reduced_distance, _ = (
+            _reduced_cost_path_tightening_data(
+                quotient, profit, q, root, fixed_zero
+            )
+        )
+        for node in active:
+            distance = reduced_distance[node]
+            if (node != root and distance is not None
+                    and reduced_upper - distance < reduced_den * baseline):
+                if node not in new_fixed:
+                    reduced_fixed += 1
+                new_fixed.add(node)
+
+        budget = _capacity_budget(active_q, {active_root}, len(active))
+        if budget >= 0:
+            gateways = _bridge_subtree_zero_fix(
+                active_nb, active_root, active_q, {active_root}, budget
+            )
+            for compact_node in gateways:
+                node = active[compact_node]
+                if node not in new_fixed:
+                    bridge_fixed += 1
+                new_fixed.add(node)
+
+        # The incumbent is a direct certificate that its nodes remain usable.
+        new_fixed.difference_update(selected_hint)
+        new_fixed.discard(root)
+        new_fixed.difference_update(fixed_zero)
+        if not new_fixed:
+            break
+        for node in sorted(new_fixed):
+            model.Add(x[node] == 0)
+        fixed_zero.update(new_fixed)
+
+    # Final active view after all cascading exclusions.
+    reachable = {root}
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        for neighbor in quotient[node]:
+            if neighbor not in fixed_zero and neighbor not in reachable:
+                reachable.add(neighbor)
+                stack.append(neighbor)
+    disconnected = set(range(n)) - reachable - fixed_zero
+    for node in sorted(disconnected):
+        model.Add(x[node] == 0)
+    fixed_zero.update(disconnected)
+    active = sorted(set(range(n)) - fixed_zero)
+    active_index = {node: i for i, node in enumerate(active)}
+    active_nb = [
+        sorted(active_index[w] for w in quotient[node] if w in active_index)
+        for node in active
+    ]
+    active_profit = np.asarray([profit[node] for node in active], dtype=np.int64)
+    active_q = np.asarray([q[node] for node in active], dtype=np.int64)
+    active_root = active_index[root]
+
+    active_upper = _lagrangian_objective_bound(
+        active_profit, active_q, {active_root}
+    )
+    if active_upper < baseline:
+        return fallback
+    if active_upper < upper:
+        upper = int(active_upper)
+        model.Add(objective <= upper)
+
+    conditional_active = _lagrangian_conditional_bounds(
+        active_profit, active_q, {active_root}
+    )
+    conditional_rows = 0
+    for node, bound in zip(active, conditional_active):
+        if node != root and bound < upper:
+            model.Add(objective <= int(bound)).OnlyEnforceIf(x[node])
+            conditional_rows += 1
+
+    # Connect node reachability to positive q actually selected, not merely to
+    # all optimistic q in the window.
+    _, path_deficit = _surplus_path_tightening_data(
+        quotient, q, root, fixed_zero
+    )
+    positive_q_nodes = [node for node in active if q[node] > 0]
+    total_positive_q = sum(int(q[node]) for node in positive_q_nodes)
+    positive_q_selected = model.NewIntVar(
+        0, total_positive_q, 'polish_positive_q_selected'
+    )
+    model.Add(
+        positive_q_selected ==
+        sum(int(q[node]) * x[node] for node in positive_q_nodes)
+    )
+    surplus_path_rows = 0
+    for node in active:
+        distance = path_deficit[node]
+        if distance:
+            model.Add(int(distance) * x[node] <= positive_q_selected)
+            surplus_path_rows += 1
+
+    # Negative Lagrangian reduced costs on every possible connecting path lower
+    # the objective cap conditionally on selecting the target node.
+    reduced_den, reduced_upper, reduced_distance, reduced_price = (
+        _reduced_cost_path_tightening_data(
+            quotient, profit, q, root, fixed_zero
+        )
+    )
+    reduced_coefficients_safe = (
+        abs(int(reduced_den)) * max(abs(baseline), abs(upper)) < 2**62
+        and abs(int(reduced_upper)) < 2**62
+    )
+    if reduced_coefficients_safe:
+        model.Add(int(reduced_den) * objective <= int(reduced_upper))
+    reduced_path_rows = 0
+    for node in active:
+        distance = reduced_distance[node]
+        if (reduced_coefficients_safe and distance and
+                abs(int(reduced_den)) * max(abs(baseline), abs(upper))
+                + abs(int(distance)) < 2**62 and
+                abs(int(reduced_upper)) < 2**62):
+            model.Add(
+                int(reduced_den) * objective + int(distance) * x[node]
+                <= int(reduced_upper)
+            )
+            reduced_path_rows += 1
+
+    # Rate-only cardinality and graph distance are cheap projections of the
+    # eventual flow formulation and tighten every flow-free separation round.
+    max_selected, negative_idx, max_negative = _surplus_knapsack_bounds(
+        active_q, {active_root}, len(active)
+    )
+    if max_selected is None:
+        return fallback
+    max_selected = max(len(selected_hint), min(len(active), int(max_selected)))
+    selected_count = model.NewIntVar(1, max_selected, 'polish_selected_count')
+    model.Add(selected_count == sum(x))
+    if max_negative < len(negative_idx):
+        model.Add(sum(x[active[i]] for i in negative_idx) <= max_negative)
+    active_distances = _root_graph_distances(active_nb, active_root)
+    distance_rows = 0
+    for compact_node, distance in enumerate(active_distances):
+        node = active[compact_node]
+        if node != root:
+            model.Add(selected_count >= (int(distance) + 1) * x[node])
+            distance_rows += 1
+
+    # Reuse the regular solver's bounded root separators and surplus-aware
+    # component cardinality cuts on the donor quotient graph.
+    separator_implications, separator_bounds = _small_root_separator_implications(
+        quotient, root, np.asarray(profit, dtype=np.int64),
+        np.asarray(q, dtype=np.int64), max_size=3, clause_limit=200,
+        target_limit=128,
+    )
+    for node, separator in separator_implications:
+        model.AddBoolOr([x[node].Not()] + [x[cut] for cut in separator])
+    for index, (separator, affected, k_bound) in enumerate(separator_bounds):
+        activation = model.NewBoolVar(f'polish_separator_{index}')
+        model.Add(activation <= sum(x[cut] for cut in separator))
+        model.Add(sum(x[node] for node in affected) <= int(k_bound) * activation)
+
+    closure_edges = _profitable_closure_edges(quotient, profit, q)
+    for neighbor, profitable in closure_edges:
+        model.Add(x[neighbor] <= x[profitable])
     model.AddHint(objective, baseline)
     for i in range(n):
         model.AddHint(x[i], int(i in selected_hint))
     if log:
         _stage_print(f'[STAGE] FINAL_POLISH_SUPERNODES asu={asu_number} '
                      f'tracts={len(assignments)} model_nodes={n} donors={len(donors)} '
-                     f'baseline_unemp={baseline} upper_bound={upper}', flush=True)
+                     f'baseline_unemp={baseline} upper_bound={upper} '
+                     f'fixed_zero={len(fixed_zero)} bridge_fixed={bridge_fixed} '
+                     f'surplus_fixed={surplus_fixed} reduced_fixed={reduced_fixed} '
+                     f'conditional_fixed={conditional_fixed} max_selected={max_selected} '
+                     f'positive_q_terms={len(positive_q_nodes)} '
+                     f'surplus_path_rows={surplus_path_rows} '
+                     f'reduced_path_rows={reduced_path_rows} '
+                     f'conditional_rows={conditional_rows} distance_rows={distance_rows} '
+                     f'separator_rows={len(separator_implications) + len(separator_bounds)} '
+                     f'closure_rows={len(closure_edges)} lagrangian_price={reduced_price}',
+                     flush=True)
 
     def expand(groups):
         return sorted(v for i in groups[0] for v in members[i])
@@ -7233,7 +7546,7 @@ def _solve_supernode_polish(nb_local, u_g, E_g, P_g, tau, pop_thresh,
     cut_model = model
     root_rows = [[model.NewConstant(int(i == root)) for i in range(n)]]
     seen_cuts = set()
-    cycle, cut_round_limit, cut_stall_limit = 1, 50, 5
+    cycle, cut_round_limit, cut_stall_limit = 1, 25, 5
     flow_stall_limit = incumbent_stall_seconds
     while True:
         reason = interruption()
@@ -7288,10 +7601,55 @@ def _solve_supernode_polish(nb_local, u_g, E_g, P_g, tau, pop_thresh,
         # and remains flow-free for the next separation cycle. Variables retain
         # their indices in a clone, so x/objective/root_rows address both models.
         model = cut_model.Clone()
-        count = sum(x)
+        count = selected_count
         # Connectivity sends one unit per quotient node, preserving paths
         # through whole donors.
-        flow_limit = max(0, n - 1)
+        flow_limit = max(0, max_selected - 1)
+        compact_bridge_bounds = _bridge_edge_bounds(active_nb, active_root)
+        bridge_bounds = {
+            (active[near], active[far]): min(int(bound), flow_limit)
+            for (near, far), bound in compact_bridge_bounds.items()
+        }
+        root_distances = [n] * n
+        for compact_node, distance in enumerate(active_distances):
+            root_distances[active[compact_node]] = int(distance)
+
+        hybrid_enabled = (
+            configure_subsolvers
+            and bool(use_flow_capacity_hybrid_search)
+            and max(1, int(workers)) >= 6
+            and flow_limit > 0
+        )
+        hybrid_select_nodes = []
+        hybrid_reject_nodes = []
+        hybrid_far_tracts = []
+        if hybrid_enabled:
+            active_economic_u = np.asarray(
+                [economic_u[node] for node in active], dtype=np.int64
+            )
+            active_economic_e = np.asarray(
+                [economic_e[node] for node in active], dtype=np.int64
+            )
+            _, select_prefix, reject_prefix, far_order = (
+                _asu_flow_capacity_hybrid_groups(
+                    (),
+                    active_economic_u,
+                    active_economic_e,
+                    num,
+                    den,
+                    active_distances,
+                    max_prefix=_ASU_HYBRID_PREFIX_SIZE,
+                )
+            )
+            hybrid_select_nodes = [active[index] for index in select_prefix]
+            hybrid_reject_nodes = [active[index] for index in reject_prefix]
+            hybrid_far_tracts = [
+                active[index] for kind, index in far_order if kind == 'tract'
+            ]
+
+        def direction_cap(node):
+            return max(0, flow_limit - root_distances[node])
+
         hints = _spanning_tree_flows(sorted(selected_hint), quotient, root)
         net = [[] for _ in range(n)]
         for i in range(n):
@@ -7303,15 +7661,43 @@ def _solve_supernode_polish(nb_local, u_g, E_g, P_g, tau, pop_thresh,
             for j in quotient[i]:
                 if i >= j:
                     continue
-                flow = model.NewIntVar(-flow_limit, flow_limit, f'polish_flow_{i}_{j}')
+                forward_bridge = bridge_bounds.get((i, j))
+                reverse_bridge = bridge_bounds.get((j, i))
+                if forward_bridge is not None:
+                    lower, upper_flow = 0, min(forward_bridge, direction_cap(i))
+                elif reverse_bridge is not None:
+                    lower, upper_flow = -min(reverse_bridge, direction_cap(j)), 0
+                else:
+                    lower = -min(flow_limit, direction_cap(j))
+                    upper_flow = min(flow_limit, direction_cap(i))
+                flow = model.NewIntVar(lower, upper_flow, f'polish_flow_{i}_{j}')
                 for endpoint in (i, j):
-                    model.Add(flow <= flow_limit * x[endpoint])
-                    model.Add(flow >= -flow_limit * x[endpoint])
+                    model.Add(flow <= upper_flow * x[endpoint])
+                    model.Add(flow >= lower * x[endpoint])
                 net[i].append(flow)
                 net[j].append(-flow)
                 model.AddHint(flow, hints.get((i, j), 0) - hints.get((j, i), 0))
             demand = count - 1 if i == root else -x[i]
             model.Add(sum(net[i]) == demand)
+        if hybrid_enabled:
+            if hybrid_select_nodes:
+                model.AddDecisionStrategy(
+                    [x[node] for node in hybrid_select_nodes],
+                    cp_model.CHOOSE_FIRST,
+                    cp_model.SELECT_MAX_VALUE,
+                )
+            if hybrid_reject_nodes:
+                model.AddDecisionStrategy(
+                    [x[node] for node in hybrid_reject_nodes],
+                    cp_model.CHOOSE_FIRST,
+                    cp_model.SELECT_MIN_VALUE,
+                )
+            if hybrid_far_tracts:
+                model.AddDecisionStrategy(
+                    [x[node] for node in hybrid_far_tracts],
+                    cp_model.CHOOSE_FIRST,
+                    cp_model.SELECT_MIN_VALUE,
+                )
         remaining = float(time_limit) - (time.monotonic() - started)
         reason = interruption()
         if reason or remaining <= 0:
@@ -7321,6 +7707,10 @@ def _solve_supernode_polish(nb_local, u_g, E_g, P_g, tau, pop_thresh,
             _stage_print(f'[STAGE] FINAL_POLISH_SUPERNODES_FLOW asu={asu_number} '
                   f'tracts={len(assignments)} model_nodes={n} donors={len(donors)} '
                   f'cycle={cycle} baseline_unemp={best_obj} upper_bound={upper} '
+                  f'flow_limit={flow_limit} bridge_bounds={len(bridge_bounds)} '
+                  f'hybrid={hybrid_enabled} hybrid_abs_flows=0 '
+                  f'hybrid_capacity={len(hybrid_select_nodes) + len(hybrid_reject_nodes)} '
+                  f'hybrid_distance_tail={len(hybrid_far_tracts)} '
                   f'incumbent_stall_seconds={flow_stall_limit}', flush=True)
         engine = cp_model.CpSolver()
         engine.parameters.max_time_in_seconds = remaining
@@ -7329,7 +7719,11 @@ def _solve_supernode_polish(nb_local, u_g, E_g, P_g, tau, pop_thresh,
         if rel_gap is not None:
             engine.parameters.relative_gap_limit = float(rel_gap)
         if configure_subsolvers:
-            _configure_asu_solver_portfolio(engine.parameters, workers)
+            _configure_asu_solver_portfolio(
+                engine.parameters,
+                workers,
+                use_flow_capacity_hybrid_search=hybrid_enabled,
+            )
         last_gain = [time.monotonic()]
         done, stopped = threading.Event(), []
 
@@ -7471,6 +7865,12 @@ def _solve_supernode_polish(nb_local, u_g, E_g, P_g, tau, pop_thresh,
             engine = cp_model.CpSolver()
             engine.parameters.max_time_in_seconds = remaining
             engine.parameters.num_search_workers = max(1, int(workers))
+            if configure_subsolvers:
+                _configure_asu_solver_portfolio(
+                    engine.parameters,
+                    workers,
+                    use_flow_capacity_hybrid_search=hybrid_enabled,
+                )
             last_gain[0] = time.monotonic()
             done.clear()
             watcher = threading.Thread(target=watch, daemon=True)
@@ -10461,9 +10861,8 @@ def build_many_asus_cpsat(
     creates touching ASUs, jointly reoptimize each transitive touching group
     using the polish time limit. Accepted updates restart polishing. Each update
     increases total unemployment or reduces group count without losing coverage.
-    A merge following an individual polish gives the newly merged ASU the next
-    turn, then the queue resumes lowest total unemployment first. A further
-    merge repeats this priority for the enlarged ASU.
+    A merge restarts the polish queue from lowest total unemployment using the
+    updated memberships; an enlarged ASU receives no special queue priority.
     Late exchanges, takeovers, and residual additions trigger this check too.
     The polish uses
     `final_asu_polish_time_limit` seconds per ASU, or the standalone expansion time
@@ -12572,9 +12971,6 @@ def build_many_asus_cpsat(
         polish_priority = 'unemployment_ascending' if merge_adjacent else 'unemployment_descending'
         polish_order_description = 'lowest' if merge_adjacent else 'highest'
         pending_ids = None
-        # Track tracts rather than IDs: touching unions can renumber every ASU.
-        # Each merged group gets one immediate turn before normal ordering resumes.
-        merged_first_nodes: Set[int] = set()
         seen_states = set()
         start_polish_sweep = True
         while True:
@@ -12594,11 +12990,6 @@ def build_many_asus_cpsat(
                 asu_id, u, E, tau, least_unemployment_first=merge_adjacent)
             if pending_ids is not None:
                 polish_ids = [k for k in polish_ids if k in pending_ids]
-            merged_first_ids = {int(asu_id[node]) for node in merged_first_nodes
-                                if asu_id[node] > 0}
-            priority_ids = [label for label in polish_ids if label in merged_first_ids]
-            polish_ids = priority_ids + [label for label in polish_ids
-                                         if label not in merged_first_ids]
             total_polish_unemp = int(u[np.where(asu_id > 0)[0]].sum())
             if verbose and polish_ids:
                 _stage_print(
@@ -12606,15 +12997,13 @@ def build_many_asus_cpsat(
                     f"asus={len(polish_ids)} total_unemp={total_polish_unemp} "
                     f"checking_asus=none asus_remaining={len(polish_ids)} "
                     f"mode={'followup' if pending_ids is not None else 'normal'} "
-                    f"priority={polish_priority} "
-                    f"merged_first={','.join(map(str, priority_ids)) or 'none'}",
+                    f"priority={polish_priority} merged_first=none",
                     flush=True,
                 )
                 print(
                     f"\n[FINAL POLISH] round {polish_round}: "
                     f"{len(polish_ids)} ASU(s), "
-                    + (f"newly merged ASU(s) {priority_ids} first, then " if priority_ids else "")
-                    + f"{polish_order_description} total unemployment first, "
+                    f"{polish_order_description} total unemployment first, "
                     "each seeing all currently "
                     f"unassigned tracts (up to {polish_time_limit:.1f}s each); "
                     f"total unemployment currently captured={total_polish_unemp}",
@@ -12646,12 +13035,10 @@ def build_many_asus_cpsat(
                 if not completed:
                     polish_completed = False
                     break
-                merged_first_nodes.difference_update(turn_nodes)
                 touching_deferrals.note_turn([turn_nodes])
                 if len(np.unique(asu_id[asu_id > 0])) < asus_before_polish:
-                    # Retire stale donors and resolve the enlarged ASU before
-                    # resuming the usual unemployment order.
-                    merged_first_nodes.update(np.flatnonzero(asu_id == asu_number).tolist())
+                    # Retire stale donors, then rebuild the queue strictly from
+                    # current total unemployment.
                     restart_after_merge = True
                     break
                 if not merge_adjacent:
@@ -12659,20 +13046,14 @@ def build_many_asus_cpsat(
 
                 # A polish can make this ASU touch another one. Check now,
                 # before polishing ASUs whose assignments could become stale.
-                # A safe union gives the merged groups the next turns using
-                # their new IDs. Exact joint work waits for the completed sweep.
-                before_touching_merge = asu_id.copy()
+                # A safe union restarts the queue using current total
+                # unemployment. Exact joint work waits for the completed sweep.
                 if _merge_committed_asus(
                     "FINAL_POLISH_MERGE",
                     f"round={polish_round} checked={polish_position}/{len(polish_ids)} "
                     f"after_asu={asu_number}",
                     allow_joint=False,
                 ):
-                    for label in np.unique(asu_id[asu_id > 0]):
-                        members = np.flatnonzero(asu_id == label)
-                        previous_ids = before_touching_merge[members]
-                        if len(np.unique(previous_ids[previous_ids > 0])) > 1:
-                            merged_first_nodes.update(members.tolist())
                     restart_after_merge = True
                     break
 

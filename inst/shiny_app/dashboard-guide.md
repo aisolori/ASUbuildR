@@ -170,7 +170,7 @@ infeasibility.
 | PARTITION_EXPANSION_COMPLETE | Summarizing that round. Rejected seeds did not produce valid ASUs; the whole run can continue. |
 | PARTITION_TOUCHING_JOINT / PARTITION_TOUCHING_JOINT_COMPLETE | Jointly reoptimizing a touching partition cluster with reachable unassigned tracts. Reports source stage, group/window size, budget/workers, movable roots, baseline unemployment, gain, deactivated slots, acceptance, and elapsed time. `CACHED` skips an unchanged attempted neighborhood, not a proof of optimality. |
 | PARTITION_BUILD_MERGE / PARTITION_COMBINE | Legacy touching-group combining; partitioning uses the joint check instead. |
-| FINAL_POLISH | With merging enabled, processes ASUs from least to most total unemployment. After a merge, the newly merged ASU gets the next solve, then normal ordering resumes. |
+| FINAL_POLISH | With merging enabled, processes ASUs from least to most total unemployment. After a merge, the queue is rebuilt from updated unemployment totals without special merge priority. |
 | FINAL_POLISH_MERGE | Restarting polishing after a merge. |
 | SINGLE_ASU_TAKEOVER / TAKEOVER_DONOR_REPAIR | Runs flow-free graph cuts before the takeover flow solve, then repairs affected groups before accepting or rejecting the attempt. |
 | FINAL_RESIDUAL_CHECK | Checking remaining tract components near the end. |
@@ -186,7 +186,7 @@ A proven optimum can skip further primary optimization; Stop and Skip remain act
 The post-polish bridge-pair pass has been removed (both cuts and flow).
 Supernode polishing starts with connectivity cuts on the contracted graph.
 Its rounds check ASUs from least to most total unemployment, breaking ties by
-ASU ID. After a merge, the newly merged ASU runs next before returning to this order. Ordinary polishing with merging
+ASU ID. After a merge, the queue restarts in this same unemployment order. Ordinary polishing with merging
 disabled retains highest-unemployment-first order.
 `FINAL_POLISH_SUPERNODES_CUT_ROUND` reports the upper bound and its stall count.
 The first cut pass stops after 50 cut rounds or five consecutive rounds without a
