@@ -1,8 +1,10 @@
 """Proof reuse and exact-scout/cut-relaxation sequencing for single-ASU solves."""
 import contextlib
 import io
+import math
 from pathlib import Path
 import sys
+import threading
 from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
@@ -110,6 +112,62 @@ class ScoutBeforeCutsTest(unittest.TestCase):
         self.assertNotIn('scout:', log)
         self.assertIn('primary optimum proved', log)
 
+    def test_cut_callback_stops_on_new_cuts_and_preserves_connected_incumbents(self):
+        real_solve = solver.cp_model.CpSolver.Solve
+        for final_selected in ({0, 2, 3}, {0, 1, 2}):
+            cuts, requests = [], []
+
+            def discovered(instance, model, *args, **kwargs):
+                if self.has_flow(model) or cuts:
+                    return real_solve(instance, model, *args, **kwargs)
+                cuts.append(model.Clone())
+                callback = args[0]
+                self.assertTrue(math.isinf(instance.parameters.max_time_in_seconds))
+                before = len(model.Proto().constraints)
+                callback.StopSearch = lambda: requests.append(True)
+                # Preserve connected improvements even when parallel shutdown
+                # leaves a different final incumbent than the violating one.
+                for selected in ({0, 1, 2}, {0, 2, 3}):
+                    callback.BooleanValue = lambda var: int(var.name.split('_')[1]) in selected
+                    callback.on_solution_callback()
+                    self.assertEqual(len(model.Proto().constraints), before)
+                    self.assertEqual(len(requests), int(selected == {0, 2, 3}))
+                instance.BooleanValue = lambda var: int(var.name.split('_')[1]) in final_selected
+                instance.ObjectiveValue = lambda: 16 if final_selected == {0, 1, 2} else 17
+                instance.BestObjectiveBound = lambda: 18
+                return solver.cp_model.FEASIBLE
+
+            with self.subTest(final=final_selected), \
+                    patch.object(solver.cp_model.CpSolver, 'Solve', new=discovered):
+                result, models, log = self.run_window(scout_before_cuts=False, deterministic_ties=True)
+            self.assertEqual((result.obj, result.status), (16, 'OPTIMAL'))
+            self.assertEqual(requests, [True])
+            self.assertIn('round_end=NEW_CONNECTIVITY_CUTS', log)
+            self.assertTrue(any(self.has_flow(model) for model, _ in models))
+            self.assertGreater(len(models[1][0].Proto().constraints), len(cuts[0].Proto().constraints))
+
+    def test_cut_callback_preserves_improvement_on_skip(self):
+        with TemporaryDirectory() as directory:
+            flag = Path(directory) / 'skip'
+
+            def interrupted(instance, model, *args, **kwargs):
+                self.assertFalse(self.has_flow(model))
+                callback = args[0]
+                before = len(model.Proto().constraints)
+                callback.BooleanValue = lambda var: var.name in ('x_0', 'x_1', 'x_2')
+                callback.StopSearch = lambda: None
+                callback.on_solution_callback()
+                flag.touch()
+                callback.on_solution_callback()
+                self.assertEqual(len(model.Proto().constraints), before)
+                return solver.cp_model.UNKNOWN
+
+            with patch.object(solver.cp_model.CpSolver, 'Solve', new=interrupted):
+                result, models, _ = self.run_window(scout_before_cuts=False, skip_flag_path=str(flag))
+            self.assertEqual((result.obj, result.status), (16, 'SKIPPED_FEASIBLE'))
+            self.assertEqual(len(models), 1)
+            self.assertFalse(flag.exists())
+
     def test_single_cut_pass_stops_after_ten_unchanged_upper_bounds(self):
         real_solve = solver.cp_model.CpSolver.Solve
         cut_models = []
@@ -131,6 +189,96 @@ class ScoutBeforeCutsTest(unittest.TestCase):
         self.assertIn('upper_bound_stall=10/10', log)
         self.assertIn('stop_reason=UPPER_BOUND_STALL', log)
 
+    def test_cut_time_is_unlimited_and_does_not_consume_exact_solve_budget(self):
+        real_solve = solver.cp_model.CpSolver.Solve
+        real_clock = solver.time.monotonic
+        elapsed = [0.0]
+        cut_limits, exact_limits = [], []
+
+        def long_round(instance, model, *args, **kwargs):
+            if not self.has_flow(model):
+                cut_limits.append(instance.parameters.max_time_in_seconds)
+                elapsed[0] += 120.0  # Every round exceeds the old entire budget.
+                instance.BooleanValue = lambda var: var.name in ('x_0', 'x_2', 'x_3')
+                instance.BestObjectiveBound = lambda: 18
+                return solver.cp_model.FEASIBLE
+            exact_limits.append(instance.parameters.max_time_in_seconds)
+            return real_solve(instance, model, *args, **kwargs)
+
+        with (patch.object(solver.time, 'monotonic', side_effect=lambda: real_clock() + elapsed[0]),
+              patch.object(solver.cp_model.CpSolver, 'Solve', new=long_round)):
+            result, _, log = self.run_window(scout_before_cuts=False)
+        self.assertEqual(len(cut_limits), 11)
+        self.assertTrue(all(math.isinf(limit) for limit in cut_limits))
+        self.assertTrue(exact_limits)
+        self.assertTrue(all(0 < limit <= 10 for limit in exact_limits))
+        self.assertGreater(exact_limits[0], 8)
+        self.assertEqual((result.obj, result.status), (16, 'OPTIMAL'))
+        self.assertIn('time_limit=none', log)
+        self.assertIn('stop_reason=UPPER_BOUND_STALL', log)
+
+    def test_cut_upper_bound_improvement_resets_stall(self):
+        real_solve = solver.cp_model.CpSolver.Solve
+        bounds = [1700] * 10 + [1650] * 11
+        cut_count = [0]
+
+        def improving_round(instance, model, *args, **kwargs):
+            if not self.has_flow(model):
+                bound = bounds[cut_count[0]]
+                cut_count[0] += 1
+                instance.BooleanValue = lambda var: var.name in ('x_0', 'x_1')
+                instance.BestObjectiveBound = lambda: bound
+                return solver.cp_model.FEASIBLE
+            return real_solve(instance, model, *args, **kwargs)
+
+        with patch.object(solver.cp_model.CpSolver, 'Solve', new=improving_round):
+            result, _, log = self.run_window(scout_before_cuts=False, economic_scale=100)
+        self.assertEqual(cut_count[0], 21)
+        self.assertEqual(result.obj, 1600)
+        self.assertIn('upper_bound=1650 upper_bound_stall=0/10', log)
+        self.assertIn('stop_reason=UPPER_BOUND_STALL', log)
+
+    def test_untimed_cut_round_honors_stop_and_skip_watchdog(self):
+        for kind in ('stop', 'skip'):
+            with self.subTest(kind=kind), TemporaryDirectory() as folder:
+                flag = Path(folder) / kind
+                stopped = threading.Event()
+
+                def interrupt(instance, model, *args, **kwargs):
+                    self.assertFalse(self.has_flow(model))
+                    self.assertTrue(math.isinf(instance.parameters.max_time_in_seconds))
+                    flag.touch()
+                    self.assertTrue(stopped.wait(2), 'cut watchdog did not interrupt')
+                    return solver.cp_model.UNKNOWN
+
+                with (patch.object(solver.cp_model.CpSolver, 'Solve', new=interrupt),
+                      patch.object(solver.cp_model.CpSolver, 'StopSearch', side_effect=stopped.set)):
+                    result, models, _ = self.run_window(
+                        scout_before_cuts=False, **{kind + '_flag_path': str(flag)})
+                self.assertEqual(len(models), 1)
+                self.assertEqual(result.obj, 10)
+                self.assertEqual(result.status, 'STOPPED_FEASIBLE' if kind == 'stop' else 'SKIPPED_FEASIBLE')
+                self.assertEqual(flag.exists(), kind == 'stop')
+
+    def test_connected_feasible_cut_result_waits_for_bound_stall(self):
+        real_solve = solver.cp_model.CpSolver.Solve
+        cut_count = [0]
+
+        def connected_round(instance, model, *args, **kwargs):
+            if not self.has_flow(model):
+                cut_count[0] += 1
+                instance.BooleanValue = lambda var: var.name == 'x_0'
+                instance.ObjectiveValue = lambda: 10
+                instance.BestObjectiveBound = lambda: 18
+                return solver.cp_model.FEASIBLE
+            return real_solve(instance, model, *args, **kwargs)
+
+        with patch.object(solver.cp_model.CpSolver, 'Solve', new=connected_round):
+            result, _, log = self.run_window(scout_before_cuts=False)
+        self.assertEqual(cut_count[0], 11)
+        self.assertEqual(result.obj, 16)
+        self.assertIn('stop_reason=UPPER_BOUND_STALL', log)
+
     def test_single_cut_pass_keeps_round_limit_when_upper_bound_improves(self):
         real_solve = solver.cp_model.CpSolver.Solve
         cuts = []
@@ -144,10 +292,11 @@ class ScoutBeforeCutsTest(unittest.TestCase):
             return real_solve(instance, model, *args, **kwargs)
 
         with patch.object(solver.cp_model.CpSolver, 'Solve', new=improving_bound):
-            result, models, _ = self.run_window(scout_before_cuts=False, economic_scale=100)
+            result, models, log = self.run_window(scout_before_cuts=False, economic_scale=100)
         self.assertEqual(len(cuts), 100)
         self.assertTrue(self.has_flow(models[-1][0]))
         self.assertEqual((result.obj, result.status), (1600, 'OPTIMAL'))
+        self.assertIn('stop_reason=ROUND_LIMIT', log)
 
     def test_takeover_runs_cuts_before_flow_and_keeps_generated_constraints(self):
         models = []

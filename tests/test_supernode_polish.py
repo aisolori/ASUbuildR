@@ -32,8 +32,8 @@ class SupernodePolishTest(unittest.TestCase):
         self.assertFalse(any(v.name.startswith('polish_flow_')
                              for model in models for v in model.Proto().variables))
 
-    def test_five_stalled_bound_rounds_reset_on_improvement_even_without_new_cuts(self):
-        bounds = [30, 30, 29, 29, 29, 29, 29, 29]
+    def test_ten_stalled_bound_rounds_reset_on_improvement_even_without_new_cuts(self):
+        bounds = [30, 30] + [29] * 11
         cut_models, flow_models, reports = [], [], []
         real_solve = solver.cp_model.CpSolver.Solve
 
@@ -54,11 +54,11 @@ class SupernodePolishTest(unittest.TestCase):
             result = self.solve([10, 5, 20], [0, 0, 0], [1, -1, 2],
                                 deterministic_ties=False, log=True,
                                 incumbent_report_callback=lambda selected, value: reports.append((selected, value)))
-        self.assertEqual(len(cut_models), 8)
+        self.assertEqual(len(cut_models), 13)
         self.assertEqual(len(flow_models), 1)
         self.assertEqual((result.obj, result.status), (15, 'OPTIMAL'))
         self.assertIn(([0, 1, 2], 15), reports)
-        self.assertIn('upper_bound_stall=5/5', output.getvalue())
+        self.assertIn('upper_bound_stall=10/10', output.getvalue())
         self.assertIn('stop_reason=UPPER_BOUND_STALL', output.getvalue())
         self.assertIn('bound_carried_to_flow=True', output.getvalue())
 
@@ -86,7 +86,7 @@ class SupernodePolishTest(unittest.TestCase):
                 with patch.object(solver.cp_model.CpSolver, 'Solve', new=capture):
                     result = self.solve([10, 0, 5, 20], [0, 10, 0, 0], [1, -1, -1, 2],
                                         deterministic_ties=False)
-                self.assertEqual(len(cut_models), 6)  # Baseline + five stalled rounds.
+                self.assertEqual(len(cut_models), 11)  # Baseline + ten stalled rounds.
                 self.assertEqual(len(flow_models), 1)
                 self.assertEqual((result.obj, result.status), (15, 'OPTIMAL'))
                 if not unknown:
@@ -104,6 +104,8 @@ class SupernodePolishTest(unittest.TestCase):
         configured_limit = []
 
         def cuts(*args, **kwargs):
+            self.assertTrue(kwargs['stop_on_new_cuts'])
+            self.assertEqual(kwargs['upper_bound_stall_rounds'], 10)
             configured_limit.append(kwargs['max_rounds'])
             return real_cuts(*args, **kwargs)
 
@@ -129,7 +131,7 @@ class SupernodePolishTest(unittest.TestCase):
         self.assertEqual(len(flow_models), 1)
         self.assertEqual((result.obj, result.status), (15, 'OPTIMAL'))
         self.assertIn('stop_reason=ROUND_LIMIT', output.getvalue())
-        self.assertIn('upper_bound_stall=0/5', output.getvalue())
+        self.assertIn('upper_bound_stall=0/10', output.getvalue())
 
     def solve(self, u, emp, ids, nb=None, **options):
         n = len(u)

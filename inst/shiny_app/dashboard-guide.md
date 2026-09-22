@@ -75,12 +75,97 @@ returns no new ASUs rather than falling back to an unrestricted full-graph solve
 This is not a proof that no ASUs exist.
 
 **Expansion incumbent stall limit (sec)** controls how long retained-component
-repair, sequential/joint expansion, and expansion touching-group solves may run
+repair, individual ASU expansion, and expansion touching-group solves may run
 without improving an incumbent. The dashboard default is 300 seconds; 0 disables
 this limit. The solve time budget still applies. Final polishing uses the general
 incumbent stall limit. Python/CLI callers can set
 `expansion_incumbent_stall_seconds` / `--expansion-incumbent-stall-seconds`;
 omitting it inherits the general stall setting.
+
+Dashboard runs disable the standalone `[graph-cut]` hint stage and corridor
+`[repair]`. Legacy single-ASU windows proceed from their other starting-solution
+heuristics to the main solver, which retains its internal `[cut-pass]`.
+That pass carries its generated cuts and tighter bounds into the exact solve.
+The single-ASU `[cut-pass]` has no time limit, including within each round.
+It stops after 100 rounds or ten consecutive rounds without a lower proven
+upper bound; a better bound resets the stall counter. Proof, Stop/Skip, and
+solver failure can end it earlier. Cut-pass time is additional to the configured
+solve budget, which still limits the other solve phases.
+Within each round, a callback stops search once an incumbent exposes a new
+connectivity cut. Separator rows are added only after the solve returns.
+Already-known/dominated cuts and connected incumbents alone do not trigger
+this early stop. Valid connected improvements survive restarts and Stop/Skip.
+`round_end=NEW_CONNECTIVITY_CUTS` identifies early discovery stops in the logs.
+This applies to Legacy and to Partitioning's individual single-ASU solves.
+Partitioning still uses the connectivity-free relaxation to generate seeds.
+
+**Split saved ASUs (joint model)** requires a warm-start RDS, even if the
+warm-start checkbox is off. It tries each imported ASU once, in descending
+captured unemployment; there is no size threshold. Newly created children
+are not split again during that run. Increase **Max ASUs** above the imported
+count to leave room for splits. A parent can produce **two or three children**,
+limited further by the remaining ASU slots and available qualifying population.
+Both the cut pass and exact flow model allocate at most three child slots.
+
+Each child must contain at least one tract from its parent and independently
+meet connectivity, population, and unemployment-rate requirements. Parent
+tracts may be released and currently unassigned tracts may be added. Other
+ASUs remain fixed during the attempt; their tracts and all their neighbors
+are excluded. Children cannot touch one another or any other ASU, including
+corner contacts in the queen-contiguity graph. Only a strictly greater combined
+unemployment total replaces the parent; otherwise it stays unchanged.
+
+The solver uses articulation points and a bounded search of low-degree,
+two-tract corridor separators to suggest initial child lobes. These are graph
+bottleneck hints, not geometric-width measurements or forced split boundaries.
+The full joint model can choose a different separation or find a split with no
+such hint. This does not enable the standalone `[graph-cut]` repair stage.
+
+Before the first cut round, the split model also adds a bounded set of valid
+articulation/small-separator constraints to every child slot. These use the
+**full eligible graph**, including unassigned tracts, so a bypass outside the
+parent is not incorrectly cut off. These constraints enforce necessary
+connectivity conditions; they do not force a particular split boundary.
+
+Population-derived minimum child sizes and rate-surplus bounds tighten the
+maximum selected-tract and deficit-tract counts. Each child reserves enough
+tracts for the other active children. Optimistic unemployment upper bounds
+apply both to each child and to their combined selection; conditional bounds
+can exclude a tract only when selecting it cannot meet the rate requirement
+or cannot improve on the parent. The same constraints and derived flow
+capacities carry into the exact model. `ASU_SPLIT_TIGHTENING` reports separator
+rows, count bounds, objective bounds, and gain-based exclusions. A proven
+economic impossibility returns the unchanged parent without running cut or
+flow solves and is logged as `ASU_SPLIT_ECONOMIC_SCREEN`.
+
+Each parent starts with an untimed, flow-free connectivity cut pass: at most
+**25 rounds or 10 consecutive stalled-upper-bound rounds**. Proof, cancellation,
+or solver failure may end it earlier. Within each round, the solver checks
+incumbents for disconnected children and stops as soon as it discovers new
+connectivity cuts. It adds those cuts after the solver stops, then restarts
+unless the pass has reached its round/stall limit. Connected incumbents or
+already-known cuts alone do not trigger this early stop. The same callback
+behavior is enabled in Legacy's main cut pass and Partitioning's individual,
+touching-ASU joint, and supernode-polishing cut passes. Existing time budgets
+and total round caps are unchanged; initial upper-bound stall limits are ten.
+
+`ASU_SPLIT_CUT_ROUND` reports `round_end=NEW_CONNECTIVITY_CUTS` for these early
+stops. The solver status may be `FEASIBLE`, not `OPTIMAL`. Only certified solver
+upper bounds carry forward, never a disconnected incumbent's objective as an
+upper bound. Valid connected split incumbents found during a round are retained.
+Faster cut discovery can leave weaker bounds and more work for exact flow;
+presolve still runs each round, and there is no time guarantee before finding
+a useful candidate. Cuts and tighter bounds remain in the
+same model when exact connectivity flows are added. A valid connected optimum
+of the cut model needs no further flow solve. **Time limit per window** and
+**Incumbent stall limit** apply only to that subsequent exact solve per parent;
+the cut pass has neither a total nor a per-round time cap. Use a positive time
+limit to enable split attempts. Solves run sequentially using all workers.
+Stop/Skip preserve the best validated improving split, if any; otherwise the
+original parent is retained. No merging, takeover, polishing, or residual-ASU
+creation follows this strategy. An unsuccessful limited solve is not a proof
+that the parent cannot be improved. `[STAGE] ASU_SPLIT_*` logs report attempts,
+bottleneck hints, cut rounds, and accepted gains.
 
 `SURPLUS_PRUNE_COMPONENT` logs each retained component's population, unemployment
 rate, threshold, and exact `q_surplus`. Stalled components also report counts of
@@ -131,11 +216,10 @@ Set these before starting. Changing a control does not reconfigure a running sol
 
 | Parameter | Meaning and effect |
 | --- | --- |
-| CP-SAT strategy | **Partitioning strategy (potential multiple ASUs)** creates seeds, expands territories, jointly reoptimizes touching ASUs, and polishes groups. **Legacy single-ASU solve** builds candidates from remaining tracts one at a time; it can still produce multiple ASUs. Legacy is currently the selected default. |
+| CP-SAT strategy | **Partitioning strategy (potential multiple ASUs)** creates seeds, expands territories, jointly reoptimizes touching ASUs, and polishes groups. **Legacy single-ASU solve** builds candidates from remaining tracts one at a time; it can still produce multiple ASUs. **Split saved ASUs (joint model)** splits imported parents only when separated children capture strictly more combined unemployment. Legacy is currently the selected default. |
 | UR threshold (τ) | Minimum aggregate rate as a **fraction**. Default `0.0645` means **6.45%**. Do not enter `6.45` here. |
 | Population threshold | Minimum combined population of a candidate. Default `10000`. |
-| Use saved ASUs as a warm start / Warm-start RDS | Available for CP-SAT strategies, off by default. Upload a saved dashboard `.rds` (`sf` or data frame) containing `GEOID`/`geoid` and `asunum`/`asu_id`. Groups are matched to the current data by GEOID and validated before starting. Disable the checkbox to run without the uploaded file. |
-| Joint multi-ASU expansion (experimental) | Only shown for the partitioning strategy; off by default. Pools up to three neighboring seed territories and jointly assigns their tracts. Each active ASU must independently satisfy connectivity, population, and rate requirements. Batches run sequentially with all workers and 1800 seconds per batch, not per ASU. May use more memory. |
+| Use saved ASUs as a warm start / Warm-start RDS | Upload a saved dashboard `.rds` (`sf` or data frame) containing `GEOID`/`geoid` and `asunum`/`asu_id`. Groups are matched to the current data by GEOID and validated before starting. Optional and off by default for Legacy and Partitioning; **mandatory for Split saved ASUs regardless of the checkbox**. |
 | Max ASUs | Limit used by the ASU creation loop. Default `30`. It is not a target count; fewer groups may be feasible and merges reduce the count. |
 | Time limit (sec) per window | Budget for an individual main candidate window (the tracts considered in that solve). Default `18000` is five hours. **Not a whole-run limit.** Use positive seconds. Partition expansion has a separate built-in 1800-second budget per solve, also used by default for final polishing. |
 | Incumbent stall limit (sec) | Stops the applicable search after this long without improving its best solution. Default `300` is five minutes; `0` disables it. Bound improvements alone do not reset this timer. |
@@ -169,21 +253,24 @@ infeasibility.
 | STATEWIDE_JOINT / STATEWIDE_JOINT_COMPLETE | One all-tract joint model. Reports group slots, assignment/flow variable estimates, workers, time limit, and final status, active groups, merges, unemployment, gain, and elapsed time. |
 | STATEWIDE_JOINT_MODEL | Reports the actual hint mode, hinted tract count, tightening setting, derived count bounds, graph components, and assignments fixed to zero. |
 | PARTITION_EXPANSION | Expanding seeds in assigned territories, one solve at a time. |
-| PARTITION_JOINT_EXPANSION / PARTITION_JOINT_EXPANSION_COMPLETE | Experimental pooled expansion. Reports batch number, candidate count, territory size, workers, time budget, and then status, active/inactive groups, unemployment gain, and elapsed time. |
 | PARTITION_EXPANSION_COMPLETE | Summarizing that round. Rejected seeds did not produce valid ASUs; the whole run can continue. |
 | PARTITION_TOUCHING_JOINT / PARTITION_TOUCHING_JOINT_COMPLETE | Jointly reoptimizing a touching partition cluster with reachable unassigned tracts. Reports source stage, group/window size, budget/workers, movable roots, baseline unemployment, gain, deactivated slots, acceptance, and elapsed time. `CACHED` skips an unchanged attempted neighborhood, not a proof of optimality. |
 | PARTITION_BUILD_MERGE / PARTITION_COMBINE | Legacy touching-group combining; partitioning uses the joint check instead. |
 | FINAL_POLISH | With merging enabled, processes ASUs from least to most total unemployment. After a merge, the queue is rebuilt from updated unemployment totals without special merge priority. |
 | FINAL_POLISH_MERGE | Committing a merge and finishing remaining queued ASUs before restarting polishing. |
-| SINGLE_ASU_TAKEOVER / TAKEOVER_DONOR_REPAIR | Runs flow-free graph cuts before the takeover flow solve, then repairs affected groups before accepting or rejecting the attempt. |
+| SINGLE_ASU_TAKEOVER / TAKEOVER_DONOR_REPAIR | Partitioning only. Runs flow-free graph cuts before the takeover flow solve, then repairs affected groups before accepting or rejecting the attempt. |
 | FINAL_RESIDUAL_CHECK | Checking remaining tract components near the end. |
 
 Stages may repeat or be skipped depending on the strategy and results.
 
-The single-ASU takeover cut pass keeps its 100-round maximum and stops after
-ten rounds without an improved upper bound. It shares the solve time budget
-(up to 60 seconds and 15% of that budget for cuts, with a two-second minimum
-when time remains). All generated cuts strengthen the subsequent exact model.
+Legacy single-ASU runs proceed to the final residual check after their ASU
+search passes; they do not run `SINGLE_ASU_TAKEOVER` or its donor repairs.
+
+In Partitioning, the single-ASU takeover uses the same untimed cut pass:
+100 rounds maximum or ten rounds without an improved upper bound.
+All generated cuts strengthen the subsequent exact model.
+A round can stop early on a newly discovered connectivity cut, just as in
+Legacy's main cut pass; it need not prove a disconnected assignment optimal.
 A proven optimum can skip further primary optimization; Stop and Skip remain active.
 
 The post-polish bridge-pair pass has been removed (both cuts and flow).
@@ -193,10 +280,14 @@ ASU ID. After a merge, remaining surviving ASUs finish before the queue restarts
 in this same unemployment order. Ordinary polishing with merging
 disabled retains highest-unemployment-first order.
 `FINAL_POLISH_SUPERNODES_CUT_ROUND` reports the upper bound and its stall count.
-The first cut pass stops after 50 cut rounds or five consecutive rounds without a
+The first cut pass stops after 25 cut rounds or ten consecutive rounds without a
 better upper bound, whichever happens first. A better bound resets the stall
 count, not the total round count. There is no individual-cut-count cap.
 Proof, cancellation, and the overall polish time limit can stop it sooner.
+Individual supernode cut rounds also stop on new connectivity cuts; their
+existing ten-second per-round ceiling and shared polish budget still apply.
+Partitioning's touching-ASU joint cut passes use this callback too, retaining
+their existing per-round and overall cut-pass time budgets.
 Exact flow retains the cuts and best connected solution and uses the remaining
 time. If primary flow stalls with a valid incumbent that absorbs another ASU,
 that solution returns immediately for merge validation/commit and the polish
@@ -204,8 +295,8 @@ queue continues with remaining surviving ASUs before restarting in lowest
 unemployment order. Equal statewide unemployment is sufficient; coverage cannot
 decrease. `FINAL_POLISH_SUPERNODES_STALL_MERGE` reports this handoff.
 Otherwise, if the primary flow solve reaches its incumbent stall limit without a
-proof, another flow-free cut pass runs with both limits doubled: 100/10, 200/20,
-400/40, and so on. Each flow solve is rebuilt from the accumulated cuts.
+proof, another flow-free cut pass runs with both limits doubled: 50/20, 100/40,
+200/80, and so on. Each flow solve is rebuilt from the accumulated cuts.
 The primary flow incumbent-stall allowance also doubles on each retry:
 the configured limit, then 2x, 4x, and so on. A disabled stall limit stays
 disabled. Cycle/flow stage logs report the active allowance. Valid
@@ -255,23 +346,11 @@ Max ASUs counts both imported and newly created groups.
 The `WARM_START` stage reports imported ASUs, assigned tracts, and baseline
 unemployment. The original RDS is never modified. The edit tab's existing
 **Load Data** control remains separate from this solver warm-start upload.
-To compare expansion strategies, choose **Partitioning strategy**, then run
-with **Joint multi-ASU expansion (experimental)** off and on using the same
-data and thresholds. Compare total unemployment, valid ASUs, elapsed time,
-and memory use; a joint batch is not a statewide optimum. Sequential mode
-gets 1800 seconds per seed, while joint mode shares 1800 seconds per batch,
-so these are not equal-total-budget comparisons.
 
-Joint expansion may exchange tracts across the pooled territory boundaries.
-Valid seed groups remain active and their combined unemployment cannot fall;
-individual groups can shrink. A weak relaxed component may be repaired or
-left inactive, and is never committed as an invalid ASU. Every active group
-retains at least one tract from its seed. Other batches and already committed
-ASUs stay outside the solve. Valid seeds are retained if no solution is found.
-Stop ends the search; Skip skips the current batch. Time, relative-gap and
-incumbent-stall controls apply. Previews show the combined selection's added
-and removed tracts, not provisional group colors. Touching joint checks run only
-after the batch returns. An accepted update restarts expansion before the next batch.
+Partitioning expands ASUs individually in sequence, using all workers and a
+1800-second budget per ASU. The joint multi-ASU expansion option has been
+removed from the dashboard. Touching-ASU joint checks still run after individual
+expansions; an accepted update restarts expansion before the next ASU.
 
 ### Touching ASUs in partitioning
 
@@ -296,8 +375,7 @@ automatic merge fallback. Accepted changes restart expansion or polishing
 with fresh territories/order. Late-stage changes receive the same check.
 
 Touching-ASU solves automatically enable small-separator cuts, seed-distance/
-cardinality constraints, and the connectivity cut pre-pass. These do not depend
-on the optional joint-expansion checkbox.
+cardinality constraints, and the connectivity cut pre-pass.
 The pre-pass uses at most eight rounds, 60 seconds, and 15% of the remaining
 joint budget; it does not add time to that budget. Only validated connected
 solutions are retained. Cuts carry into the final exact flow model.
@@ -454,5 +532,5 @@ the same filenames in the active save directory.
 
 
 The experimental statewide joint strategy and user-imposed ASU tract limits
-have been removed from the dashboard, R wrapper, Python API and CLI. Partition
-joint expansion and connectivity cut passes remain available.
+have been removed from the dashboard, R wrapper, Python API and CLI.
+Connectivity cut passes and touching-ASU joint checks remain available.

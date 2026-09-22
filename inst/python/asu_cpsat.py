@@ -1427,7 +1427,7 @@ _ASU_FULL_SUBSOLVER_PATTERN = (
     "core_max_lp",
     
     "quick_restart_no_lp",
-    "variables_shaving_max_lp",
+    "variables_shaving_no_lp",
     "max_lp",
     "lb_tree_search",
     "asu_probe_deep",
@@ -1439,7 +1439,7 @@ _ASU_FULL_SUBSOLVER_PATTERN = (
     "core",
 
 
-    "variables_shaving_no_lp",
+    "variables_shaving_max_lp",
     "objective_shaving_no_lp",
     "asu_probe_mega_deep",
     "objective_lb_search_no_lp"
@@ -2900,6 +2900,14 @@ def solve_one_asu_cpsat(
     seconds (10% of the original budget) before generating cuts on a separate
     relaxation. False disables that early scout for controlled comparisons.
 
+    The cut pass has no wall-clock or per-round time limit. It stops after
+    100 rounds or ten consecutive rounds without a lower proven upper bound,
+    or on proof, cancellation, or solver failure. Cut-pass elapsed time is
+    excluded from `time_limit`, which still bounds the other solve phases.
+    Each round stops early when an incumbent exposes a new connectivity cut.
+    The callback preserves valid connected incumbents and only collects a
+    violating selection; separator rows are added after the solve returns.
+
     `stop_flag_path`, when given, names a file whose mere existence is polled by
     a dedicated watchdog thread during the main solve; on detection it calls
     `solver.stop_search()` (a CP-SAT callback API) so the current incumbent is
@@ -3779,7 +3787,7 @@ def solve_one_asu_cpsat(
     _SCOUT_SECS = min(5.0, .1 * float(time_limit), max(0.0, remaining_time - 1.0))
     phase_interrupted = []
 
-    def _solve_primary_phase(engine, phase_model):
+    def _solve_primary_phase(engine, phase_model, *, timed=True, callback=None):
         def requested():
             if _stop_requested(stop_flag_path):
                 return "STOPPED"
@@ -3792,11 +3800,12 @@ def solve_one_asu_cpsat(
         if reason:
             phase_interrupted.append(reason)
             return cp_model.UNKNOWN
-        remaining = float(time_limit) - (time.monotonic() - start_time)
-        if remaining <= 0:
-            return cp_model.UNKNOWN
-        engine.parameters.max_time_in_seconds = min(
-            engine.parameters.max_time_in_seconds, remaining)
+        if timed:
+            remaining = float(time_limit) - (time.monotonic() - start_time)
+            if remaining <= 0:
+                return cp_model.UNKNOWN
+            engine.parameters.max_time_in_seconds = min(
+                engine.parameters.max_time_in_seconds, remaining)
         done = threading.Event()
 
         def watch_phase():
@@ -3810,7 +3819,7 @@ def solve_one_asu_cpsat(
         watcher = threading.Thread(target=watch_phase, daemon=True)
         watcher.start()
         try:
-            return engine.Solve(phase_model)
+            return engine.Solve(phase_model, callback) if callback is not None else engine.Solve(phase_model)
         finally:
             done.set()
             watcher.join()
@@ -3895,11 +3904,11 @@ def solve_one_asu_cpsat(
     if proven_upper_bound >= 0:
         model.Add(obj_expr <= proven_upper_bound)
     cut_round = 0
-    # Cuts retain a bounded share of the original budget after the scout.
+    # Cut rounds are bounded by count and upper-bound stall, not elapsed time.
+    # Credit this phase's elapsed time back before returning to the exact model.
     cut_started = time.monotonic()
-    cut_time_budget = min(max(0.0, float(time_limit) - (cut_started - start_time)),
-                          60, max(2.0, float(time_limit) * 0.15))
     cut_bound_stall = _UpperBoundStall(10)
+    cut_stop_reason = None
     prev_num_components: Optional[int] = None
     first_components: Optional[int] = None
     prev_detached_unemp: Optional[int] = None
@@ -3918,6 +3927,7 @@ def solve_one_asu_cpsat(
     separator_literals = 0
     separator_clause_literals = 0
     separator_sizes: List[int] = []
+    boundary_cut_seen = set(seen_seeded_cuts)
     fallback_components = 0
     fallback_clauses = 0
     fallback_literals = 0
@@ -4013,6 +4023,50 @@ def solve_one_asu_cpsat(
                     break
         return targets
 
+    def _new_boundary_cut(target, boundary):
+        """Check exact/dominated rows without changing the live model or pools."""
+        if target in fixed_zero_nodes or (target, tuple(boundary)) in boundary_cut_seen:
+            return False
+        candidate = frozenset(boundary)
+        return not any(prior.issubset(candidate) for prior in separator_pool.get(target, []))
+
+    class SingleCutDiscovery(cp_model.CpSolverSolutionCallback):
+        def __init__(self):
+            super().__init__()
+            self.selection = None
+            self.components = None
+            self.best = None
+            self.best_obj = best_obj
+
+        def on_solution_callback(self):
+            if (phase_interrupted or _stop_requested(stop_flag_path)
+                    or _stop_requested(skip_flag_path)):
+                self.StopSearch()
+                return
+            selected = [i for i, var in enumerate(x) if self.BooleanValue(var)]
+            mask = np.zeros(N, dtype=bool)
+            mask[selected] = True
+            components = _connected_components(nb_local, mask)
+            if len(components) == 1 and root_local in components[0]:
+                value = int(u_g[selected].sum())
+                if value > self.best_obj:
+                    expanded = sorted(v for i in selected for v in expand_c[i])
+                    if component_ok(expanded, u_g_orig, E_g_orig, P_g_orig, tau,
+                                    pop_thresh, nb_local_orig, required=required_orig):
+                        self.best, self.best_obj = selected, value
+            elif self.selection is None:
+                detached = [set(c) for c in components if root_local not in c]
+                for component in detached:
+                    boundary = sorted({w for v in component for w in nb_local[v]} - component)
+                    if any(_new_boundary_cut(target, boundary)
+                           for target in _pick_component_targets(component)):
+                        self.selection, self.components = selected, detached
+                        break
+            if self.selection is not None:
+                # Only request shutdown here. Dynamic separator generation and
+                # all model/pool mutations happen after Solve returns.
+                self.StopSearch()
+
     # Populated once a round goes DISCONNECTED; nudges each following round
     # toward absorbing the smallest still-disconnected component first,
     # instead of leaving CP-SAT to re-solve the cuts unguided every round.
@@ -4020,13 +4074,10 @@ def solve_one_asu_cpsat(
     # round 0 already targets the smallest component instead of the full hint.
     pending_expand: List[set] = list(initial_pending)
 
+    if log and not primary_proved:
+        _stage_print("[STAGE] SINGLE_ASU_CUT_PASS max_rounds=100 "
+                     "upper_bound_stall_limit=10 time_limit=none stop_on_new_cuts=True", flush=True)
     while not primary_proved and cut_round < 100:
-        elapsed = time.monotonic() - start_time
-        remaining_for_cuts = min(cut_time_budget - (time.monotonic() - cut_started),
-                                 float(time_limit) - elapsed)
-        if remaining_for_cuts <= 0:
-            break
-
         if pending_expand:
             expand_component = pending_expand.pop(0)
             expand_base = (
@@ -4044,7 +4095,6 @@ def solve_one_asu_cpsat(
 
         solver = cp_model.CpSolver()
         solver.parameters.num_search_workers = max(1, int(workers))
-        solver.parameters.max_time_in_seconds = remaining_for_cuts
         solver.parameters.log_search_progress = False  # silent; summary logged after loop
         solver.parameters.cp_model_presolve = True
         solver.parameters.linearization_level = 2
@@ -4058,11 +4108,22 @@ def solve_one_asu_cpsat(
                 use_flow_capacity_hybrid_search=flow_capacity_hybrid_enabled,
             )
 
-        status = _solve_primary_phase(solver, model)
+        discovery = SingleCutDiscovery()
+        status = _solve_primary_phase(solver, model, timed=False, callback=discovery)
+        round_end = ("NEW_CONNECTIVITY_CUTS" if discovery.selection is not None else "SOLVER_RETURNED")
+        callback_improved = discovery.best is not None and discovery.best_obj > best_obj
+        if callback_improved:
+            best_connected, best_obj = discovery.best, discovery.best_obj
+            if best_obj > lower_bound:
+                model.Add(obj_expr >= best_obj)
+                lower_bound = best_obj
         if phase_interrupted:
             return (_to_orig(best_connected, phase_interrupted[0] + "_FEASIBLE")
                     if best_connected is not None else None)
+        if callback_improved and _incumbent_requests_interrupt(best_connected):
+            return _to_orig(best_connected, "MERGE_STOPPED_FEASIBLE")
         if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            cut_stop_reason = solver.StatusName(status)
             break
 
         selected = [i for i in range(N) if solver.BooleanValue(x[i])]
@@ -4100,7 +4161,10 @@ def solve_one_asu_cpsat(
             if log:
                 print(
                     f"  [cut-pass] round {cut_round}: CONNECTED, unemp={objective} "
-                    f"(best so far={best_obj}), elapsed={time.monotonic() - start_time:.1f}s",
+                    f"(best so far={best_obj}), upper_bound={cut_bound_stall.best} "
+                    f"upper_bound_stall={cut_bound_stall.rounds}/10 "
+                    f"round_end={round_end} "
+                    f"elapsed={time.monotonic() - start_time:.1f}s",
                     flush=True,
                 )
             if improved_connected and _incumbent_requests_interrupt(selected):
@@ -4119,10 +4183,26 @@ def solve_one_asu_cpsat(
                           "optimization and proceeding to requested tie-breaks", flush=True)
                 if not deterministic_ties:
                     return _to_orig(selected, "OPTIMAL")
-            break
+            if primary_proved:
+                cut_round += 1
+                break
+            if discovery.selection is None:
+                cut_round += 1
+                if cut_bound_stall.rounds >= 10:
+                    cut_stop_reason = "UPPER_BOUND_STALL"
+                    break
+                continue
 
-        unseen = selected_set - root_component
-        components: List[set] = []
+        # Another worker may have changed the final incumbent during shutdown.
+        # Separate the saved violating candidate, not an unrelated final one.
+        if discovery.selection is not None:
+            selected = discovery.selection
+            selected_set = set(selected)
+            components = discovery.components
+            unseen = set()
+        else:
+            unseen = selected_set - root_component
+            components: List[set] = []
         while unseen:
             seed = unseen.pop()
             component = {seed}
@@ -4150,6 +4230,7 @@ def solve_one_asu_cpsat(
                 f"({len(components)} component(s) cut), best_connected so far={best_text}, "
                 f"detached_unemp={detached_unemp}, upper_bound={cut_bound_stall.best} "
                 f"upper_bound_stall={cut_bound_stall.rounds}/10 "
+                f"round_end={round_end} "
                 f"elapsed={time.monotonic() - start_time:.1f}s",
                 flush=True,
             )
@@ -4188,12 +4269,18 @@ def solve_one_asu_cpsat(
             if boundary:
                 # Fallback when dynamic separation yields no useful cut.
                 for target in targets:
+                    if not _new_boundary_cut(target, boundary):
+                        continue
                     model.AddBoolOr([x[int(target)].Not()] + [x[w] for w in boundary])
+                    boundary_cut_seen.add((int(target), tuple(boundary)))
                     fallback_clauses += 1
                     fallback_literals += len(boundary) + 1
             else:
                 for target in targets:
+                    if not _new_boundary_cut(target, boundary):
+                        continue
                     model.Add(x[int(target)] == 0)
+                    boundary_cut_seen.add((int(target), ()))
                     fixed_zero_nodes.add(int(target))
                     fallback_clauses += 1
                     fallback_literals += 1
@@ -4203,12 +4290,18 @@ def solve_one_asu_cpsat(
 
         cut_round += 1
         if cut_bound_stall.rounds >= 10:
-            if log:
-                _stage_print(f"[STAGE] SINGLE_ASU_CUT_COMPLETE "
-                             f"rounds={cut_round} stop_reason=UPPER_BOUND_STALL "
-                             f"upper_bound={cut_bound_stall.best} upper_bound_stall=10/10",
-                             flush=True)
+            cut_stop_reason = "UPPER_BOUND_STALL"
             break
+
+    cut_elapsed = time.monotonic() - cut_started
+    start_time += cut_elapsed
+    if log and (cut_round or cut_stop_reason):
+        cut_stop_reason = ("PROVED_OPTIMAL" if primary_proved else
+                           cut_stop_reason or "ROUND_LIMIT")
+        _stage_print(f"[STAGE] SINGLE_ASU_CUT_COMPLETE rounds={cut_round} "
+                     f"stop_reason={cut_stop_reason} upper_bound={cut_bound_stall.best} "
+                     f"upper_bound_stall={cut_bound_stall.rounds}/10 "
+                     f"elapsed={cut_elapsed:.3f}s", flush=True)
 
     if log and separator_attempts > 0:
         avg_literals = separator_literals / max(1, separator_accepted)
@@ -7546,7 +7639,7 @@ def _solve_supernode_polish(nb_local, u_g, E_g, P_g, tau, pop_thresh,
     cut_model = model
     root_rows = [[model.NewConstant(int(i == root)) for i in range(n)]]
     seen_cuts = set()
-    cycle, cut_round_limit, cut_stall_limit = 1, 25, 5
+    cycle, cut_round_limit, cut_stall_limit = 1, 25, 10
     flow_stall_limit = incumbent_stall_seconds
     while True:
         reason = interruption()
@@ -7573,6 +7666,7 @@ def _solve_supernode_polish(nb_local, u_g, E_g, P_g, tau, pop_thresh,
             upper_bound_stall_rounds=cut_stall_limit, bound_stall_only=True,
             seen_cuts=seen_cuts, initial_upper_bound=upper if cycle > 1 else None,
             stage_prefix='FINAL_POLISH_SUPERNODES', proof_out=cut_proof, bound_out=cut_bounds,
+            stop_on_new_cuts=True,
             repair_candidate=repair_cut_candidate if use_surplus_path_repair else None)
         if cut_bounds and cut_bounds[0] is not None:
             upper = min(upper, cut_bounds[0])
@@ -8207,6 +8301,27 @@ class _JointConnectivityCutCache:
         return True
 
 
+def _joint_new_connectivity_cuts(groups, root_rows, nb, u, boolean_value, seen, limit):
+    """Collect root-aware violated rows without mutating a live solver model."""
+    cuts, detached = [], 0
+    for k, unit in enumerate(groups):
+        mask = np.zeros(len(nb), dtype=bool)
+        mask[unit] = True
+        components = _connected_components(nb, mask)
+        if len(components) <= 1:
+            continue
+        detached += len(components) - 1
+        for component in components:
+            if any(boolean_value(root_rows[k][v]) for v in component):
+                continue
+            region = tuple(sorted(component))
+            boundary = sorted({w for v in region for w in nb[v]} - set(region))
+            for target in sorted(region, key=lambda v: (-int(u[v]), v))[:3]:
+                if (k, target, region) not in seen and len(cuts) < limit:
+                    cuts.append((k, target, region, boundary))
+    return cuts, detached
+
+
 def _joint_connectivity_cut_pass(model, x, root_rows, nb, u,
                                  fallback, valid_candidate, deadline, workers,
                                  cancellation, *, log=False, report=None,
@@ -8216,7 +8331,8 @@ def _joint_connectivity_cut_pass(model, x, root_rows, nb, u,
                                  cut_cache=None, global_nodes=None,
                                  proof_out=None, bound_stall_only=False, bound_out=None,
                                  seen_cuts=None, initial_upper_bound=None,
-                                 repair_candidate=None):
+                                 repair_candidate=None, round_seconds=10.0,
+                                 objective_floor=None, stop_on_new_cuts=False):
     """Solve/add root-aware cuts before flows; never publish disconnected groups.
 
     For v in C: x[v] <= sum(root[C]) + sum(x[boundary(C)]). A connected
@@ -8225,6 +8341,9 @@ def _joint_connectivity_cut_pass(model, x, root_rows, nb, u,
     bound_stall_only removes early connected-feasible and no-new-cut exits,
     but respects the supplied round/cut caps. Proof, cancellation, invalidity,
     and deadline still stop.
+    stop_on_new_cuts interrupts a round when an incumbent exposes new violated
+    connectivity rows. Rows are added only AFTER Solve returns. Valid connected
+    incumbents are retained; only certified solver bounds tighten the objective.
     """
     if bound_stall_only:
         if upper_bound_stall_rounds is None or upper_bound_stall_rounds < 1:
@@ -8269,7 +8388,8 @@ def _joint_connectivity_cut_pass(model, x, root_rows, nb, u,
     if log:
         _stage_print(f"[STAGE] {stage_prefix}_CUT_PASS groups={len(x)} "
               f"baseline_unemp={best_obj} time_limit={max(0, deadline-started):.3f}s "
-              f"max_rounds={max_rounds} cut_limit={cut_limit} workers={workers}", flush=True)
+              f"max_rounds={max_rounds} cut_limit={cut_limit} workers={workers} "
+              f"stop_on_new_cuts={bool(stop_on_new_cuts)}", flush=True)
     round_number = 0
     while round_number < max_rounds:
         round_number += 1
@@ -8279,11 +8399,44 @@ def _joint_connectivity_cut_pass(model, x, root_rows, nb, u,
             status_name = reason or ("CUT_LIMIT" if rows >= cut_limit else "TIME_LIMIT")
             break
         scout = cp_model.CpSolver()
-        scout.parameters.max_time_in_seconds = min(10.0, remaining)
+        # None leaves individual rounds untimed; existing callers keep 10s.
+        scout.parameters.max_time_in_seconds = (remaining if round_seconds is None
+                                                else min(round_seconds, remaining))
         scout.parameters.num_search_workers = max(1, int(workers))
         scout.parameters.log_search_progress = bool(log)
         _configure_asu_solver_portfolio(scout.parameters, workers)
         done, interrupted = threading.Event(), []
+
+        class CutDiscovery(cp_model.CpSolverSolutionCallback):
+            def __init__(self):
+                super().__init__()
+                self.cuts = []
+                self.detached = 0
+                self.best = None
+                self.best_obj = best_obj
+
+            def on_solution_callback(self):
+                reason = cancellation()
+                if reason:
+                    if not interrupted:
+                        interrupted.append(reason)
+                    self.StopSearch()
+                    return
+                groups = [[i for i, var in enumerate(row) if self.BooleanValue(var)] for row in x]
+                if valid_candidate(groups):
+                    value = sum(int(u[unit].sum()) for unit in groups)
+                    if value >= self.best_obj:
+                        self.best, self.best_obj = groups, value
+                elif not self.cuts:
+                    self.cuts, self.detached = _joint_new_connectivity_cuts(
+                        groups, root_rows, nb, u, self.BooleanValue, seen, cut_limit - rows)
+                if self.cuts:
+                    # Multiworker search can deliver another incumbent during
+                    # shutdown. Keep any valid improvement, but don't replace
+                    # the first useful batch or mutate the model in a callback.
+                    self.StopSearch()
+
+        discovery = CutDiscovery() if stop_on_new_cuts else None
 
         def watch():
             while not done.wait(.1):
@@ -8296,17 +8449,26 @@ def _joint_connectivity_cut_pass(model, x, root_rows, nb, u,
         watcher = threading.Thread(target=watch, daemon=True)
         watcher.start()
         try:
-            status = scout.Solve(model)
+            status = scout.Solve(model, discovery) if discovery is not None else scout.Solve(model)
         finally:
             done.set()
             watcher.join()
         rounds = round_number
         status_name = interrupted[0] if interrupted else scout.StatusName(status)
+        round_end = (interrupted[0] if interrupted else
+                     "NEW_CONNECTIVITY_CUTS" if discovery is not None and discovery.cuts else
+                     "SOLVER_RETURNED")
+        if discovery is not None and discovery.best is not None and discovery.best_obj >= best_obj:
+            best, best_obj = discovery.best, discovery.best_obj
+            if objective is not None:
+                model.Add(objective >= best_obj)
+            if report is not None:
+                report([i for unit in best for i in unit], best_obj)
         if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
             if bound_stall_only and status == cp_model.UNKNOWN and not interrupted:
                 bound = scout.BestObjectiveBound()
                 if (objective is not None and math.isfinite(bound)
-                        and best_obj <= bound < 2**53):
+                        and max(best_obj, objective_floor or 0) <= bound < 2**53):
                     candidate_bound = math.ceil(bound)
                     if upper_bound is None or candidate_bound < upper_bound:
                         upper_bound = candidate_bound
@@ -8314,7 +8476,7 @@ def _joint_connectivity_cut_pass(model, x, root_rows, nb, u,
                 stalled = bound_stall.observe(upper_bound)
                 if log:
                     _stage_print(f'[STAGE] {stage_prefix}_CUT_ROUND round={round_number} '
-                                 f'status={status_name} upper_bound={upper_bound} '
+                                 f'status={status_name} round_end={round_end} upper_bound={upper_bound} '
                                  f'upper_bound_stall={bound_stall.rounds}/{upper_bound_stall_rounds}',
                                  flush=True)
                 if not stalled:
@@ -8368,35 +8530,28 @@ def _joint_connectivity_cut_pass(model, x, root_rows, nb, u,
             # flow model and also matches its best possible objective.
             proved_connected_optimal = True
         added, detached = 0, 0
-        if not connected and not interrupted:
-            for k, unit in enumerate(groups):
-                mask = np.zeros(len(nb), dtype=bool)
-                mask[unit] = True
-                components = _connected_components(nb, mask)
-                if len(components) <= 1:
+        if not interrupted:
+            cuts = []
+            if discovery is not None and discovery.cuts:
+                cuts, detached = discovery.cuts, discovery.detached
+            elif not connected:
+                cuts, detached = _joint_new_connectivity_cuts(
+                    groups, root_rows, nb, u, scout.BooleanValue, seen, cut_limit - rows)
+            for k, target, region, boundary in cuts:
+                key = (k, target, region)
+                if key in seen or rows >= cut_limit:
                     continue
-                detached += len(components) - 1
-                for component in components:
-                    if any(scout.BooleanValue(root_rows[k][v]) for v in component):
-                        continue
-                    region = tuple(sorted(component))
-                    boundary = sorted({w for v in region for w in nb[v]} - set(region))
-                    for target in sorted(region, key=lambda v: (-int(u[v]), v))[:3]:
-                        key = (k, target, region)
-                        if key in seen or rows >= cut_limit:
-                            continue
-                        seen.add(key)
-                        model.Add(x[k][target] <= sum(root_rows[k][v] for v in region)
-                                  + sum(x[k][v] for v in boundary))
-                        rows += 1
-                        added += 1
-                        if cached is not None:
-                            stored += int(cut_cache.remember(
-                                cached, global_nodes[target],
-                                [global_nodes[v] for v in region]))
+                seen.add(key)
+                model.Add(x[k][target] <= sum(root_rows[k][v] for v in region)
+                          + sum(x[k][v] for v in boundary))
+                rows += 1
+                added += 1
+                if cached is not None:
+                    stored += int(cut_cache.remember(
+                        cached, global_nodes[target], [global_nodes[v] for v in region]))
         if log:
             _stage_print(f"[STAGE] {stage_prefix}_CUT_ROUND round={round_number} "
-                  f"status={status_name} relaxed_unemp={value} connected={connected} "
+                  f"status={status_name} round_end={round_end} relaxed_unemp={value} connected={connected} "
                   f"detached_components={detached} cuts_added={added} cuts_total={rows} "
                   f"valid_unemp={best_obj} upper_bound={upper_bound} "
                   f"upper_bound_stall={bound_stall.rounds}/{upper_bound_stall_rounds} "
@@ -9240,7 +9395,8 @@ def _solve_regional_exchange(units, nodes, nb, u, E, P, tau, pop_thresh,
             valid_local_candidate, time.monotonic() + min(180, .15 * remaining),
             workers, cancellation, log=log, report=incumbent_report_callback,
             stage_prefix=stage_prefix, objective=objective,
-            cut_cache=cut_cache, global_nodes=nodes, proof_out=cut_proof)
+            cut_cache=cut_cache, global_nodes=nodes, proof_out=cut_proof,
+            stop_on_new_cuts=True)
         proved_by_cuts = bool(cut_proof and cut_proof[0])
         if (best_obj >= baseline and (best_obj > incumbent_baseline or
                 (proved_by_cuts and allow_seed_consolidation
@@ -9797,25 +9953,25 @@ def solve_asu_graph_cut_only(
         Sequence[Tuple[Sequence[int], Sequence[int]]]
     ] = None,
     initial_components: Optional[Sequence[Sequence[int]]] = None,
-    stall_rounds: Optional[int] = 5,
+    stall_rounds: Optional[int] = 10,
 ) -> Optional["CpsatResult"]:
     """
     Standalone ASU solver that enforces connectivity through iterative
     constraint-generation vertex-separator cuts -- no exact flow-based
     connectivity phase at all. Unlike the cut pre-pass inside
-    `solve_one_asu_cpsat`, there is no round cap: each round either adds
-    representative separator cuts for components disconnected from the root
-    are disconnected from the root, or (once a connected candidate is found)
-    tightens the objective floor to strictly require a better one next round.
+    `solve_one_asu_cpsat`, there is no round cap: each round adds representative
+    separator cuts for components disconnected from the root or (once a
+    connected candidate is found) tightens the objective floor to strictly
+    require a better one next round. Each scout gets at most ten seconds so
+    cut generation cannot spend the entire budget in its first round.
+
     The loop stops when the model goes INFEASIBLE (the current incumbent is
     then provably optimal), when `time_limit` is exhausted, or -- unless
-    `stall_rounds` is `None` -- once `stall_rounds` consecutive DISCONNECTED
-    rounds pass without the cut components shrinking (the smallest
-    disconnected-component count seen since the last incumbent improvement).
-    A stall only ends the search early; whatever `best_connected` incumbent
-    was already found is still returned. Intended to be run against a
-    connectivity-free relaxation's selection/bound/cuts as a completely
-    graph-cut repair path used while preparing a window hint.
+    `stall_rounds` is `None` -- once the solver's proven objective
+    upper bound has failed to improve for that many consecutive rounds. This
+    matches the partitioning cut pass: disconnected incumbent values never
+    substitute for a proof bound, and only a new minimum resets the stall
+    counter. Whatever connected incumbent was already found is still returned.
     """
     N = len(nb_local)
     if N == 0:
@@ -9943,8 +10099,11 @@ def solve_asu_graph_cut_only(
     cut_round = 0
     status_name = "FEASIBLE"
     pending_expand: List[set] = initial_pending
-    best_num_components: Optional[int] = None
-    stall_count = 0
+    upper_bound = int(objective_upper_bound) if objective_upper_bound is not None else None
+    bound_stall = _UpperBoundStall(stall_rounds)
+    if upper_bound is not None:
+        bound_stall.observe(upper_bound)
+    stop_reason: Optional[str] = None
     root_distances = _root_graph_distances(nb_local, root_local)
     separator_attempts = 0
     separator_accepted = 0
@@ -10028,6 +10187,7 @@ def solve_asu_graph_cut_only(
     while True:
         remaining = float(time_limit) - (time.monotonic() - start_time)
         if remaining <= 0:
+            stop_reason = "TIME_LIMIT"
             break
 
         if pending_expand:
@@ -10046,7 +10206,7 @@ def solve_asu_graph_cut_only(
 
         solver = cp_model.CpSolver()
         solver.parameters.num_search_workers = max(1, int(workers))
-        solver.parameters.max_time_in_seconds = remaining
+        solver.parameters.max_time_in_seconds = min(10.0, remaining)
         solver.parameters.log_search_progress = False
         solver.parameters.cp_model_presolve = True
         solver.parameters.linearization_level = 2
@@ -10054,15 +10214,53 @@ def solve_asu_graph_cut_only(
 
         progress = _GraphCutProgress(log, cut_round, start_time)
         status = solver.Solve(model, progress)
+        status_name = solver.StatusName(status)
         if status == cp_model.INFEASIBLE:
             # The last objective floor bump can't be beaten -- best_connected is optimal.
             status_name = "OPTIMAL"
+            stop_reason = "PROVED_OPTIMAL"
             break
         if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-            break
+            if status != cp_model.UNKNOWN:
+                stop_reason = status_name
+                break
+            raw_bound = solver.BestObjectiveBound()
+            if (best_obj >= 0 and math.isfinite(raw_bound)
+                    and best_obj <= raw_bound < 2**53):
+                candidate_bound = math.ceil(raw_bound)
+                if upper_bound is None or candidate_bound < upper_bound:
+                    upper_bound = candidate_bound
+                    model.Add(obj_expr <= upper_bound)
+            stalled = bound_stall.observe(upper_bound)
+            if log:
+                print(
+                    f"  [graph-cut] round {cut_round}: status={status_name}, "
+                    f"upper_bound={bound_stall.best}, "
+                    f"upper_bound_stall={bound_stall.rounds}/{stall_rounds}",
+                    flush=True,
+                )
+            cut_round += 1
+            if stalled:
+                stop_reason = "UPPER_BOUND_STALL"
+                break
+            continue
 
         selected = [i for i in range(N) if solver.BooleanValue(x[i])]
         selected_set = set(selected)
+        relaxed_value = int(u_g[selected].sum())
+        raw_bound = solver.BestObjectiveBound()
+        if (math.isfinite(raw_bound)
+                and max(relaxed_value, best_obj) <= raw_bound < 2**53):
+            candidate_bound = math.ceil(raw_bound)
+            if upper_bound is None or candidate_bound < upper_bound:
+                upper_bound = candidate_bound
+                model.Add(obj_expr <= upper_bound)
+        stalled = bound_stall.observe(upper_bound)
+        if (best_connected is not None and upper_bound is not None
+                and best_obj >= upper_bound):
+            status_name = "OPTIMAL"
+            stop_reason = "PROVED_OPTIMAL"
+            break
         selected_mask = np.zeros(N, dtype=bool)
         selected_mask[selected] = True
         # One igraph call replaces the old two-pass root-BFS + unseen-BFS: it
@@ -10074,47 +10272,28 @@ def solve_asu_graph_cut_only(
 
         if len(root_component) == len(selected):
             best_connected = selected
-            best_obj = int(round(solver.ObjectiveValue()))
+            best_obj = relaxed_value
             pending_expand = []
-            best_num_components = None
-            stall_count = 0
             if log:
                 print(
                     f"  [graph-cut] round {cut_round}: CONNECTED, unemp={best_obj}, "
+                    f"upper_bound={bound_stall.best}, "
+                    f"upper_bound_stall={bound_stall.rounds}/{stall_rounds}, "
                     f"elapsed={time.monotonic() - start_time:.1f}s",
                     flush=True,
                 )
-            if status == cp_model.OPTIMAL:
+            if status == cp_model.OPTIMAL or (
+                    upper_bound is not None and best_obj >= upper_bound):
                 status_name = "OPTIMAL"
+                stop_reason = "PROVED_OPTIMAL"
                 break
             # Force next round to beat this incumbent or prove it's optimal.
             model.Add(obj_expr >= best_obj + 1)
             cut_round += 1
+            if stalled:
+                stop_reason = "UPPER_BOUND_STALL"
+                break
             continue
-
-        # A disconnected result can't be the answer, but its components can
-        # often be corridor-connected into a real (if suboptimal) feasible
-        # ASU right now -- reuse the same repair used elsewhere, and treat it
-        # like a connected round if it beats the current incumbent.
-        repair_fallback = best_connected if best_connected is not None else sorted(forced_set)
-        repaired = repair_connectivity_free_selection(
-            selected, repair_fallback, nb_local, u_g, E_g, P_g, tau, pop_thresh, root_local,
-            forced_selected=sorted(forced_set), log=log,
-            deadline=start_time + float(time_limit),
-        )
-        if component_ok(repaired, u_g, E_g, P_g, tau, pop_thresh, nb_local):
-            repaired_obj = int(u_g[repaired].sum())
-            if repaired_obj > best_obj:
-                best_connected = repaired
-                best_obj = repaired_obj
-                if log:
-                    print(
-                        f"  [graph-cut] round {cut_round}: repaired disconnected "
-                        f"candidate -> CONNECTED unemp={best_obj}, "
-                        f"elapsed={time.monotonic() - start_time:.1f}s",
-                        flush=True,
-                    )
-                model.Add(obj_expr >= best_obj + 1)
 
         components: List[set] = [set(c) for c in all_components if root_local not in c]
         round_cuts_added = 0
@@ -10165,28 +10344,20 @@ def solve_asu_graph_cut_only(
         # to absorb, and most likely for a CP-SAT-guided swap to succeed.
         # Ties (equal tract count) break toward the smallest unemployment.
         pending_expand = sorted(components, key=_component_key)
-        if best_num_components is None or num_components < best_num_components:
-            best_num_components = num_components
-            stall_count = 0
-        else:
-            stall_count += 1
         if log:
             best_text = str(best_obj) if best_obj >= 0 else "none"
             print(
                 f"  [graph-cut] round {cut_round}: DISCONNECTED "
                 f"({num_components} component(s), {round_cuts_added} cut(s) added), "
                 f"best_connected so far={best_text}, "
+                f"upper_bound={bound_stall.best}, "
+                f"upper_bound_stall={bound_stall.rounds}/{stall_rounds}, "
                 f"elapsed={time.monotonic() - start_time:.1f}s",
                 flush=True,
             )
         cut_round += 1
-        if stall_rounds is not None and stall_count >= stall_rounds:
-            if log:
-                print(
-                    f"  [graph-cut] stalled: component count hasn't improved in "
-                    f"{stall_count} round(s); stopping early",
-                    flush=True,
-                )
+        if stalled:
+            stop_reason = "UPPER_BOUND_STALL"
             break
 
     if log:
@@ -10195,7 +10366,8 @@ def solve_asu_graph_cut_only(
         print(
             f"  graph-cut-only solve: {cut_round} round(s), {elapsed:.1f}s, "
             f"status={status_name if best_connected is not None else 'INFEASIBLE'}, "
-            f"best unemp={obj_text}; separator attempts={separator_attempts}, "
+            f"best unemp={obj_text}, upper_bound={bound_stall.best}, "
+            f"stop_reason={stop_reason}; separator attempts={separator_attempts}, "
             f"accepted={separator_accepted}, duplicates={separator_duplicates}, "
             f"dominated={separator_dominated}, superseded={separator_superseded}, "
             f"fallback={fallback_clauses}",
@@ -10366,7 +10538,8 @@ def _prepare_window_hint(
                         if True
                     ]
 
-                if use_connectivity_free_repair and not connectivity_free_standalone_asus:
+                if (use_connectivity_free_repair and not use_graph_cut_repair
+                        and not connectivity_free_standalone_asus):
                     fallback = best["hint_improved"] if best["hint_valid"] else []
                     num_cf, den_cf = as_fraction_tau(tau)
                     slack_cf = (
@@ -10430,10 +10603,9 @@ def _prepare_window_hint(
                         }
                         hint_source = "connectivity_free_repair"
 
-                # Separate experiment: re-optimize via lazy vertex-separator
-                # cuts alone (no flow phase), seeded from this same relaxation.
-                # Independent of repair_connectivity_free_selection above --
-                # does not consume or alter its output.
+                # Re-optimize via lazy vertex-separator cuts alone (no flow
+                # phase), seeded from this same relaxation. When enabled, this
+                # is the alternative to connectivity-free heuristic repair.
                 best_graph_cut: Optional[List[int]] = None
                 # Once harvest has already carved off independently-feasible
                 # standalone ASUs from this relaxation, each one is expanded
@@ -10728,6 +10900,383 @@ def _export_window_comparison(
     print(f"  [EXPORT] {path}", flush=True)
 
 
+_ASU_SPLIT_MAX_CHILDREN = 3
+
+
+def _split_bottleneck_hint(nb, parent, u, max_children, cancellation):
+    """Suggest lobes around cheap articulation/corridor removals, never fix them.
+
+    The bounded two-tract search includes adjacent low-degree pairs (e.g. a
+    two-tract-wide ladder neck). These are graph bottlenecks, not geometric
+    width measurements. Missing a bottleneck cannot exclude a feasible split.
+    """
+    mask = np.zeros(len(nb), dtype=bool)
+    mask[parent] = True
+    parent_set = set(parent)
+    separators = {(v,) for v in _articulation_points(nb, mask)}
+    degree = {v: sum(w in parent_set for w in nb[v]) for v in parent}
+    separators.update(tuple(sorted((v, w))) for v in parent for w in nb[v]
+                      if w in parent_set and v < w and degree[v] <= 3 and degree[w] <= 3)
+    candidates = sorted(separators, key=lambda s: (sum(int(u[v]) for v in s), len(s), s))[:64]
+    best, best_separator, best_score = [], [], None
+    for separator in candidates:
+        if cancellation():
+            break
+        retained = mask.copy()
+        retained[list(separator)] = False
+        parts = _connected_components(nb, retained)
+        if len(parts) < 2:
+            continue
+        parts.sort(key=lambda unit: (-int(u[unit].sum()), min(unit)))
+        parts = parts[:max_children]
+        values = [int(u[unit].sum()) for unit in parts]
+        score = (sum(values), values[1], -len(separator))
+        if best_score is None or score > best_score:
+            best, best_separator, best_score = parts, list(separator), score
+    return best, best_separator
+
+
+def _valid_asu_split(groups, parent, allowed, nb, u, E, P, tau, pop_thresh):
+    """Independent acceptance gate: gain, anchored children, and no contacts."""
+    children = [list(unit) for unit in groups if len(unit)]
+    if len(children) < 2:
+        return False
+    parent_set, allowed_set = set(parent), set(allowed)
+    owners = {}
+    for k, unit in enumerate(children):
+        if (not parent_set.intersection(unit) or not set(unit).issubset(allowed_set)
+                or not component_ok(unit, u, E, P, tau, pop_thresh, nb)):
+            return False
+        for v in unit:
+            if v in owners:
+                return False
+            owners[v] = k
+    if any(w in owners and owners[w] != k
+           for v, k in owners.items() for w in nb[v]):
+        return False
+    return sum(int(u[unit].sum()) for unit in children) > int(u[parent].sum())
+
+
+def _solve_asu_split(parent, nodes, nb, u, E, P, tau, pop_thresh,
+                     seconds, workers, max_children, *, cancellation=lambda: None,
+                     log=False, rel_gap=None, incumbent_stall_seconds=None):
+    """Joint separated children, flow-free cut rounds first, exact flows second.
+
+    Every active child contains a parent tract; none are mandatory. The
+    original parent is kept by the caller unless a strictly better valid split
+    is returned. Other-ASU buffers must already be excluded from nodes.
+    Full-graph separator rows and optimistic population/rate bounds tighten
+    the model before its first cut round; both remain in the exact flow model.
+    Each round may finish as soon as an incumbent exposes new connectivity
+    cuts, rather than proving the disconnected relaxation optimal first.
+    """
+    reason = cancellation()
+    if reason or seconds <= 0:
+        return [], reason or "DISABLED"
+    local = {v: i for i, v in enumerate(nodes)}
+    anchors = sorted(local[v] for v in parent if v in local)
+    n = len(nodes)
+    lu, le, lp = u[nodes], E[nodes], P[nodes]
+    baseline = int(u[parent].sum())
+    slots = min(_ASU_SPLIT_MAX_CHILDREN, int(max_children), len(anchors))
+    if pop_thresh > 0:
+        slots = min(slots, sum(max(0, int(p)) for p in lp) // int(pop_thresh))
+    if slots < 2 or int(lu.sum()) <= baseline:
+        return [], "NO_SPLIT_CAPACITY"
+    local_nb = [[local[w] for w in nb[v] if w in local] for v in nodes]
+    edges = [(i, j) for i, row in enumerate(local_nb) for j in row if i < j]
+
+    # Every qualifying child AND their disjoint union satisfy the exact rate
+    # row. Relaxing connectivity, separation and population therefore gives
+    # safe (optimistic) cardinality/objective caps, never forced expansions.
+    num, den = as_fraction_tau(tau)
+    q = den * lu.astype(np.int64) - num * le.astype(np.int64)
+    minimum_count = _joint_minimum_tract_count(lp, pop_thresh)
+    total_bound, deficit_indices, deficit_bound = _surplus_knapsack_bounds(q, set(), n)
+    total_bound = 0 if total_bound is None else total_bound
+    slots = min(slots, total_bound // minimum_count)
+    joint_bound, joint_conditionals = _rate_count_objective_bounds(lu, q, total_bound)
+    if slots < 2 or joint_bound <= baseline:
+        if log:
+            _stage_print(f"[STAGE] ASU_SPLIT_ECONOMIC_SCREEN status=INFEASIBLE "
+                         f"child_slots={slots} minimum_child_tracts={minimum_count} "
+                         f"total_tract_bound={total_bound} upper_bound={joint_bound} "
+                         f"parent_unemp={baseline}", flush=True)
+        return [], "INFEASIBLE"
+    # At least one other child must retain enough tracts to qualify. The
+    # active-count rows below reserve more when three children are selected.
+    group_bound = total_bound - minimum_count
+    group_objective_bound, group_conditionals = _rate_count_objective_bounds(lu, q, group_bound)
+    reason = cancellation()
+    if reason:
+        return [], reason
+    # Parent-only articulation points may have bypasses through unassigned
+    # tracts. Use the FULL eligible graph and root-independent separators.
+    # Bound work by attempts/patterns, not wall time; Stop/Skip remains active.
+    separator_cuts = _joint_small_separator_cuts(
+        local_nb, lu, q, [anchors], math.inf, cancellation,
+        limit=128, target_limit=128)
+    reason = cancellation()
+    if reason:
+        return [], reason
+    model = cp_model.CpModel()
+    x = [[model.NewBoolVar(f"split_{k}_{i}") for i in range(n)] for k in range(slots)]
+    selected = [model.NewBoolVar(f"split_selected_{i}") for i in range(n)]
+    for i in range(n):
+        model.Add(sum(row[i] for row in x) == selected[i])
+    # Selected neighbors must have the SAME owner. Thus different children
+    # are separated by unassigned tracts, including corner/queen contacts.
+    for i, j in edges:
+        for row in x:
+            model.Add(row[i] + selected[j] - row[j] <= 1)
+    active, roots, counts, root_indices = [], [], [], []
+    group_objectives = []
+    anchor_set = set(anchors)
+    for k, row in enumerate(x):
+        if cancellation():
+            return [], cancellation()
+        on = model.NewBoolVar(f"split_active_{k}")
+        root = [model.NewBoolVar(f"split_root_{k}_{i}") for i in range(n)]
+        count = model.NewIntVar(0, group_bound, f"split_count_{k}")
+        model.Add(sum(root) == on)
+        model.Add(count == sum(row))
+        model.Add(count >= minimum_count * on)
+        model.Add(count <= group_bound * on)
+        for i in range(n):
+            model.Add(row[i] <= on)
+            model.Add(root[i] <= row[i])
+            if i not in anchor_set:
+                model.Add(root[i] == 0)
+        # Root at the smallest selected parent tract; order interchangeable
+        # child slots by that root, without restricting their memberships.
+        prefix = 0
+        for i in anchors:
+            next_prefix = model.NewBoolVar(f"split_root_prefix_{k}_{i}")
+            model.Add(next_prefix == prefix + root[i])
+            model.Add(row[i] <= next_prefix)
+            prefix = next_prefix
+        root_index = sum((i + 1) * root[i] for i in anchors)
+        if k:
+            model.Add(active[-1] >= on)
+            model.Add(root_indices[-1] < root_index).OnlyEnforceIf(on)
+        _add_asu_feasibility_constraints(model, row, lu, le, lp, tau, pop_thresh, active=on)
+        group_objective = model.NewIntVar(0, group_objective_bound, f"split_child_unemployment_{k}")
+        model.Add(group_objective == sum(int(lu[i]) * row[i] for i in range(n)))
+        model.Add(group_objective <= group_objective_bound * on)
+        for i, bound in enumerate(group_conditionals):
+            if bound < 0:
+                model.Add(row[i] == 0)
+            elif bound < group_objective_bound:
+                model.Add(group_objective <= group_objective_bound
+                          - (group_objective_bound - bound) * row[i])
+        if deficit_bound < len(deficit_indices):
+            model.Add(sum(row[i] for i in deficit_indices) <= deficit_bound * on)
+        for a, b, separator in separator_cuts:
+            model.Add(row[a] + row[b] <= 1 + sum(row[v] for v in separator))
+        active.append(on)
+        roots.append(root)
+        counts.append(count)
+        root_indices.append(root_index)
+        group_objectives.append(group_objective)
+    model.Add(sum(active) >= 2)
+    model.Add(sum(selected) <= total_bound)
+    if deficit_bound < len(deficit_indices):
+        model.Add(sum(selected[i] for i in deficit_indices) <= deficit_bound)
+    for on, count in zip(active, counts):
+        model.Add(count + minimum_count * (sum(active) - on) <= total_bound)
+    for child_count in range(2, slots + 1):
+        # Each tract is used at most once; a larger total population target
+        # may require more tracts than child_count * minimum_count.
+        union_minimum = _joint_minimum_tract_count(lp, child_count * int(pop_thresh))
+        model.Add(sum(selected) >= union_minimum * active[child_count - 1])
+    objective = model.NewIntVar(baseline + 1, joint_bound, "split_unemployment")
+    model.Add(objective == sum(group_objectives))
+    for i, bound in enumerate(joint_conditionals):
+        if bound <= baseline:
+            model.Add(selected[i] == 0)
+        elif bound < joint_bound:
+            model.Add(objective <= joint_bound - (joint_bound - bound) * selected[i])
+    model.Maximize(objective)
+
+    hinted, separator = _split_bottleneck_hint(local_nb, anchors, lu, slots, cancellation)
+    if hinted:
+        hinted.sort(key=min)
+        for k, row in enumerate(x):
+            part = set(hinted[k]) if k < len(hinted) else set()
+            # Partial suggestions only: free tracts and all other variables
+            # remain open so the solver can expand or replace these lobes.
+            for i in anchors:
+                model.AddHint(row[i], int(i in part))
+    if log:
+        _stage_print(f"[STAGE] ASU_SPLIT_TIGHTENING "
+                     f"separator_patterns={len(separator_cuts)} separator_rows={slots * len(separator_cuts)} "
+                     f"minimum_child_tracts={minimum_count} total_tract_bound={total_bound} "
+                     f"child_tract_bound={group_bound} deficit_tract_bound={deficit_bound} "
+                     f"upper_bound={joint_bound} child_upper_bound={group_objective_bound} "
+                     f"excluded_by_gain_bound={sum(b <= baseline for b in joint_conditionals)}",
+                     flush=True)
+        _stage_print(f"[STAGE] ASU_SPLIT_MODEL parent_unemp={baseline} "
+                     f"tracts={n} child_slots={slots} bottleneck_hint_lobes={len(hinted)} "
+                     f"hint_separator={[nodes[i] for i in separator]}", flush=True)
+
+    def valid(groups):
+        mapped = [[nodes[i] for i in unit] for unit in groups]
+        return _valid_asu_split(mapped, parent, nodes, nb, u, E, P, tau, pop_thresh)
+
+    proof = []
+    best, best_value, status_name = _joint_connectivity_cut_pass(
+        model, x, roots, local_nb, lu, [], valid, math.inf, workers,
+        cancellation, log=log, max_rounds=25, cut_limit=math.inf,
+        upper_bound_stall_rounds=10, stage_prefix="ASU_SPLIT",
+        objective=objective, objective_floor=baseline + 1,
+        proof_out=proof, bound_stall_only=True, round_seconds=None, stop_on_new_cuts=True)
+
+    def result():
+        return [[nodes[i] for i in unit] for unit in best if unit]
+
+    reason = cancellation()
+    if reason or proof == [True] or status_name in ("INFEASIBLE", "MODEL_INVALID"):
+        return result(), reason or status_name
+    if best:
+        model.Add(objective >= best_value)
+        model.ClearHints()
+        for row, unit in zip(x, best):
+            members = set(unit)
+            for i, var in enumerate(row):
+                model.AddHint(var, int(i in members))
+    # Extend the SAME model: all cuts and its best bound carry into exact flow.
+    for k, row in enumerate(x):
+        if cancellation():
+            return result(), cancellation()
+        net = [[] for _ in nodes]
+        for edge_index, (i, j) in enumerate(edges):
+            if edge_index % 256 == 0 and cancellation():
+                return result(), cancellation()
+            flow = model.NewIntVar(-(group_bound - 1), group_bound - 1, f"split_flow_{k}_{i}_{j}")
+            for endpoint in (i, j):
+                model.Add(flow <= (group_bound - 1) * row[endpoint])
+                model.Add(flow >= -(group_bound - 1) * row[endpoint])
+            net[i].append(flow)
+            net[j].append(-flow)
+        for i in range(n):
+            injected = model.NewIntVar(0, group_bound, f"split_injected_{k}_{i}")
+            model.Add(injected <= group_bound * roots[k][i])
+            model.Add(injected <= counts[k])
+            model.Add(injected >= counts[k] - group_bound * (1 - roots[k][i]))
+            model.Add(sum(net[i]) == injected - row[i])
+    exact = cp_model.CpSolver()
+    exact.parameters.max_time_in_seconds = float(seconds)
+    exact.parameters.num_search_workers = max(1, int(workers))
+    exact.parameters.log_search_progress = bool(log)
+    _configure_asu_solver_portfolio(exact.parameters, workers)
+    if rel_gap is not None:
+        exact.parameters.relative_gap_limit = float(rel_gap)
+    last_improvement = time.monotonic()
+
+    class Incumbent(cp_model.CpSolverSolutionCallback):
+        def on_solution_callback(self):
+            nonlocal best, best_value, last_improvement
+            groups = [[i for i, var in enumerate(row) if self.BooleanValue(var)] for row in x]
+            value = sum(int(lu[unit].sum()) for unit in groups)
+            if value > best_value and valid(groups):
+                best, best_value = groups, value
+                last_improvement = time.monotonic()
+
+    done, interrupted = threading.Event(), []
+
+    def watch():
+        while not done.wait(.1):
+            reason = cancellation()
+            if (not reason and incumbent_stall_seconds
+                    and time.monotonic() - last_improvement >= incumbent_stall_seconds):
+                reason = "INCUMBENT_STALL"
+            if reason:
+                interrupted.append(reason)
+                exact.StopSearch()
+                return
+
+    if log:
+        _stage_print(f"[STAGE] ASU_SPLIT_FLOW time_limit={seconds}s "
+                     f"baseline_unemp={baseline} valid_split_unemp={best_value}", flush=True)
+    watcher = threading.Thread(target=watch, daemon=True)
+    watcher.start()
+    try:
+        status = exact.Solve(model, Incumbent())
+    finally:
+        done.set()
+        watcher.join()
+    return result(), interrupted[0] if interrupted else exact.StatusName(status)
+
+
+def _split_warm_start_asus(ids, nb, u, E, P, tau, pop_thresh, max_asus,
+                            seconds, workers, *, stop_path=None, skip_path=None,
+                            log=False, rel_gap=None, incumbent_stall_seconds=None,
+                            publish=None):
+    """Try imported parents once, highest unemployment first; commit atomically."""
+    ids = np.asarray(ids, dtype=int).copy()
+    labels = np.unique(ids[ids > 0]).tolist()
+    queue = sorted(labels, key=lambda label: (-int(u[ids == label].sum()), label))
+    next_id, attempts = max(labels, default=0) + 1, []
+
+    def cancellation():
+        if _stop_requested(stop_path):
+            return "STOPPED"
+        if _stop_requested(skip_path):
+            return "SKIPPED"
+        return None
+
+    for label in queue:
+        if _stop_requested(stop_path):
+            break
+        slots = min(_ASU_SPLIT_MAX_CHILDREN,
+                    int(max_asus) - len(np.unique(ids[ids > 0])) + 1)
+        if slots < 2:
+            if log:
+                _stage_print("[STAGE] ASU_SPLIT_CAPACITY no free ASU slots; "
+                             "increase Max ASUs to allow a split", flush=True)
+            break
+        parent = np.flatnonzero(ids == label).tolist()
+        other = set(np.flatnonzero((ids > 0) & (ids != label)).tolist())
+        blocked = other | {w for v in other for w in nb[v]}
+        allowed = np.array([v not in blocked for v in range(len(nb))], dtype=bool)
+        # Only components containing a usable parent tract can host a child.
+        parent_set = set(parent)
+        nodes = sorted(v for part in _connected_components(nb, allowed)
+                       if parent_set.intersection(part) for v in part)
+        baseline = int(u[parent].sum())
+        if publish:
+            publish(ids, "ASU_SPLIT_START", parent)
+        if log:
+            _stage_print(f"[STAGE] ASU_SPLIT_START parent={label} parent_unemp={baseline} "
+                         f"available_tracts={len(nodes)}", flush=True)
+        groups, status = _solve_asu_split(
+            parent, nodes, nb, u, E, P, tau, pop_thresh, seconds, workers, slots,
+            cancellation=cancellation, log=log, rel_gap=rel_gap,
+            incumbent_stall_seconds=incumbent_stall_seconds)
+        if status == "SKIPPED" or _stop_requested(skip_path):
+            _consume_flag(skip_path)
+        accepted = (len([unit for unit in groups if len(unit)]) <= slots
+                    and _valid_asu_split(groups, parent, nodes, nb, u, E, P, tau, pop_thresh))
+        gain = 0
+        if accepted:
+            children = sorted((list(unit) for unit in groups if len(unit)),
+                              key=lambda unit: (-int(u[unit].sum()), min(unit)))
+            gain = sum(int(u[unit].sum()) for unit in children) - baseline
+            ids[parent] = -1
+            for k, unit in enumerate(children):
+                ids[unit] = label if k == 0 else next_id
+                if k:
+                    next_id += 1
+        attempts.append(dict(parent=int(label), baseline_unemp=baseline,
+                             status=status, accepted=bool(accepted), gain=gain))
+        if publish:
+            publish(ids, "ASU_SPLIT_ACCEPTED" if accepted else "ASU_SPLIT_RETAINED", [])
+        if log:
+            _stage_print(f"[STAGE] ASU_SPLIT_COMPLETE parent={label} status={status} "
+                         f"accepted={accepted} gain={gain}", flush=True)
+    return ids, attempts
+
+
 def _validate_initial_asu_id(values, nb, u, E, P, tau, pop_thresh, max_asus,
                              ):
     """Validate already aligned warm-start assignments, then compact labels.
@@ -10824,6 +11373,7 @@ def build_many_asus_cpsat(
     expansion_incumbent_stall_seconds: Optional[float] = None,
     final_consolidation: bool = True,
     polish_consolidated_asus: bool = False,
+    split_warm_start: bool = False,
 ) -> Dict[str, np.ndarray]:
     """
     Build ASUs in batches of up to `parallel_asus` disjoint candidate windows, solved
@@ -10916,8 +11466,21 @@ def build_many_asus_cpsat(
     `initial_asu_id` supplies one saved assignment per current dataframe row.
     Every positive group is validated before use; 0/-1 mean unassigned. IDs
     are compacted and imported groups count toward max_asus. The dashboard
-    aligns RDS files by GEOID before supplying this vector; both strategies
+    aligns RDS files by GEOID before supplying this vector; all strategies
     resume from those validated assignments.
+
+    `split_warm_start` instead tries each imported parent once, highest captured
+    unemployment first. Joint children may release parent tracts and use
+    unassigned tracts, but each must overlap its parent, qualify independently,
+    and avoid touching any other ASU. Only strict combined unemployment gains
+    replace a parent. Each split has two or three children; Max ASUs also caps
+    the total across all parents. Articulation/corridor hints are
+    optional suggestions, not restrictions. An untimed 25-round/5-bound-stall
+    cut pass precedes the exact joint flow solve (time_limit per parent).
+    No build, merge, takeover, polish, or residual-addition stages follow.
+    Before cut solving, full-graph separators and optimistic population/rate
+    cardinality and objective bounds tighten each child and the disjoint union.
+    Conditional bounds exclude only proven-impossible improving assignments.
 
     `skip_flag_path` similarly halts only the in-flight window(s) of the
     current batch -- the flag is consumed on detection -- so the (partial)
@@ -11084,6 +11647,27 @@ def build_many_asus_cpsat(
                 )
 
     _emit_progress("INIT")
+
+    if split_warm_start:
+        if not initial_units:
+            raise ValueError("Split saved ASUs requires a nonempty validated warm start")
+
+        def publish_split(values, phase, exploring):
+            nonlocal asu_id
+            asu_id = np.asarray(values, dtype=int).copy()
+            _emit_progress(phase, exploring_idx=exploring)
+
+        asu_id, attempts = _split_warm_start_asus(
+            asu_id, nb, u, E, P, tau, pop_thresh, max_asus, time_limit, workers,
+            stop_path=stop_flag_path, skip_path=skip_flag_path, log=verbose,
+            rel_gap=rel_gap, incumbent_stall_seconds=incumbent_stall_seconds,
+            publish=publish_split)
+        asu_id = _sequential_asu_ids(asu_id)
+        _emit_progress("DONE")
+        return {"asu_id": asu_id.tolist(),
+                "n_asu": int(np.unique(asu_id[asu_id > 0]).size),
+                "split_attempts": attempts,
+                "residual_check": {"status": "NOT_RUN_SPLIT_STRATEGY", "exhausted": False}}
 
     # Each concurrent territory keeps its own delta. Serialize aggregation and
     # publication together so a later writer cannot overwrite a newer preview.
@@ -13179,7 +13763,8 @@ def build_many_asus_cpsat(
     _emit_progress("PRE_POLISH")
     _run_final_polish()
 
-    # ---- Single-ASU full-visibility takeover pass ----
+    # ---- Partitioning-only single-ASU full-visibility takeover pass ----
+    # Legacy single-ASU runs skip this pass and proceed to the residual check.
     # After polish/merge settles, let the single biggest (by unemployment
     # captured) committed ASU re-solve against every tract in the state --
     # including tracts already claimed by OTHER ASUs, not just unassigned
@@ -13188,7 +13773,8 @@ def build_many_asus_cpsat(
     # with the takeover and all surviving ASUs fixed. The whole takeover is accepted only
     # if it strictly increases total unemployment captured across all
     # surviving ASUs; otherwise every assignment is left untouched.
-    if polish_time_limit > 0 and not _stop_requested(stop_flag_path):
+    if (harvest_connectivity_free_asus and polish_time_limit > 0
+            and not _stop_requested(stop_flag_path)):
         committed_ids_takeover = np.unique(asu_id[asu_id > 0]).astype(int).tolist()
         if committed_ids_takeover:
             big_asu_id = max(
@@ -13713,8 +14299,9 @@ def main():
         action="store_true",
         help=(
             "Re-optimize the connectivity-free relaxation using lazy "
-            "vertex-separator cuts only (no flow phase, no round cap); "
-            "independent of --use-connectivity-free-repair"
+            "vertex-separator cuts only (no flow phase), stopping after ten "
+            "rounds without a better proven upper bound; supersedes "
+            "--use-connectivity-free-repair"
         ),
     )
     ap.add_argument(

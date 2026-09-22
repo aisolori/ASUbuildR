@@ -120,9 +120,19 @@ class JointGraphCutsTest(unittest.TestCase):
             self.assertTrue(solver.component_ok(selected, np.array(u), np.array(emp),
                                                 np.array(pop), .2, 10000, nb))
         # A cut generated with the root on the RIGHT must still permit a root
-        # on the LEFT. This inspects the cut-only model, before its improved floor.
+        # on the LEFT. Isolate cut validity from the callback's verified
+        # incumbent floor, which legitimately excludes worse selections.
+        cut_only = templates[0].Clone()
+        objective_coeffs = dict(zip(cut_only.Proto().objective.vars,
+                                    [-c for c in cut_only.Proto().objective.coeffs]))
+        for row in cut_only.Proto().constraints:
+            if (dict(zip(row.linear.vars, row.linear.coeffs)) == objective_coeffs
+                    and list(row.linear.domain)[-1] == solver.cp_model.INT_MAX
+                    and row.linear.domain[0] > 0):
+                row.linear.domain.clear()
+                row.linear.domain.extend([0, solver.cp_model.INT_MAX])
         for group in ([0], [2], [3], [2, 3]):
-            self.assertEqual(self.check_assignment(templates[0], [group]), solver.cp_model.OPTIMAL)
+            self.assertEqual(self.check_assignment(cut_only, [group]), solver.cp_model.OPTIMAL)
         self.assertIn("connected=False", output.getvalue())
         self.assertIn("STATEWIDE_JOINT_FLOW", output.getvalue())
         self.assertIn("bound_carried_to_flow=True", output.getvalue())

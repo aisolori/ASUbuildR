@@ -101,7 +101,7 @@ class SupernodeCutCyclesTest(unittest.TestCase):
 
     def test_stalls_double_both_limits_and_preserve_state_and_deadline(self):
         result, cuts, flows, seen_ids, log = self.run_case()
-        self.assertEqual([(row[0], row[1]) for row in cuts], [(10, 5), (20, 10), (40, 20)])
+        self.assertEqual([(row[0], row[1]) for row in cuts], [(25, 10), (50, 20), (100, 40)])
         self.assertEqual(len({row[2] for row in cuts}), 1)
         self.assertEqual([row[3] for row in cuts], [[[0]], [[0, 1]], [[0, 1, 2]]])
         self.assertEqual([row[4] for row in cuts], [None, 30, 30])

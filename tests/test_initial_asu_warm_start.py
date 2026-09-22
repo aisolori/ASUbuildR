@@ -16,6 +16,51 @@ import asu_cpsat as solver
 
 
 class InitialAsuWarmStartTest(unittest.TestCase):
+    def test_legacy_skips_takeover_and_still_checks_residuals(self):
+        frame = pd.DataFrame({
+            "tract_ASU_unemp": [10, 0, 20],
+            "tract_ASU_emp": [0, 500, 0],
+            "tract_pop2024": [10000, 10000, 10000],
+        })
+        for partition in (False, True):
+            for merge in (False, True):
+                calls, output = [], io.StringIO()
+
+                def solve(**options):
+                    calls.append(options)
+                    return None  # Retain the existing valid ASUs.
+
+                with (
+                    self.subTest(partition=partition, merge=merge),
+                    patch.object(solver, "solve_one_asu_cpsat", side_effect=solve),
+                    patch.object(solver, "_solve_supernode_polish", side_effect=solve),
+                    patch.object(solver, "_search_unassigned_asu",
+                                 return_value=([], "INFEASIBLE")) as residual,
+                    patch.object(solver, "_repair_takeover_donor",
+                                 side_effect=AssertionError("unexpected donor repair")),
+                    contextlib.redirect_stdout(output),
+                ):
+                    result = solver.build_many_asus_cpsat(
+                        frame, [[1], [0, 2], [1]], .2, 10000,
+                        max_asus=2, initial_asu_id=[1, -1, 2],
+                        harvest_connectivity_free_asus=partition,
+                        final_asu_polish_time_limit=1, workers=1,
+                        merge_adjacent=merge, final_consolidation=False,
+                        verbose=True,
+                    )
+
+                takeover = [call for call in calls if "objective_no_improve_stop" in call]
+                polish = [call for call in calls if "incumbent_interrupt_callback" in call]
+                self.assertEqual(len(takeover), int(partition))
+                if partition:
+                    self.assertGreaterEqual(len(polish), 2)
+                else:
+                    self.assertEqual(calls, [])
+                self.assertEqual("[STAGE] SINGLE_ASU_TAKEOVER" in output.getvalue(), partition)
+                self.assertIn("[STAGE] FINAL_RESIDUAL_CHECK", output.getvalue())
+                residual.assert_called_once()
+                self.assertEqual(result["asu_id"], [1, -1, 2])
+
     def validate(self, ids, **kwargs):
         return solver._validate_initial_asu_id(
             ids, [[1], [0], []], np.array([10, 10, 10]), np.array([0, 0, 0]),

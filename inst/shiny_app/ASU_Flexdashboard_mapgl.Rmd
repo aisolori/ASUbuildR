@@ -1002,15 +1002,21 @@ shiny::conditionalPanel(
       "CP-SAT strategy",
       choices = c(
         "Partitioning strategy (potential multiple ASUs)" = "partition",
-        "Legacy single-ASU solve" = "single"
+        "Legacy single-ASU solve" = "single",
+        "Split saved ASUs (joint model)" = "split"
       ),
       selected = "single"
     ),
     shiny::checkboxInput("cpsat_use_warm_start", "Use saved ASUs as a warm start", value = FALSE),
     shiny::conditionalPanel(
-      condition = "input.cpsat_use_warm_start === true",
+      condition = "input.cpsat_use_warm_start === true || input.cpsat_strategy === 'split'",
       shiny::fileInput("cpsat_warm_start", "Warm-start RDS", accept = ".rds", multiple = FALSE),
       shiny::helpText("Matches GEOID plus asunum/asu_id to the current input data. Saved groups must meet current thresholds and connectivity. Max ASUs includes these groups; assignments remain changeable.")
+    ),
+    shiny::conditionalPanel(
+      condition = "input.cpsat_strategy === 'split'",
+      shiny::helpText("Requires a warm-start RDS regardless of the checkbox. Tries imported ASUs once, highest captured unemployment first, using articulation points and narrow graph corridors as split hints. Each child must contain a parent tract, qualify independently, and avoid touching all other ASUs. Unassigned tracts are available; only strict combined unemployment gains are accepted."),
+      shiny::helpText("Increase Max ASUs above the imported count to leave room for children. Each split may create two or three children, limited further by the available slots. Solves run sequentially with all workers. Each starts with an untimed cut pass: 25 rounds or 10 stalled-upper-bound rounds. Individual rounds stop when a candidate exposes new connectivity cuts, without waiting for an optimal disconnected assignment. Time and incumbent-stall limits apply to the subsequent exact flow solve per parent. No merging or polishing follows.")
     ),
     shiny::conditionalPanel(
       condition = "input.cpsat_strategy === 'partition'",
@@ -1025,14 +1031,10 @@ shiny::conditionalPanel(
       shiny::checkboxInput("cpsat_final_consolidation", "Consolidate touching ASUs at the end", value = TRUE),
       shiny::checkboxInput("cpsat_polish_consolidated_asus", "Polish consolidated groups", value = TRUE),
       shiny::helpText("Final consolidation preserves every selected tract. Optional polishing uses the final-polish budget and general stall limit, preserves selected tracts, then consolidates any new contacts. Stop still allows the quick consolidation but skips additional solves."),
-      shiny::helpText("Finish retained-component repair and partition expansion solves after this many seconds without an incumbent improvement. Applies to sequential and joint expansion. 0 disables this limit; the solve time budget still applies. Final polishing uses the general stall limit."),
+      shiny::helpText("Finish retained-component repair and partition expansion solves after this many seconds without an incumbent improvement. 0 disables this limit; the solve time budget still applies. Final polishing uses the general stall limit."),
       shiny::helpText("Surplus pruning starts with all tracts and removes the lowest-surplus tracts while preserving population. A removal may split a component only if every resulting component meets the population threshold; each is then pruned independently toward the rate threshold. Stalled components are repaired using only retained tracts. Valid seeds then enter outward expansion and polishing, where pruned tracts become available again."),
-      shiny::checkboxInput(
-        "cpsat_joint_partition_expansion",
-        "Joint multi-ASU expansion (experimental)", value = FALSE
-      ),
-      shiny::helpText("When enabled, up to three neighboring seed territories are pooled into one solve. Batches run sequentially with all workers and a shared 1800-second limit per batch. May use more memory; invalid seeds may remain inactive."),
-      shiny::helpText("In partitioning, touching ASUs are jointly reoptimized with all reachable unassigned tracts instead of automatically merged. Roots and boundaries can move; the solver may keep separate groups or consolidate them. Combined unemployment cannot decrease. Graph cuts and a connectivity pre-pass are enabled automatically for these touching solves, independent of the joint-expansion checkbox. Each touching-cluster solve uses all workers and the expansion/polish budget (1800 seconds in this dashboard); the pre-pass shares that budget.")
+      shiny::helpText("Partitioning expands each ASU individually, sequentially, using all workers and a 1800-second limit per ASU."),
+      shiny::helpText("In partitioning, touching ASUs are jointly reoptimized with all reachable unassigned tracts instead of automatically merged. Roots and boundaries can move; the solver may keep separate groups or consolidate them. Combined unemployment cannot decrease. Graph cuts and a connectivity pre-pass are enabled automatically for these touching solves. Each touching-cluster solve uses all workers and the expansion/polish budget (1800 seconds in this dashboard); the pre-pass shares that budget.")
     ),
     shiny::numericInput("cpsat_tau",       "UR threshold (τ)",          value = 0.0645, min = 0, max = 1, step = 0.0001),
     shiny::numericInput("cpsat_pop",       "Population threshold",      value = 10000,  min = 0, step = 100),
@@ -1250,11 +1252,10 @@ if (identical(algo_choice, "cpsat")) {
     parallel_asus <- if (is.null(input$cpsat_parallel_asus)) 1L else max(1L, as.integer(input$cpsat_parallel_asus))
     cpsat_strategy <- if (is.null(input$cpsat_strategy) || identical(input$cpsat_strategy, "")) "partition" else as.character(input$cpsat_strategy)
     use_partitioning <- identical(cpsat_strategy, "partition")
+    use_split <- identical(cpsat_strategy, "split")
     partition_seed_strategy <- if (use_partitioning && identical(input$cpsat_partition_seed_strategy, "surplus_prune")) "surplus_prune" else "connectivity_free"
     expansion_incumbent_stall_seconds <- if (is.null(input$cpsat_expansion_incumbent_stall_seconds) || is.na(input$cpsat_expansion_incumbent_stall_seconds)) 300L else max(0L, as.integer(input$cpsat_expansion_incumbent_stall_seconds))
-    joint_partition_expansion <- use_partitioning && isTRUE(input$cpsat_joint_partition_expansion)
-    if (use_partitioning) append_cpsat_log(sprintf("[run] partition expansion mode: %s",
-                            if (joint_partition_expansion) "joint (experimental)" else "sequential"))
+    if (use_partitioning) append_cpsat_log("[run] partition expansion mode: sequential")
     rel_gap  <- if (!is.null(input$cpsat_relgap) && !is.na(input$cpsat_relgap)) as.numeric(input$cpsat_relgap) else NA_real_
     append_cpsat_log(sprintf("[run] params: strategy=%s tau=%.6f pop=%d max=%d limit=%ds stall=%ds workers=%d concurrent_asus=%d rel_gap=%s",
            cpsat_strategy,
@@ -1353,13 +1354,17 @@ if (identical(algo_choice, "cpsat")) {
     append_cpsat_log(sprintf("[NB] Tracts kept: %d (after join)", nrow(merged_df)))
 
     warm_start <- NULL
-    if (isTRUE(input$cpsat_use_warm_start)) {
+    if (use_split || isTRUE(input$cpsat_use_warm_start)) {
       warm_start <- tryCatch({
-        if (is.null(input$cpsat_warm_start)) stop("Choose a warm-start RDS file or disable warm start.")
-        asu_read_warm_start(
+        if (is.null(input$cpsat_warm_start)) {
+          stop(if (use_split) "Split saved ASUs requires a warm-start RDS file." else "Choose a warm-start RDS file or disable warm start.")
+        }
+        imported <- asu_read_warm_start(
           input$cpsat_warm_start$datapath, merged_df$GEOID, data = merged_df,
           neighbors = lapply(merged_sf$continuous, function(iv) as.integer(iv) - 1L),
           tau = tau, pop_thresh = pop_thr, max_asus = max_asus)
+        if (use_split && imported$asu_count < 1L) stop("Split saved ASUs requires at least one assigned ASU in the RDS file.")
+        imported
       }, error = function(e) e)
       if (inherits(warm_start, "error")) {
         append_cpsat_log(paste0("[warm start] rejected: ", conditionMessage(warm_start)))
@@ -1472,6 +1477,7 @@ print('[runner] inputs: rows=' + str(len(df)) + ' nb_lists=' + str(len(nb)))
 kwargs = dict(
     df=df, nb=nb,
     initial_asu_id=df['warm_start_asu'].tolist() if 'warm_start_asu' in df.columns else None,
+    split_warm_start=%s,
     tau=%s, pop_thresh=%d, max_asus=%d,
     time_limit=%d, workers=%d, parallel_asus=%d, verbose=True,
     configure_subsolvers=True,
@@ -1496,15 +1502,15 @@ kwargs = dict(
     use_distance_flow_bounds=True,
     use_global_capacity_cardinality_bound=True,
     use_bridge_subtree_pruning=True,
-    use_connectivity_free_repair=True,
+    use_connectivity_free_repair=False,
     connectivity_free_time_limit=120.0,
     harvest_connectivity_free_asus=%s,
     partition_seed_strategy='%s',
     final_consolidation=%s,
     polish_consolidated_asus=%s,
     harvest_all_connectivity_free_components=%s,
-    joint_partition_expansion=%s,
-    use_graph_cut_repair=True,
+    joint_partition_expansion=False,
+    use_graph_cut_repair=False,
     graph_cut_repair_time_limit=120,
     standalone_expansion_time_limit=1800,
     incumbent_stall_seconds=%d,
@@ -1516,9 +1522,9 @@ kwargs = dict(
 REL = %s
 if REL is not None and not (isinstance(REL, float) and math.isnan(REL)):
     kwargs['rel_gap'] = REL
-print('[runner] window scope: all remaining tracts', flush=True)
-print('[runner] strategy: ' + ('partition' if kwargs['harvest_connectivity_free_asus'] else 'single'), flush=True)
-print('[runner] search: flow-capacity-hybrid', flush=True)
+print('[runner] window scope: ' + ('parent plus reachable unassigned tracts, excluding other-ASU contacts' if kwargs['split_warm_start'] else 'all remaining tracts'), flush=True)
+print('[runner] strategy: ' + ('split' if kwargs['split_warm_start'] else 'partition' if kwargs['harvest_connectivity_free_asus'] else 'single'), flush=True)
+print('[runner] search: ' + ('joint separated children' if kwargs['split_warm_start'] else 'flow-capacity-hybrid'), flush=True)
 print('[runner] launching CP-SAT…', flush=True)
 res = build_many_asus_cpsat(**kwargs)
 print('[runner] solver finished; writing json', flush=True)
@@ -1530,13 +1536,13 @@ with open(r'%s','w') as g:
 print('[runner] OK', flush=True)
 ",
       py_mod_path, df_csv, nb_json,
+        if (use_split) "True" else "False",
         format(tau, scientific = FALSE), pop_thr, max_asus, tlimit, workers, parallel_asus,
   if (use_partitioning) "True" else "False",
   partition_seed_strategy,
   if (!identical(input$cpsat_final_consolidation, FALSE)) "True" else "False",
   if (isTRUE(input$cpsat_polish_consolidated_asus)) "True" else "False",
   if (use_partitioning) "True" else "False",
-  if (joint_partition_expansion) "True" else "False",
         incumbent_stall_seconds,
         expansion_incumbent_stall_seconds,
         stop_file, skip_file,

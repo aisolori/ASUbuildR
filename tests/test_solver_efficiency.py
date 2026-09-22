@@ -1,6 +1,7 @@
 """Regression checks for certificate reuse and release-driven polishing."""
 import contextlib
 import io
+import math
 from pathlib import Path
 import sys
 import time
@@ -42,16 +43,24 @@ class ScreeningEfficiencyTest(unittest.TestCase):
 
     def test_screen_time_counts_against_connected_solve_budget(self):
         now = [0.0]
+        cut_models = []
         def screen(*args, **kwargs):
             now[0] = 10.0
             return "UNKNOWN"
+        def cut_round(engine, model, *args, **kwargs):
+            # Screening exhausted the timed budget, but cuts are untimed.
+            self.assertFalse(any(v.name.startswith('f_') for v in model.Proto().variables))
+            self.assertTrue(math.isinf(engine.parameters.max_time_in_seconds))
+            cut_models.append(model.Clone())
+            now[0] += 120.0
+            return solver.cp_model.UNKNOWN
         with (
             patch.object(solver.time, "monotonic", side_effect=lambda: now[0]),
             patch.object(solver, "_connectivity_free_feasibility", side_effect=screen),
-            patch.object(solver.cp_model, "CpSolver") as constructor,
+            patch.object(solver.cp_model.CpSolver, "Solve", new=cut_round),
         ):
             self.assertIsNone(self.solve())
-            constructor.assert_not_called()
+        self.assertEqual(len(cut_models), 1)
 
     def test_cache_reuses_certificates_and_distinguishes_constraints(self):
         cache = {}
