@@ -168,7 +168,7 @@ class ScoutBeforeCutsTest(unittest.TestCase):
             self.assertEqual(len(models), 1)
             self.assertFalse(flag.exists())
 
-    def test_single_cut_pass_stops_after_ten_unchanged_upper_bounds(self):
+    def test_single_cut_pass_stops_after_25_unchanged_upper_bounds(self):
         real_solve = solver.cp_model.CpSolver.Solve
         cut_models = []
 
@@ -184,10 +184,39 @@ class ScoutBeforeCutsTest(unittest.TestCase):
 
         with patch.object(solver.cp_model.CpSolver, 'Solve', new=repeat_relaxation):
             result, _, log = self.run_window(scout_before_cuts=False)
-        self.assertEqual(len(cut_models), 11)
+        self.assertEqual(len(cut_models), 26)
         self.assertEqual((result.obj, result.status), (16, 'OPTIMAL'))
-        self.assertIn('upper_bound_stall=10/10', log)
+        self.assertIn('upper_bound_stall=25/25', log)
         self.assertIn('stop_reason=UPPER_BOUND_STALL', log)
+
+    def test_valid_unemployment_stall_stops_at_50_and_resets_on_callback_gain(self):
+        real_solve = solver.cp_model.CpSolver.Solve
+        for connected, gain_round in ((False, None), (True, None), (False, 25)):
+            with self.subTest(connected=connected, gain_round=gain_round):
+                rounds = []
+
+                def response(instance, model, *args, **kwargs):
+                    if self.has_flow(model):
+                        return real_solve(instance, model, *args, **kwargs)
+                    rounds.append(model.Clone())
+                    if len(rounds) == gain_round:
+                        callback = args[0]
+                        callback.BooleanValue = lambda var: var.name in ('x_0', 'x_1', 'x_2')
+                        callback.on_solution_callback()
+                    members = ('x_0',) if connected else ('x_0', 'x_2', 'x_3')
+                    instance.BooleanValue = lambda var: var.name in members
+                    instance.ObjectiveValue = lambda: 1000 if connected else 1700
+                    instance.BestObjectiveBound = lambda: 1800 - len(rounds)
+                    return solver.cp_model.FEASIBLE
+
+                with patch.object(solver.cp_model.CpSolver, 'Solve', new=response):
+                    result, models, log = self.run_window(scout_before_cuts=False, economic_scale=100)
+                self.assertEqual(len(rounds), 50 + (gain_round or 0))
+                self.assertEqual((result.obj, result.status), (1600, 'OPTIMAL'))
+                self.assertTrue(any(self.has_flow(model) for model, _ in models))
+                self.assertIn('valid_unemp_stall=50/50', log)
+                self.assertIn('stop_reason=VALID_UNEMP_STALL', log)
+                self.assertIn('upper_bound_stall=0/25', log)
 
     def test_cut_time_is_unlimited_and_does_not_consume_exact_solve_budget(self):
         real_solve = solver.cp_model.CpSolver.Solve
@@ -208,7 +237,7 @@ class ScoutBeforeCutsTest(unittest.TestCase):
         with (patch.object(solver.time, 'monotonic', side_effect=lambda: real_clock() + elapsed[0]),
               patch.object(solver.cp_model.CpSolver, 'Solve', new=long_round)):
             result, _, log = self.run_window(scout_before_cuts=False)
-        self.assertEqual(len(cut_limits), 11)
+        self.assertEqual(len(cut_limits), 26)
         self.assertTrue(all(math.isinf(limit) for limit in cut_limits))
         self.assertTrue(exact_limits)
         self.assertTrue(all(0 < limit <= 10 for limit in exact_limits))
@@ -219,7 +248,7 @@ class ScoutBeforeCutsTest(unittest.TestCase):
 
     def test_cut_upper_bound_improvement_resets_stall(self):
         real_solve = solver.cp_model.CpSolver.Solve
-        bounds = [1700] * 10 + [1650] * 11
+        bounds = [1700] * 20 + [1650] * 26
         cut_count = [0]
 
         def improving_round(instance, model, *args, **kwargs):
@@ -233,9 +262,9 @@ class ScoutBeforeCutsTest(unittest.TestCase):
 
         with patch.object(solver.cp_model.CpSolver, 'Solve', new=improving_round):
             result, _, log = self.run_window(scout_before_cuts=False, economic_scale=100)
-        self.assertEqual(cut_count[0], 21)
+        self.assertEqual(cut_count[0], 46)
         self.assertEqual(result.obj, 1600)
-        self.assertIn('upper_bound=1650 upper_bound_stall=0/10', log)
+        self.assertIn('upper_bound=1650 upper_bound_stall=0/25', log)
         self.assertIn('stop_reason=UPPER_BOUND_STALL', log)
 
     def test_untimed_cut_round_honors_stop_and_skip_watchdog(self):
@@ -275,11 +304,11 @@ class ScoutBeforeCutsTest(unittest.TestCase):
 
         with patch.object(solver.cp_model.CpSolver, 'Solve', new=connected_round):
             result, _, log = self.run_window(scout_before_cuts=False)
-        self.assertEqual(cut_count[0], 11)
+        self.assertEqual(cut_count[0], 26)
         self.assertEqual(result.obj, 16)
         self.assertIn('stop_reason=UPPER_BOUND_STALL', log)
 
-    def test_single_cut_pass_keeps_round_limit_when_upper_bound_improves(self):
+    def test_valid_stall_precedes_total_round_limit_when_only_bound_improves(self):
         real_solve = solver.cp_model.CpSolver.Solve
         cuts = []
 
@@ -293,10 +322,10 @@ class ScoutBeforeCutsTest(unittest.TestCase):
 
         with patch.object(solver.cp_model.CpSolver, 'Solve', new=improving_bound):
             result, models, log = self.run_window(scout_before_cuts=False, economic_scale=100)
-        self.assertEqual(len(cuts), 100)
+        self.assertEqual(len(cuts), 50)
         self.assertTrue(self.has_flow(models[-1][0]))
         self.assertEqual((result.obj, result.status), (1600, 'OPTIMAL'))
-        self.assertIn('stop_reason=ROUND_LIMIT', log)
+        self.assertIn('stop_reason=VALID_UNEMP_STALL', log)
 
     def test_takeover_runs_cuts_before_flow_and_keeps_generated_constraints(self):
         models = []

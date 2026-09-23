@@ -32,8 +32,8 @@ class SupernodePolishTest(unittest.TestCase):
         self.assertFalse(any(v.name.startswith('polish_flow_')
                              for model in models for v in model.Proto().variables))
 
-    def test_ten_stalled_bound_rounds_reset_on_improvement_even_without_new_cuts(self):
-        bounds = [30, 30] + [29] * 11
+    def test_25_stalled_bound_rounds_reset_on_improvement_even_without_new_cuts(self):
+        bounds = [30, 30] + [29] * 26
         cut_models, flow_models, reports = [], [], []
         real_solve = solver.cp_model.CpSolver.Solve
 
@@ -54,11 +54,11 @@ class SupernodePolishTest(unittest.TestCase):
             result = self.solve([10, 5, 20], [0, 0, 0], [1, -1, 2],
                                 deterministic_ties=False, log=True,
                                 incumbent_report_callback=lambda selected, value: reports.append((selected, value)))
-        self.assertEqual(len(cut_models), 13)
+        self.assertEqual(len(cut_models), 28)
         self.assertEqual(len(flow_models), 1)
         self.assertEqual((result.obj, result.status), (15, 'OPTIMAL'))
         self.assertIn(([0, 1, 2], 15), reports)
-        self.assertIn('upper_bound_stall=10/10', output.getvalue())
+        self.assertIn('upper_bound_stall=25/25', output.getvalue())
         self.assertIn('stop_reason=UPPER_BOUND_STALL', output.getvalue())
         self.assertIn('bound_carried_to_flow=True', output.getvalue())
 
@@ -86,7 +86,7 @@ class SupernodePolishTest(unittest.TestCase):
                 with patch.object(solver.cp_model.CpSolver, 'Solve', new=capture):
                     result = self.solve([10, 0, 5, 20], [0, 10, 0, 0], [1, -1, -1, 2],
                                         deterministic_ties=False)
-                self.assertEqual(len(cut_models), 11)  # Baseline + ten stalled rounds.
+                self.assertEqual(len(cut_models), 26)  # Baseline + 25 stalled rounds.
                 self.assertEqual(len(flow_models), 1)
                 self.assertEqual((result.obj, result.status), (15, 'OPTIMAL'))
                 if not unknown:
@@ -97,7 +97,7 @@ class SupernodePolishTest(unittest.TestCase):
                     for index, constraint in enumerate(cut_models[-1].Proto().constraints):
                         self.assertEqual(str(prefix[index]), str(constraint))
 
-    def test_configured_round_cap_stops_even_when_every_bound_improves(self):
+    def test_valid_stall_precedes_round_cap_when_every_bound_improves(self):
         cut_models, flow_models = [], []
         real_solve = solver.cp_model.CpSolver.Solve
         real_cuts = solver._joint_connectivity_cut_pass
@@ -105,7 +105,7 @@ class SupernodePolishTest(unittest.TestCase):
 
         def cuts(*args, **kwargs):
             self.assertTrue(kwargs['stop_on_new_cuts'])
-            self.assertEqual(kwargs['upper_bound_stall_rounds'], 10)
+            self.assertEqual(kwargs['upper_bound_stall_rounds'], 25)
             configured_limit.append(kwargs['max_rounds'])
             return real_cuts(*args, **kwargs)
 
@@ -127,11 +127,12 @@ class SupernodePolishTest(unittest.TestCase):
               contextlib.redirect_stdout(output)):
             result = self.solve([10, 5, 20], [0, 0, 0], [1, -1, 2],
                                 deterministic_ties=False, log=True)
-        self.assertEqual(len(cut_models), configured_limit[0])
+        self.assertEqual(configured_limit[0], 100)
+        self.assertEqual(len(cut_models), 51)  # Initial valid gain + 50 stalled rounds.
         self.assertEqual(len(flow_models), 1)
         self.assertEqual((result.obj, result.status), (15, 'OPTIMAL'))
-        self.assertIn('stop_reason=ROUND_LIMIT', output.getvalue())
-        self.assertIn('upper_bound_stall=0/10', output.getvalue())
+        self.assertIn('stop_reason=VALID_UNEMP_STALL', output.getvalue())
+        self.assertIn('upper_bound_stall=0/25', output.getvalue())
 
     def solve(self, u, emp, ids, nb=None, **options):
         n = len(u)
@@ -442,10 +443,9 @@ class SupernodePolishTest(unittest.TestCase):
         self.assertEqual(result['n_asu'], 1)
         self.assertEqual(len(set(result['asu_id'])), 1)
         self.assertIn('statewide_gain=25 absorbed_asus=1', output.getvalue())
-        # ASU 1 has less unemployment and goes first. The two-tract ASU 2
-        # becomes a single optional donor supernode.
-        self.assertIn('checking_asu=1 position=1/2', output.getvalue())
-        self.assertIn('model_nodes=4 donors=1', output.getvalue())
+        # ASU 2 has higher aggregate surplus and goes first. ASU 1 is a donor.
+        self.assertIn('checking_asu=2 position=1/2', output.getvalue())
+        self.assertIn('model_nodes=5 donors=1', output.getvalue())
         stage_lines = [line for line in output.getvalue().splitlines() if '[STAGE]' in line]
         self.assertTrue(stage_lines)
         for line in stage_lines:
@@ -454,10 +454,10 @@ class SupernodePolishTest(unittest.TestCase):
         self.assertIn('total_unemp=30', stage_lines[0])
         completed = next(line for line in stage_lines if '[STAGE] FINAL_POLISH_COMPLETE ' in line)
         self.assertIn('total_unemp=55', completed)
-        self.assertIn('priority=unemployment_ascending', output.getvalue())
+        self.assertIn('priority=q_surplus_descending', output.getvalue())
 
     def test_surviving_asu_stage_id_matches_dashboard_after_donor_absorption(self):
-        frame = pd.DataFrame({'tract_ASU_unemp': [10, 20, 50],
+        frame = pd.DataFrame({'tract_ASU_unemp': [30, 20, 10],
                               'tract_ASU_emp': [0, 0, 0], 'tract_pop2024': [10000]*3})
         output = io.StringIO()
         real_solve = solver.cp_model.CpSolver.Solve

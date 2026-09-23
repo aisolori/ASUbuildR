@@ -123,6 +123,13 @@ table.dataTable td {
     });
     ensureTooltip(mapId);
   });
+  // A state switch replaces the widget after its assignment message may have
+  // arrived. Attach the tooltip to the new map as soon as its layers are ready.
+  window.jQuery(document).on("shiny:value.asuTooltip", function(event) {
+    if (event.name === "initial_map" || event.name === "edit_map") {
+      window.setTimeout(function() { ensureTooltip(event.name); }, 0);
+    }
+  });
 })();
 </script>
 
@@ -202,10 +209,17 @@ if (is_dev_mode) {
   source(file.path(r_dir, "read_asu_warm_start.R"))
   source(file.path(r_dir, "asu_summary.R"))
   source(file.path(r_dir, "neighbor_cache.R"))
+  source(file.path(r_dir, "browser_data.R"))
+  source(file.path(r_dir, "solver_checkpoint.R"))
+  source(file.path(r_dir, "tract_geography.R"))
 } else {
   asu_read_warm_start <- getFromNamespace("asu_read_warm_start", "ASUbuildR")
   asu_summarize_tracts <- getFromNamespace("asu_summarize_tracts", "ASUbuildR")
   asu_cached_neighbors <- getFromNamespace("asu_cached_neighbors", "ASUbuildR")
+  for (helper in c("asu_load_tract_geography", "asu_join_tract_data", "asu_read_upload", "asu_state_slice", "asu_display_geometry", "asu_display_bounds",
+                   "asu_payload_log", "asu_install_payload_logging", "asu_browser_source", "asu_map_source",
+                   "asu_checkpoint_run_dir", "asu_service_checkpoints"))
+    assign(helper, getFromNamespace(helper, "ASUbuildR"))
   message("→ Installed package mode: functions should already be available")
 }
 
@@ -244,13 +258,10 @@ options(asu_python_ready = python_ready)
 
 # 1. choose sensible user-cache paths (rappdirs works everywhere)
 cache_dir <- rappdirs::user_cache_dir("ASUbuildR", "tigris")
-pmtiles_cache_dir <- rappdirs::user_cache_dir("ASUbuildR", "pmtiles")
 
 # 2. create it if it doesn't exist
 if (!dir.exists(cache_dir))
   dir.create(cache_dir, recursive = TRUE, showWarnings = FALSE)
-if (!dir.exists(pmtiles_cache_dir))
-  dir.create(pmtiles_cache_dir, recursive = TRUE, showWarnings = FALSE)
 
 options(
   tigris_cache_dir = cache_dir,
@@ -262,8 +273,13 @@ options(
 
 options(shiny.maxRequestSize = 50 * 1024^2)  # Set to 50MB or your desired limit
 
+# Record serialized output sizes, never dataset contents.
+asu_install_payload_logging(session)
+
 # Initialize reactive values
 uploaded_data <- shiny::reactiveVal(NULL)
+display_state <- shiny::reactiveVal(NULL)
+upload_status <- shiny::reactiveVal("Choose an ASU workbook to begin.")
 state <- shiny::reactiveVal(NULL)
 tract_year <- shiny::reactiveVal(NULL)
 tigris_year <- shiny::reactiveVal(NULL)
@@ -275,13 +291,6 @@ full_data <- shiny::reactiveVal(NULL)
 full_data_reset <- shiny::reactiveVal()
 selected_tracts <- shiny::reactiveVal(NULL)
 nb_adjacency    <- shiny::reactiveVal(NULL) # island-fixed full-state neighbor graph
-pmtiles_server  <- shiny::reactiveVal(NULL)
-pmtiles_disabled <- shiny::reactiveVal(
-  !isTRUE(getOption("ASUbuildR.use_pmtiles", TRUE)) ||
-    !requireNamespace("freestiler", quietly = TRUE)
-)
-
-
 # New England Optional year selection logic
 output$is_new_england <- shiny::reactive({
   if (is.null(state())) {
@@ -291,7 +300,7 @@ output$is_new_england <- shiny::reactive({
   # New England state FIPS codes
   new_england_fips <- c("09", "23", "25", "33", "44", "50") # CT, ME, MA, NH, RI, VT
 
-  state() %in% new_england_fips
+  any(state() %in% new_england_fips)
 })
 
 # ---- CP-SAT logging + paths ----
@@ -344,10 +353,7 @@ session$onSessionEnded(function() {
   px <- shiny::isolate(cpsat_solver_proc())
   if (!is.null(px) && px$is_alive()) px$kill()
 
-  tile_server <- shiny::isolate(pmtiles_server())
-  if (!is.null(tile_server) && requireNamespace("freestiler", quietly = TRUE)) {
-    try(freestiler::stop_server(tile_server$port), silent = TRUE)
-  }
+
 })
 
 # ---- New England year override logic ---------------------------------
@@ -359,140 +365,110 @@ th_state <- shiny::reactiveVal(NULL)
 th_tract_list <- shiny::reactiveVal(NULL)
 th_bls_df <- shiny::reactiveVal(NULL)
 
-prep_map_data <- function(map_data) {
-  # Cache the result to avoid repeated processing
-  if (nrow(map_data) == 0) return(map_data)
-  
-  map_data |>
-    sf::st_make_valid() |>
-    sf::st_simplify(dTolerance = .005, preserveTopology = TRUE) |>  # Simplify geometry
-    sf::st_zm(what = "ZM", drop = TRUE) |>
-    dplyr::filter(!sf::st_is_empty(geometry)) |>
-    dplyr::mutate(geom_type = sf::st_geometry_type(geometry)) |>
-    dplyr::filter(geom_type %in% c("POLYGON", "MULTIPOLYGON")) |>
-    dplyr::select(-geom_type)
-}
+# Nationwide data remains authoritative; the display selector changes the view only.
+available_display_states <- shiny::reactive({
+  data <- if (!is.null(full_data())) full_data() else uploaded_data()
+  states <- sort(unique(substr(as.character(data$GEOID), 1L, 2L)))
+  choices <- stats::setNames(states, states)
+  if (length(states) > 1L) choices <- c(choices, "All states (nationwide)" = "ALL")
+  choices
+})
+shiny::observe({
+  choices <- available_display_states()
+  if (!length(choices)) return()
+  chosen <- shiny::isolate(display_state())
+  if (is.null(chosen) || !chosen %in% choices) {
+    chosen <- unname(choices[1L])
+    display_state(chosen)
+  }
+  for (id in c("display_state_upload", "display_state_initial", "display_state_edit"))
+    shiny::updateSelectInput(session, id, choices = choices, selected = chosen)
+})
+for (picker in c("display_state_upload", "display_state_initial", "display_state_edit")) local({
+  id <- picker
+  shiny::observeEvent(input[[id]], {
+    chosen <- input[[id]]
+    if (length(chosen) == 1L && chosen %in% available_display_states() &&
+        !identical(chosen, display_state())) {
+      display_state(chosen)
+      selected_tracts(NULL)
+      highlighted_tracts(character(0))
+      shiny::updateSelectInput(session, "select_asunum", selected = "None")
+      for (other in setdiff(c("display_state_upload", "display_state_initial", "display_state_edit"), id))
+        shiny::updateSelectInput(session, other, selected = chosen)
+    }
+  }, ignoreInit = TRUE)
+})
+display_data <- shiny::reactive({
+  shiny::req(full_data(), display_state())
+  asu_state_slice(full_data(), display_state())
+})
 
-# PERFORMANCE: st_make_valid()/st_simplify() over every tract is expensive,
-# but the geometry only changes when a new tract set is loaded (new state or
-# year). Editing ASU assignments only changes the `asunum` attribute, so
-# cache the cleaned geometry keyed on the GEOID set rather than on
-# full_data() itself (which changes on every edit and would defeat a
-# full_data()-keyed cache, forcing re-simplification on every click).
+# Invalidate geometry only when its actual content/attributes change, never on
+# assignment edits. State switches and same-GEOID replacement geometry are safe.
+map_revision <- shiny::reactiveVal(0L)
+map_signature <- NULL
+geoid_set <- shiny::reactiveVal(character(0))
+shiny::observe({
+  if (is.null(full_data())) {
+    if (!is.null(map_signature)) {
+      map_signature <<- NULL
+      geoid_set(character(0))
+      map_revision(shiny::isolate(map_revision()) + 1L)
+    }
+    return()
+  }
+  data <- display_data()
+  signature <- data[, c("GEOID", "tract_pop_cur", "tract_ASU_clf",
+                        "tract_ASU_urate", "tract_ASU_unemp")]
+  if (!identical(map_signature, signature)) {
+    map_signature <<- signature
+    geoid_set(sort(data$GEOID))
+    map_revision(shiny::isolate(map_revision()) + 1L)
+  }
+})
+# Retain the last two display geometries so state/nation round trips avoid
+# repeating nationwide simplification. Exact GEOIDs and geometry invalidate it.
+display_geometry_cache <- list()
 base_geom <- shiny::reactive({
-  shiny::req(full_data())
-  full_data() |>
-    dplyr::select(GEOID) |>
-    prep_map_data()
-}) |>
-  shiny::bindCache(sort(full_data()$GEOID))
-
-# Cheap non-spatial join of current attributes onto the cached geometry.
-# Only include columns needed for rendering and tooltips to minimise GeoJSON size.
+  map_revision()
+  data <- dplyr::select(shiny::isolate(display_data()), GEOID)
+  area <- shiny::isolate(display_state())
+  cached <- display_geometry_cache[[area]]
+  if (!is.null(cached) && identical(cached$input, data)) {
+    display_geometry_cache <<- c(display_geometry_cache[area],
+      display_geometry_cache[setdiff(names(display_geometry_cache), area)])
+    return(cached$output)
+  }
+  geometry <- if (identical(area, "ALL")) {
+    shiny::withProgress(message = "Preparing all-state map", detail = "Simplifying display geometry", value = 0.1,
+      asu_display_geometry(data))
+  } else asu_display_geometry(data)
+  display_geometry_cache <<- c(stats::setNames(list(list(input=data, output=geometry)), area),
+    display_geometry_cache[setdiff(names(display_geometry_cache), area)])
+  display_geometry_cache <<- head(display_geometry_cache, 2L)
+  geometry
+})
 map_geom <- shiny::reactive({
-  shiny::req(full_data())
-  attrs <- full_data() |>
+  attrs <- display_data() |>
     sf::st_drop_geometry() |>
     dplyr::select(GEOID, asunum, tract_pop_cur, tract_ASU_clf, tract_ASU_urate, tract_ASU_unemp)
   dplyr::inner_join(base_geom(), attrs, by = "GEOID")
 })
-
-map_tile_fingerprint <- function(data) {
-  attrs <- data |>
-    sf::st_drop_geometry() |>
-    dplyr::arrange(GEOID)
-  fingerprint_file <- tempfile(fileext = ".rds")
-  on.exit(unlink(fingerprint_file), add = TRUE)
-  saveRDS(attrs, fingerprint_file, version = 2)
-  unname(tools::md5sum(fingerprint_file))
-}
-
-map_cache_component <- function(value, fallback = "unknown") {
-  values <- as.character(value %||% fallback)
-  values <- values[!is.na(values) & nzchar(values)]
-  if (length(values) == 0L) values <- fallback
-  values <- gsub("[^A-Za-z0-9_-]", "_", values)
-  paste(sort(unique(values)), collapse = "-")
-}
-
-ensure_map_tiles <- function(data) {
-  if (isTRUE(pmtiles_disabled()) || is.null(data) || nrow(data) == 0) return(NULL)
-
-  tryCatch({
-    state_id <- map_cache_component(state())
-    year_id <- map_cache_component(tigris_year())
-    fingerprint <- map_tile_fingerprint(data)
-    tile_name <- sprintf("tracts_v2_%s_%s_%s.pmtiles", state_id, year_id, fingerprint)
-    tile_path <- file.path(pmtiles_cache_dir, tile_name)
-
-    if (!file.exists(tile_path)) {
-      temp_path <- tempfile(pattern = "asu_tracts_", tmpdir = pmtiles_cache_dir,
-                            fileext = ".pmtiles")
-      on.exit(unlink(temp_path), add = TRUE)
-      message("[map] Creating PMTiles cache: ", tile_name)
-      freestiler::freestile(
-        data,
-        temp_path,
-        layer_name = "tracts",
-        tile_format = "mvt",
-        min_zoom = 0L,
-        max_zoom = 14L,
-        simplification = TRUE,
-        overwrite = TRUE,
-        quiet = TRUE
-      )
-      if (!file.rename(temp_path, tile_path)) {
-        if (!file.copy(temp_path, tile_path, overwrite = TRUE)) {
-          stop("Could not move the completed PMTiles archive into the cache.")
-        }
-      }
-      message("[map] PMTiles cache created: ",
-              format(file.info(tile_path)$size, big.mark = ","), " bytes")
-    } else {
-      message("[map] Reusing PMTiles cache: ", tile_name)
-    }
-
-    server_info <- pmtiles_server()
-    if (is.null(server_info)) {
-      server_info <- freestiler::serve_tiles(
-        pmtiles_cache_dir,
-        port = httpuv::randomPort()
-      )
-      pmtiles_server(server_info)
-    }
-
-    list(
-      source_id = "tracts-source",
-      source_layer = "tracts",
-      url = paste0(server_info$url, "/", tile_name),
-      path = tile_path
-    )
-  }, error = function(e) {
-    warning("PMTiles rendering disabled for this session: ", conditionMessage(e),
-            call. = FALSE)
-    pmtiles_disabled(TRUE)
-    NULL
-  })
-}
-
-map_uses_pmtiles <- function() {
-  !isTRUE(pmtiles_disabled()) && !is.null(pmtiles_server())
-}
-
-# Reactively tracks the GEOID set but only fires when GEOIDs actually change.
-# Because full_data() changes on every ASU edit (asunum values), map_geom()
-# is invalidated on every edit too. If output$edit_map
-# depend directly on map_geom(), they are invalidated and Shiny re-sends the
-# cached HTML to the browser, which re-initialises MapLibre and wipes any
-# proxy color updates. Keying on geoid_set() instead means the map outputs
-# are only invalidated (and re-sent) when the set of tracts genuinely changes.
-geoid_set <- shiny::reactiveVal(character(0))
-shiny::observe({
-  shiny::req(full_data())
-  new_geoids <- sort(full_data()$GEOID)
-  if (!identical(geoid_set(), new_geoids)) {
-    geoid_set(new_geoids)
-  }
+map_source <- shiny::reactive({
+  revision <- map_revision()
+  data <- shiny::isolate(map_geom())
+  shiny::req(nrow(data) > 0L)
+  national <- identical(shiny::isolate(display_state()), "ALL")
+  result <- tryCatch({
+    if (national) shiny::withProgress(message = "Preparing all-state map",
+      detail = "Building or loading cached PMTiles; the first load may take several minutes", value = 0.5,
+      asu_map_source(data, session, revision, require_tiles = TRUE))
+    else asu_map_source(data, session, revision)
+  }, error = identity)
+  shiny::validate(shiny::need(!inherits(result, "error"),
+    if (inherits(result, "error")) conditionMessage(result) else ""))
+  result
 })
 
 highlighted_tracts <- shiny::reactiveVal(character(0))
@@ -619,6 +595,8 @@ push_asu_tooltip_updates <- function(data) {
   if (is.null(data) || nrow(data) == 0 ||
       !all(c("GEOID", "asunum") %in% names(data))) return(invisible(FALSE))
 
+  data <- asu_state_slice(data, display_state())
+  if (!nrow(data)) return(invisible(FALSE))
   geoids <- as.character(data$GEOID)
   values <- suppressWarnings(as.integer(data$asunum))
   values[is.na(values) | values < 0L] <- 0L
@@ -643,7 +621,7 @@ push_asu_tooltip_updates <- function(data) {
   invisible(TRUE)
 }
 
-shiny::observeEvent(full_data(), {
+shiny::observeEvent(list(full_data(), display_state()), {
   push_asu_tooltip_updates(full_data())
 }, ignoreNULL = TRUE)
 
@@ -652,7 +630,7 @@ shiny::observeEvent(full_data(), {
 # NOT set an initial filter on these layers. Use visibility="none" as the off-state
 # and pair every set_filter call with a matching set_layout_property visibility toggle.
 apply_overlay_filter <- function(proxy, layer_id, ids) {
-  ids <- ids[!is.na(ids)]
+  ids <- ids[!is.na(ids) & (display_state() == "ALL" | substr(ids, 1L, 2L) == display_state())]
   if (length(ids) == 0) {
     proxy |>
       mapgl::set_filter(layer_id, NULL) |>
@@ -680,10 +658,6 @@ update_map_efficiently <- function(map_id = "edit_map", paint_only = FALSE) {
 
   proxy <- mapgl::maplibre_proxy(map_id)
 
-  if (!paint_only && !map_uses_pmtiles()) {
-    # Skip source replacement for paint-only edits.
-    proxy <- proxy |> mapgl::set_source(layer_id = "basemap", source = data)
-  }
 
   proxy <- proxy |>
     mapgl::set_paint_property(
@@ -703,104 +677,11 @@ update_map_efficiently <- function(map_id = "edit_map", paint_only = FALSE) {
   proxy
 }
 
-# Enhanced version that can also update the data source if needed
+# Geometry changes rebuild the shared HTTP source through map_revision().
 update_map_with_data <- function(map_id = "edit_map", new_data = NULL) {
-  data <- if (is.null(new_data)) map_geom() else new_data
-  if (is.null(data) || nrow(data) == 0) return()
-
-  if (!is.null(new_data) && map_uses_pmtiles()) {
-    proxy <- update_map_efficiently(map_id, paint_only = TRUE)
-    return(proxy)
-  }
-  
-  color_scheme <- calculate_color_scheme(data)
-  
-  # If new data is provided, we need to update the source
-  if (!is.null(new_data)) {
-    mapgl::maplibre_proxy(map_id) |>
-      mapgl::clear_layer("basemap") |>
-      mapgl::clear_layer("exploring") |>
-      mapgl::clear_layer("exploring_candidate") |>
-      mapgl::clear_layer("exploring_added") |>
-      mapgl::clear_layer("exploring_removed") |>
-      mapgl::clear_layer("selected") |>
-      mapgl::clear_layer("highlighted") |>
-      mapgl::add_fill_layer(
-        id = "basemap",
-        source = data,
-        fill_color = mapgl::step_expr(
-          column = "asunum",
-          base = "#E0E0E0",
-          stops = color_scheme$colors,
-          values = color_scheme$breaks,
-          na_color = "#E0E0E0"
-        ),
-        fill_opacity = 0.5,
-        fill_outline_color = "black",
-        tooltip = NULL
-      ) |>
-      mapgl::add_line_layer(
-        id = "exploring",
-        source = data,
-        line_color = "#000000",
-        line_width = 3,
-        line_opacity = 1,
-        visibility = "none"
-      ) |>
-      mapgl::add_line_layer(
-        id = "exploring_candidate",
-        source = data,
-        line_color = "#FFD54F",
-        line_width = 3,
-        line_opacity = 1,
-        visibility = "none"
-      ) |>
-      mapgl::add_fill_layer(
-        id = "exploring_removed",
-        source = data,
-        fill_color = "#D32F2F",
-        fill_opacity = 0.25,
-        fill_antialias = FALSE,
-        visibility = "none"
-      ) |>
-      mapgl::add_fill_layer(
-        id = "exploring_added",
-        source = data,
-        fill_color = "#2E7D32",
-        fill_opacity = 0.25,
-        fill_antialias = FALSE,
-        visibility = "none"
-      ) |>
-      mapgl::add_line_layer(
-        id = "selected",
-        source = data,
-        line_color = "red",
-        line_width = 4,
-        line_opacity = 1,
-        visibility = "none"
-      ) |>
-      mapgl::add_fill_layer(
-        id = "highlighted",
-        source = data,
-        fill_color = "black",
-        fill_opacity = 0.8,
-        visibility = "none"
-      )
-  } else {
-    # Just update the paint property
-    mapgl::maplibre_proxy(map_id) |>
-      mapgl::set_paint_property("basemap", "fill-color",
-        mapgl::step_expr(
-          column = "asunum",
-          base = "#E0E0E0",
-          stops = color_scheme$colors,
-          values = color_scheme$breaks,
-          na_color = "#E0E0E0"
-        )
-      )
-  }
+  update_map_efficiently(map_id, paint_only = TRUE)
 }
-# Connect every sub-graph to the largest component via nearest centroid.
+
 fix_nb_islands <- function(nb, intpt_lat, intpt_lon) {
   g     <- igraph::graph_from_adj_list(nb)
   comps <- igraph::components(g)
@@ -847,6 +728,9 @@ Once the file is loaded, a preview of the data will appear on the right, the sta
 Note: at this time, ASUbuildR assumes a state is using county-based census tracts. If a state uses another geography such as NECTAs as the basis for its ASU tract file, this process will require some modification.
 ```{r}
 shiny::fileInput("file", "Choose Excel File", accept = c(".xls", ".xlsx"))
+shiny::selectInput("display_state_upload", "Display area:", choices = character(0))
+shiny::textOutput("upload_status")
+shiny::helpText("Choose a state or All states (nationwide) for maps and tract tables. Display selection does not change solver scope.")
 # Add numeric input for tract year
 shiny::numericInput("tract_year_input",
                      "Census Tract Year:",
@@ -855,7 +739,7 @@ shiny::numericInput("tract_year_input",
                      max = 2025,
                      step = 1)
 shiny::helpText("Select the year of Census tract boundaries to use.
-                 For New England states, 2021 is the last year with NECTA-based tracts.")
+                 Connecticut workbooks using legacy county GEOIDs automatically use matching 2021 tract geometry.")
 shiny::textOutput("selected_state")
 shiny::textOutput("tract_pop_year")
 shiny::textOutput("selected_tract_year")
@@ -864,51 +748,55 @@ shiny::textOutput("selected_tract_year")
 ## Output {data-width="850"}
 
 ```{r}
-shiny::tableOutput("data_preview")
+DT::DTOutput("data_preview")
+output$upload_status <- shiny::renderText(upload_status())
 shiny::observeEvent(input$file, {
   shiny::req(input$file)
-  df <- readxl::read_excel(input$file$datapath, range = "A2:AB25000", col_names = excel_names) |>
-    dplyr::filter(!is.na(geoid)) |>
-    dplyr::mutate(GEOID = stringr::str_remove(geoid, "14000US")) |>
-    dplyr::select(GEOID,
-           st_fips,
-           cnty_fips,
-           tract_fips,
-           name,
-           tract_pop_cur,
-           tract_ASU_clf,
-           tract_ASU_emp,
-           tract_ASU_unemp,
-           tract_ASU_urate) |>
-    dplyr::mutate(
-      tract_pop_cur = as.integer(round(tract_pop_cur)),
-      tract_ASU_clf = as.integer(round(tract_ASU_clf)),
-      tract_ASU_emp = as.integer(round(tract_ASU_emp)),
-      tract_ASU_unemp = as.integer(round(tract_ASU_unemp))
-    )
-  uploaded_data(df)
-  uploaded_data() |>
-    dplyr::pull(st_fips) |>
-    unique() |>
-    state()
-  
-  # Get population year from the Excel file header
-  readxl::read_excel(input$file$datapath, range = "H1:H1", col_names = "year") |>
-    dplyr::pull(year) |>
-    stringr::str_remove("tract_pop") |>
-    tract_year()
-  
-  output$data_preview <- shiny::renderTable({
-    head(uploaded_data(), 50)
+  if (isTRUE(cpsat_running())) {
+    shiny::showNotification("Stop the active solve before replacing the uploaded data.", type = "error")
+    return()
+  }
+  upload_status("Reading and validating workbook...")
+  result <- tryCatch(shiny::withProgress(message = "Loading ASU workbook", value = 0, {
+    shiny::incProgress(0.2, detail = "Reading all tract rows")
+    result <- asu_read_upload(input$file$datapath)
+    shiny::incProgress(0.8, detail = "Validation complete")
+    result
+  }), error = function(e) {
+    upload_status(paste("Upload rejected:", conditionMessage(e)))
+    shiny::showNotification(conditionMessage(e), type = "error", duration = NULL)
+    NULL
   })
-  
-  output$selected_state <- shiny::renderText({
-    paste0("Selected FIPS is: ", state())
-  })
-  
-  output$tract_pop_year <- shiny::renderText({
-    paste0("Population year (detected from Excel): ", tract_year())
-  })
+  if (is.null(result)) return()
+  # Publish atomically after validation; no expensive outputs see partial data.
+  full_data(NULL)
+  full_data_reset(NULL)
+  nb_adjacency(NULL)
+  selected_tracts(NULL)
+  highlighted_tracts(character(0))
+  th_state(NULL)
+  th_tract_list(NULL)
+  th_bls_df(NULL)
+  asu_summary(NULL)
+  uploaded_data(result$data)
+  state(sort(unique(result$data$st_fips)))
+  tract_year(result$population_year)
+  display_state(state()[1L])
+  upload_status(sprintf("Loaded %s tracts across %d states.",
+    format(nrow(result$data), big.mark = ","), length(state())))
+})
+output$data_preview <- DT::renderDT({
+  shiny::req(uploaded_data(), display_state())
+  DT::datatable(asu_state_slice(uploaded_data(), display_state()), rownames = FALSE,
+                options = list(pageLength = 10, scrollX = TRUE, deferRender = TRUE))
+}, server = TRUE)
+output$selected_state <- shiny::renderText({
+  shiny::req(state(), display_state())
+  paste0(if (identical(display_state(), "ALL")) "Display: All uploaded states" else paste0("Display FIPS: ", display_state()),
+         "; solver scope: ", length(state()), " uploaded state(s)")
+})
+output$tract_pop_year <- shiny::renderText({
+  paste0("Population year (detected from Excel): ", tract_year())
 })
 
 # Update tigris_year reactiveVal when input changes
@@ -932,6 +820,7 @@ shiny::observeEvent(input$tract_year_input, {
 ## Controls {data-width="200"}
 
 ```{r}
+shiny::selectInput("display_state_initial", "Display area:", choices = character(0))
 # ---- New England year override controls ------------------------------
 shiny::conditionalPanel(
   condition = "output.is_new_england === true",
@@ -943,15 +832,14 @@ shiny::conditionalPanel(
       label   = "Override tract year for New England:",
       choices = list(
         "Use selected year from Data Initialization" = "detected",
-        "Force 2021 (last NECTA year)" = "2021"
+        "Use 2021 for New England states" = "2021"
       ),
       selected = "detected",
       inline = FALSE
     ),
     shiny::p(
       style = "font-size: 0.9em; color: #666;",
-      "Note: 2021 is the last year NECTA-based tracts were available for New England states. 
-       You may have already selected 2021 in the Data Initialization tab."
+      "This override applies only to New England states. Connecticut legacy county GEOIDs automatically use 2021 geometry; other states use the selected year."
     )
   )
 )
@@ -1092,8 +980,8 @@ output$algo_blurb <- shiny::renderUI({
        <p>
          <strong>Requirements:</strong> a working Python environment with
          OR-Tools. If it isn't available, you'll see a notice and can use
-         Tract Hunter or Simple Snake instead. For New England states, you may
-         need to switch the tract year to 2021 using the option shown above.
+         Tract Hunter or Simple Snake instead. Uploaded GEOIDs must match the
+         tract geometry; legacy Connecticut county GEOIDs use 2021 geometry automatically.
        </p>
        <p>
          Click <em>Load tracts &amp; initialise</em> to start. You can refine
@@ -1201,17 +1089,8 @@ shiny::observeEvent(input$process, {
   ## 0) Basic checks ------------------------------------------------------
   shiny::req(uploaded_data(), state(), tigris_year())
 
-  # Determine year (NE override)
   selected_year <- tigris_year()
-  state_val <- state()
-  if (!is.null(state_val) && length(state_val) > 0) {
-    new_england_fips <- c("09","23","25","33","44","50")
-    if (any(state_val %in% new_england_fips) &&
-        !is.null(input$ne_year_choice) &&
-        input$ne_year_choice == "2021") {
-      selected_year <- "2021"
-    }
-  }
+  new_england_2021 <- identical(input$ne_year_choice, "2021")
 
   # ensure 'res' exists even if something returns early
   res <- NULL
@@ -1243,7 +1122,7 @@ if (identical(algo_choice, "cpsat")) {
   shiny::withProgress(message = "Running OR-Tools CP-SAT…", value = 0, {
     # ---- 1) Preconditions & parameters --------------------------------
     shiny::req(uploaded_data(), state(), tract_year())
-    sel_year <- selected_year              # from your earlier NE override logic
+    sel_year <- selected_year
     st_fips  <- state()
     tau      <- if (is.null(input$cpsat_tau))       0.0645 else as.numeric(input$cpsat_tau)
     pop_thr  <- if (is.null(input$cpsat_pop))       10000  else as.integer(input$cpsat_pop)
@@ -1270,11 +1149,18 @@ if (identical(algo_choice, "cpsat")) {
     st_fips_str <- paste(st_fips, collapse = ", ")
     append_cpsat_log(sprintf("[NB] Downloading TIGER tracts for state(s) %s (year=%s)…", st_fips_str, sel_year))
     
-    # 2. Map over the vector of states, combine them, then calculate contiguity
-    tr_sf <- purrr::map(st_fips, \(st) {
-      tigris::tracts(state = st, year = sel_year, progress_bar = FALSE)
-    }) |>
-      dplyr::bind_rows()
+    # Validate coverage before calculating adjacency or launching Python.
+    tr_sf <- tryCatch(asu_load_tract_geography(
+      uploaded_data(), sel_year, new_england_2021,
+      log = function(...) append_cpsat_log(paste0(...))), error = identity)
+    if (inherits(tr_sf, "error")) {
+      append_cpsat_log(paste0("[geography][error] ", conditionMessage(tr_sf)))
+      shiny::showModal(shiny::modalDialog(title = "Tract geography mismatch",
+        conditionMessage(tr_sf), easyClose = TRUE))
+      cpsat_stage_text("geography validation failed")
+      cpsat_running(FALSE)
+      return(invisible(NULL))
+    }
     tr_sf$continuous <- asu_cached_neighbors(tr_sf, {
       raw_nb <- lapply(sfdep::st_contiguity(sf::st_geometry(tr_sf)), function(v)
         if (length(v) == 1L && v == 0L) integer(0) else as.integer(v))
@@ -1292,21 +1178,21 @@ if (identical(algo_choice, "cpsat")) {
       return(invisible(NULL))
     }
     
-    merged_sf <- tr_sf |>
-      dplyr::left_join(uploaded_data(), by="GEOID")
+    merged_sf <- tryCatch(asu_join_tract_data(tr_sf, uploaded_data()), error = identity)
+    if (inherits(merged_sf, "error")) {
+      append_cpsat_log(paste0("[input][error] ", conditionMessage(merged_sf)))
+      shiny::showModal(shiny::modalDialog(title = "Input problem",
+        conditionMessage(merged_sf), easyClose = TRUE))
+      cpsat_running(FALSE)
+      return(invisible(NULL))
+    }
     
     # The cached graph already includes island connections.
     nb <- merged_sf$continuous
     nb_adjacency(list(geoids = merged_sf$GEOID, nb = nb))
 
-    # Pre-simplify geometry inside withProgress so the initial map can render
-    # before the solver begins returning assignment snapshots.
-    append_cpsat_log("[NB] Simplifying tract geometry...")
-    sf::st_geometry(merged_sf) <- sf::st_geometry(merged_sf) |>
-      sf::st_make_valid() |>
-      sf::st_simplify(dTolerance = .005, preserveTopology = TRUE) |>
-      sf::st_zm(what = "ZM", drop = TRUE)
-    
+    # Keep original geometry for saved results, contiguity and solver work.
+    # Display simplification happens only for the selected display area.
     merged_df <- merged_sf |> sf::st_drop_geometry()
     append_cpsat_log(sprintf("[NB] Tracts kept: %d (after join)", nrow(merged_df)))
 
@@ -1371,7 +1257,9 @@ if (identical(algo_choice, "cpsat")) {
 
     # ---- 3) Temp run folder + files ------------------------------------
     shiny::incProgress(0.10, detail = "Writing inputs")
-    run_dir <- file.path(tempdir(), paste0("cpsat_", format(Sys.time(), "%Y%m%d_%H%M%S")))
+    legacy_checkpoint <- !use_partitioning && !use_split
+    run_dir <- if (legacy_checkpoint) asu_checkpoint_run_dir() else
+      file.path(tempdir(), paste0("cpsat_", format(Sys.time(), "%Y%m%d_%H%M%S")))
     dir.create(run_dir, recursive = TRUE, showWarnings = FALSE)
 
     df_csv   <- file.path(run_dir, "df.csv")
@@ -1424,15 +1312,20 @@ sys.path.insert(0, r'%s')
 print('[runner] module path added')
 
 from asu_cpsat import build_many_asus_cpsat
+from asu_checkpoint import request_rds_checkpoint
 import pandas as pd
 
 df = pd.read_csv(r'%s', dtype={'geoid': str})
 with open(r'%s','r') as f:
     nb = json.load(f)
 print('[runner] inputs: rows=' + str(len(df)) + ' nb_lists=' + str(len(nb)))
+checkpoint_folder = %s
+def save_checkpoint(phase, ids):
+    request_rds_checkpoint(checkpoint_folder, phase, ids)
 
 kwargs = dict(
     df=df, nb=nb,
+    legacy_checkpoint_callback=save_checkpoint if checkpoint_folder else None,
     initial_asu_id=df['warm_start_asu'].tolist() if 'warm_start_asu' in df.columns else None,
     split_warm_start=%s,
     tau=%s, pop_thresh=%d, max_asus=%d,
@@ -1488,11 +1381,14 @@ print('[runner] solver finished; writing json', flush=True)
 
 asu_id = res['asu_id'] if isinstance(res, dict) else getattr(res,'asu_id')
 asu_id = [int(x) for x in asu_id]
+if checkpoint_folder:
+    save_checkpoint('LEGACY_DONE', asu_id)
 with open(r'%s','w') as g:
     json.dump({'asu_id': asu_id}, g)
 print('[runner] OK', flush=True)
 ",
       py_mod_path, df_csv, nb_json,
+        if (legacy_checkpoint) as.character(jsonlite::toJSON(run_dir, auto_unbox = TRUE)) else "None",
         if (use_split) "True" else "False",
         format(tau, scientific = FALSE), pop_thr, max_asus, tlimit, workers, parallel_asus,
   if (use_partitioning) "True" else "False",
@@ -1560,6 +1456,7 @@ print('[runner] OK', flush=True)
           asunum = ifelse(asu_id_vals < 0L, 0L, as.integer(asu_id_vals))
         )
         push_asu_tooltip_updates(color_df)
+        color_df <- asu_state_slice(color_df, display_state())
         cm <- calculate_tract_colors(color_df)
         fill_expr <- mapgl::match_expr(
           column  = "GEOID",
@@ -1629,6 +1526,9 @@ print('[runner] OK', flush=True)
       err <- try(px$read_error_lines(),  silent = TRUE)
       if (!inherits(out,"try-error") && length(out)) append_cpsat_log(paste(out, collapse="\n"))
       if (!inherits(err,"try-error") && length(err)) append_cpsat_log(paste(err, collapse="\n"))
+
+      # Save before map/table work; the solver waits for this durable acknowledgment.
+      if (legacy_checkpoint) asu_service_checkpoints(run_dir, initial_sf, append_cpsat_log)
 
       pf <- cpsat_progress_json()
       if (!is.null(pf) && file.exists(pf)) {
@@ -1781,11 +1681,14 @@ print('[runner] OK', flush=True)
     ## 1a · Build tracts + neighbours (can take ~10\u201360 s the first time)
     shiny::incProgress(0.10, detail = "Downloading Census shapefiles\u2026")
 
-    # use selected_year (handles New England override)
-    # Map over each state to fetch tracts, bind into one map, then calculate contiguity
-    tract_list <- purrr::map(state(), \(st) tigris::tracts(state = st, year = selected_year)) |> 
-      dplyr::bind_rows() |>
-      dplyr::mutate(row_num = dplyr::row_number())
+    tract_list <- tryCatch(asu_load_tract_geography(
+      uploaded_data(), selected_year, new_england_2021), error = identity)
+    if (inherits(tract_list, "error")) {
+      shiny::showModal(shiny::modalDialog(title = "Tract geography mismatch",
+        conditionMessage(tract_list), easyClose = TRUE))
+      return(invisible(NULL))
+    }
+    tract_list$row_num <- seq_len(nrow(tract_list))
     tract_list$continuous <- asu_cached_neighbors(tract_list,
       sfdep::st_contiguity(sf::st_geometry(tract_list)))
 
@@ -1802,8 +1705,7 @@ print('[runner] OK', flush=True)
 
     ## 1b · Merge the BLS data (kept for potential checks/debug)
     shiny::incProgress(0.3, detail = "Merging BLS unemployment data\u2026")
-    data_merge <- tract_list |>
-      dplyr::left_join(uploaded_data(), by = "GEOID")
+    data_merge <- asu_join_tract_data(tract_list, uploaded_data())
 
     # (kept for backward-compat, even if not used directly)
     join_flag <- isTRUE(input$join_touching)
@@ -2028,8 +1930,7 @@ map_update_trigger <- shiny::debounce(shiny::reactive({
 }), 200)
 
 # Observer for debounced updates — fires when full_data() or input$update changes.
-# paint_only=TRUE skips set_source so no GeoJSON is shipped on manual edits;
-# algorithm completions use explicit update_map_efficiently() calls with the default.
+# Assignment edits update paint only; geometry travels through the shared HTTP source.
 shiny::observeEvent(map_update_trigger(), {
   if (!is.null(full_data()) && nrow(full_data()) > 0) {
     update_map_efficiently("edit_map", paint_only = TRUE)
@@ -2041,7 +1942,8 @@ shiny::observeEvent(map_update_trigger(), {
 # Read-only overview map for Load Initial ASU tab; keyed on geoid_set() so it
 # only re-renders when the tract set changes, not on every asunum edit.
 output$initial_map <- mapgl::renderMaplibre({
-  shiny::req(length(geoid_set()) > 0)
+  map_revision()
+  if (!length(geoid_set())) return(mapgl::maplibre(style = mapgl::carto_style("positron")))
   map_data <- shiny::isolate(map_geom())
   if (is.null(map_data) || nrow(map_data) == 0) {
     return(
@@ -2050,25 +1952,16 @@ output$initial_map <- mapgl::renderMaplibre({
     )
   }
 
-  tile_source <- ensure_map_tiles(map_data)
   map_data <- map_data |> dplyr::mutate(asunum = dplyr::na_if(asunum, 0L))
 
   colors <- calculate_tract_colors(map_data)
 
   map <- mapgl::maplibre(style = mapgl::carto_style("positron")) |>
-    mapgl::fit_bounds(map_data, animate = FALSE)
-  layer_source <- map_data
-  source_layer <- NULL
-  if (!is.null(tile_source)) {
-    map <- map |>
-      mapgl::add_pmtiles_source(
-        id = tile_source$source_id,
-        url = tile_source$url,
-        promote_id = "GEOID"
-      )
-    layer_source <- tile_source$source_id
-    source_layer <- tile_source$source_layer
-  }
+    mapgl::fit_bounds(asu_display_bounds(map_data), animate = FALSE)
+  source <- shiny::isolate(map_source())
+  map$x$sources <- list(source$source)
+  layer_source <- "tracts-source"
+  source_layer <- source$source_layer
 
   map |>
     mapgl::add_fill_layer(
@@ -2122,7 +2015,7 @@ output$initial_map <- mapgl::renderMaplibre({
       visibility = "none"
     )
 }) |>
-  shiny::bindCache(geoid_set(), cache = "session")
+  shiny::bindCache(map_revision(), cache = "session")
 ```
 
 
@@ -2144,6 +2037,7 @@ mapgl::maplibreOutput("initial_map", height = "100vh")
 These tools allow you to select, inspect, and change ASU designations for individual Census tracts.  *Selected* Census tracts will be outlined in red, and are the tracts updated when you change the ASU number.  You may also click on the map to select or unselect individual tracts. An ASU value of 0 means the tract is not included in any ASU.
 
 ```{r}
+shiny::selectInput("display_state_edit", "Display area:", choices = character(0))
 #-------Total Unemployment Box --------------------------------
 shiny::htmlOutput("total_unemp2")
 shiny::renderUI(shiny::HTML("<hr>"))
@@ -2164,7 +2058,7 @@ shiny::renderUI(shiny::HTML("<hr>"))
 
 asu_choices <- shiny::reactive({
   shiny::req(full_data())
-  full_data() |> dplyr::pull(asunum) |> unique() |> sort()
+  display_data() |> dplyr::pull(asunum) |> unique() |> sort()
 }) |> shiny::debounce(400)
 
 # Push choice updates in-place; 400 ms debounce absorbs rapid sequential edits.
@@ -2203,28 +2097,20 @@ shiny::actionButton("reset", "Reset to Initial Data")
   
 output$edit_map <- mapgl::renderMaplibre({
 
-  shiny::req(length(geoid_set()) > 0)
+  map_revision()
+  if (!length(geoid_set())) return(mapgl::maplibre(style = mapgl::carto_style("positron")))
   # isolate() prevents reactive dependency on map_geom()/full_data() so that
   # asunum edits do not invalidate this output and cause MapLibre to reinitialise.
   data <- shiny::isolate(map_geom())
   if (is.null(data) || nrow(data) == 0) return(NULL)
 
   colors <- calculate_tract_colors(data)
-  tile_source <- ensure_map_tiles(data)
   map <- mapgl::maplibre(style = mapgl::carto_style("positron")) |>
-    mapgl::fit_bounds(data, animate = FALSE)
-  layer_source <- data
-  source_layer <- NULL
-  if (!is.null(tile_source)) {
-    map <- map |>
-      mapgl::add_pmtiles_source(
-        id = tile_source$source_id,
-        url = tile_source$url,
-        promote_id = "GEOID"
-      )
-    layer_source <- tile_source$source_id
-    source_layer <- tile_source$source_layer
-  }
+    mapgl::fit_bounds(asu_display_bounds(data), animate = FALSE)
+  source <- shiny::isolate(map_source())
+  map$x$sources <- list(source$source)
+  layer_source <- "tracts-source"
+  source_layer <- source$source_layer
 
   map |>
     mapgl::add_fill_layer(
@@ -2298,7 +2184,7 @@ output$edit_map <- mapgl::renderMaplibre({
       visibility = "none"
     )
 }) |>
-  shiny::bindCache(geoid_set(), cache = "session")
+  shiny::bindCache(map_revision(), cache = "session")
 
 # OPTIMIZATION 1: Use set_filter instead of clear/add for selection highlighting
 shiny::observeEvent(input$edit_map_feature_click, {
@@ -2307,6 +2193,7 @@ shiny::observeEvent(input$edit_map_feature_click, {
 
   clicked_geoid <- click$properties$GEOID
   if (is.null(clicked_geoid) || length(clicked_geoid) == 0 || is.na(clicked_geoid)) return()
+  if (!clicked_geoid %in% display_data()$GEOID) return()
 
   # toggle selection
   if (clicked_geoid %in% current_selection) {
@@ -2369,7 +2256,7 @@ shiny::observeEvent(input$select_asunum, {
     "selected",
     selected_tract_ids
   ) |>
-    mapgl::fit_bounds(subset(full_data(), GEOID %in% selected_tract_ids), animate = TRUE)
+    mapgl::fit_bounds(asu_display_bounds(subset(full_data(), GEOID %in% selected_tract_ids)), animate = TRUE)
 })
 
 
@@ -2388,7 +2275,7 @@ shiny::observeEvent(input$select_geoid, {
       "selected",
       selected_tract$GEOID
     ) |>
-      mapgl::fit_bounds(selected_tract, animate = TRUE)
+      mapgl::fit_bounds(asu_display_bounds(selected_tract), animate = TRUE)
 
     selected_tracts(selected_tract$GEOID)
   }
@@ -2469,7 +2356,7 @@ shiny::observeEvent(input$update, {
   selected_tracts(NULL)
 
   # Paint-only update fires immediately so colors change without waiting for the
-  # 200 ms debounce. GeoJSON sources refresh afterward; PMTiles remain immutable.
+  # 200 ms debounce. The shared geometry source remains unchanged.
   cm <- calculate_tract_colors(map_geom())
   proxy <- mapgl::maplibre_proxy("edit_map") |>
     mapgl::set_paint_property(
@@ -2491,7 +2378,7 @@ refresh_edit_map <- function() {
   
   # Use the efficient update function that handles data changes
   update_map_with_data("edit_map", data) |>
-    mapgl::fit_bounds(data, animate = TRUE)
+    mapgl::fit_bounds(asu_display_bounds(data), animate = TRUE)
 }
 
 
@@ -2538,6 +2425,9 @@ shiny::observeEvent(input$load_data, {
   
   # Update full_data with the loaded data
   full_data(loaded_data)
+  full_data_reset(loaded_data)
+  nb_adjacency(NULL)
+  display_state(sort(unique(substr(loaded_data$GEOID, 1L, 2L)))[1L])
   
   # Provide feedback to the user
   shiny::showModal(shiny::modalDialog(
@@ -2547,8 +2437,7 @@ shiny::observeEvent(input$load_data, {
   ))
   
   # Use the efficient update function for new data
-  update_map_with_data("edit_map", loaded_data) |>
-    mapgl::fit_bounds(loaded_data, animate = TRUE)
+  # map_revision() creates the selected display source after this observer finishes.
   
   # Clear any existing selections/highlights
   selected_tracts(NULL)
@@ -2682,7 +2571,7 @@ output$summary_table <- DT::renderDataTable({
     DT::formatRound(columns = "Unemp. Rate %", digits = 2) |>
     DT::formatCurrency(columns = c("Population", "Labor Force", "Unemp."),
                        currency = "", digits = 0)
-}, server = FALSE)
+}, server = TRUE)
 
 # DT row selected → highlight those tracts on the map
 shiny::observeEvent(input$summary_table_rows_selected, ignoreNULL = FALSE, {
@@ -2924,7 +2813,7 @@ output$asu_review <- DT::renderDataTable({
       color       = DT::styleEqual(c("TRUE", "FALSE"), c("#2e7d32", "#c62828")),
       fontWeight  = "bold"
     )
-}, server = FALSE)
+}, server = TRUE)
 
 shiny::observeEvent(input$lss_txt, {
   

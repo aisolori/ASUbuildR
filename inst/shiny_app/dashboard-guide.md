@@ -25,6 +25,7 @@ run `ASUbuildR::setup_asu_python()` in R, then restart the dashboard.
 | Control | Meaning |
 | --- | --- |
 | Choose Excel File / Browse | Loads the BLS workbook (`.xls` or `.xlsx`, typically `ST_asuYY.xlsx`). The importer expects the original column order in A through AB, with headers in row 1. |
+| Display area | Selects one state or **All states (nationwide)** for the preview and both maps. The selectors on Data Initialization, Load Initial ASU, and Modify ASU Selections stay synchronized. This changes the display, not the solver's uploaded-state scope. |
 | Census Tract Year | Boundary vintage used for the map and tract matching. Separate from the population year read from the workbook. The current selector accepts 2010–2025 and initially shows 2024. |
 | Preview and detected state/year | Check that the state and tract values match the intended workbook before building. |
 | New England Year Override (on Load Initial ASU) | Uses the selected boundary year or **Force 2021 (last NECTA year)**. Choose a vintage matching the workbook's GEOIDs. This changes the boundary download; it does not convert the workbook's geography. |
@@ -32,6 +33,37 @@ run `ASUbuildR::setup_asu_python()` in R, then restart the dashboard.
 Keep GEOIDs (tract identifiers) intact, including leading zeros. The importer
 expects county-based tract data. The first boundary download needs internet
 access; later runs can reuse cached boundaries.
+
+Nationwide workbooks are read in full and retained on the server. The upload
+validates tract IDs, duplicate records, state codes and numeric counts before
+replacing the current data. The preview uses server-side pagination. No tract
+geometry is built by the upload handler; initialization starts with the explicit
+**Load tracts & initialise** action.
+
+Maps use PMTiles by default when `freestiler` and PMTiles support in `mapgl` are
+installed. PMTiles archives are cached on disk and served as byte ranges through
+the authenticated Shiny session, so no separate tile-server port is needed.
+`options(ASUbuildR.use_pmtiles = FALSE)` selects the HTTP GeoJSON fallback.
+Choose a state or **All states (nationwide)** from **Display area**. All states
+shows every uploaded state and requires PMTiles, fetching tiles on demand through
+the Shiny session HTTP endpoint. Its first load can take several minutes to
+simplify geometry and build the cached archive; a progress indicator appears.
+The last two display geometries are retained during the session for faster switching.
+The GeoJSON fallback is available for single-state views. All layers share one
+source. Display geometry is simplified in
+metres; original geometry, neighbor lists and solver inputs stay on the server.
+Changing an ASU assignment updates colors and tooltips without resending polygons.
+Switching the display area clears the tract selection but retains all assignments.
+The selector affects maps and paginated detail tables, not the nationwide solver scope.
+
+For diagnostics, `[payload]` messages record serialized byte counts and output
+IDs without data contents. `transport=websocket` records the complete logical
+message before httpuv sends it; individual outputs in the same update share its
+message number. `transport=http-geojson` records the separate geometry response;
+`transport=http-pmtiles-range` records bytes served for a tile-range request.
+Set `options(asu.payload_log = "path/to/payload.log")` to retain these records,
+or `options(asu.payload_logging = FALSE)` to disable the WebSocket hook. The hook
+is guarded for Shiny-version compatibility; it does not change network limits.
 
 ## Load Initial ASU: algorithms and buttons
 
@@ -51,13 +83,23 @@ unemployment captured.
 
 ### CP-SAT parameters
 
-Supernode polishing starts each pass with the least total unemployment first,
-breaking ties by ASU number. A merge is committed immediately, but surviving
+Version 0.6.51 enables `symmetry_level=3` for all ASU solver phases, including
+large models that CP-SAT would otherwise skip. Symmetry detection retains a
+`symmetry_detection_deterministic_time_limit` of 1.0. This is deterministic
+solver time, not a one-second wall-clock guarantee. The setting applies even
+when the custom worker portfolio is disabled. It is an experiment: extra
+presolve work may or may not improve the incumbent or proof within the total
+solve budget.
+
+Partition polishing starts each pass with the highest total `q_surplus` first,
+breaking ties by ASU number. Surplus includes all member tracts, including
+negative-surplus tracts, at the current unemployment-rate threshold.
+A merge is committed immediately, but surviving
 ASUs still waiting in that pass keep their turns. Absorbed ASUs are removed;
 groups containing an ASU already checked wait for the next pass. Once the
-remaining queue finishes, a new pass recalculates unemployment order from the
-updated assignments. Ordinary polishing with merging disabled keeps highest
-unemployment first.
+remaining queue finishes, a new pass recalculates surplus order from the
+updated assignments. This ordering also applies with merging disabled and to
+follow-up polishing passes. Logs report `priority=q_surplus_descending`.
 
 Partitioning's **Initial ASU seed method** defaults to connected components of
 the connectivity-free solution. The optional **Surplus pruning** method starts
@@ -87,8 +129,15 @@ Dashboard runs disable the standalone `[graph-cut]` hint stage and corridor
 heuristics to the main solver, which retains its internal `[cut-pass]`.
 That pass carries its generated cuts and tighter bounds into the exact solve.
 The single-ASU `[cut-pass]` has no time limit, including within each round.
-It stops after 100 rounds or ten consecutive rounds without a lower proven
-upper bound; a better bound resets the stall counter. Proof, Stop/Skip, and
+It stops after 100 rounds, 25 consecutive rounds without a lower proven
+upper bound, or 50 consecutive rounds without higher valid unemployment,
+whichever happens first. Each improvement resets only its own stall counter.
+Equal-value solutions and disconnected candidates do not reset the valid
+unemployment counter. Logs show `valid_unemp_stall=N/50` and
+`stop_reason=VALID_UNEMP_STALL` when that limit ends the cut pass. The shared
+joint, split, and supernode cut passes use this same 50-round valid unemployment
+limit; it stays at 50 even when supernode retries increase other limits.
+Proof, Stop/Skip, and
 solver failure can end it earlier. Cut-pass time is additional to the configured
 solve budget, which still limits the other solve phases.
 Within each round, a callback stops search once an incumbent exposes a new
@@ -256,7 +305,7 @@ infeasibility.
 | PARTITION_EXPANSION_COMPLETE | Summarizing that round. Rejected seeds did not produce valid ASUs; the whole run can continue. |
 | PARTITION_TOUCHING_JOINT / PARTITION_TOUCHING_JOINT_COMPLETE | Jointly reoptimizing a touching partition cluster with reachable unassigned tracts. Reports source stage, group/window size, budget/workers, movable roots, baseline unemployment, gain, deactivated slots, acceptance, and elapsed time. `CACHED` skips an unchanged attempted neighborhood, not a proof of optimality. |
 | PARTITION_BUILD_MERGE / PARTITION_COMBINE | Legacy touching-group combining; partitioning uses the joint check instead. |
-| FINAL_POLISH | With merging enabled, processes ASUs from least to most total unemployment. After a merge, the queue is rebuilt from updated unemployment totals without special merge priority. |
+| FINAL_POLISH | Processes ASUs from highest to lowest total q_surplus. After a merge, pending surviving ASUs finish their turns; the next pass recalculates surplus from updated memberships. |
 | FINAL_POLISH_MERGE | Committing a merge and finishing remaining queued ASUs before restarting polishing. |
 | SINGLE_ASU_TAKEOVER / TAKEOVER_DONOR_REPAIR | Partitioning only. Runs flow-free graph cuts before the takeover flow solve, then repairs affected groups before accepting or rejecting the attempt. |
 | FINAL_RESIDUAL_CHECK | Checking remaining tract components near the end. |
@@ -267,7 +316,8 @@ Legacy single-ASU runs proceed to the final residual check after their ASU
 search passes; they do not run `SINGLE_ASU_TAKEOVER` or its donor repairs.
 
 In Partitioning, the single-ASU takeover uses the same untimed cut pass:
-100 rounds maximum or ten rounds without an improved upper bound.
+100 rounds maximum, 25 rounds without an improved upper bound, or 50 rounds
+without improved valid unemployment, whichever happens first.
 All generated cuts strengthen the subsequent exact model.
 A round can stop early on a newly discovered connectivity cut, just as in
 Legacy's main cut pass; it need not prove a disconnected assignment optimal.
@@ -275,13 +325,14 @@ A proven optimum can skip further primary optimization; Stop and Skip remain act
 
 The post-polish bridge-pair pass has been removed (both cuts and flow).
 Supernode polishing starts with connectivity cuts on the contracted graph.
-Its rounds check ASUs from least to most total unemployment, breaking ties by
+Its rounds check ASUs from highest to lowest total q_surplus, breaking ties by
 ASU ID. After a merge, remaining surviving ASUs finish before the queue restarts
-in this same unemployment order. Ordinary polishing with merging
-disabled retains highest-unemployment-first order.
+in this same surplus order. Ordinary polishing with merging
+disabled also uses highest-surplus-first order.
 `FINAL_POLISH_SUPERNODES_CUT_ROUND` reports the upper bound and its stall count.
-The first cut pass stops after 25 cut rounds or ten consecutive rounds without a
-better upper bound, whichever happens first. A better bound resets the stall
+The first cut pass stops after 100 cut rounds, 25 consecutive rounds without a
+better upper bound, or 50 consecutive rounds without higher valid unemployment,
+whichever happens first. A better bound resets its stall
 count, not the total round count. There is no individual-cut-count cap.
 Proof, cancellation, and the overall polish time limit can stop it sooner.
 Individual supernode cut rounds also stop on new connectivity cuts; their
@@ -291,12 +342,13 @@ their existing per-round and overall cut-pass time budgets.
 Exact flow retains the cuts and best connected solution and uses the remaining
 time. If primary flow stalls with a valid incumbent that absorbs another ASU,
 that solution returns immediately for merge validation/commit and the polish
-queue continues with remaining surviving ASUs before restarting in lowest
-unemployment order. Equal statewide unemployment is sufficient; coverage cannot
+queue continues with remaining surviving ASUs before restarting in highest
+surplus order. Equal statewide unemployment is sufficient; coverage cannot
 decrease. `FINAL_POLISH_SUPERNODES_STALL_MERGE` reports this handoff.
 Otherwise, if the primary flow solve reaches its incumbent stall limit without a
-proof, another flow-free cut pass runs with both limits doubled: 50/20, 100/40,
-200/80, and so on. Each flow solve is rebuilt from the accumulated cuts.
+proof, another flow-free cut pass runs with the total-round and upper-bound-stall
+limits doubled: 200/50, 400/100, 800/200, and so on. The valid unemployment stall
+limit remains 50 per cut pass. Each flow solve is rebuilt from the accumulated cuts.
 The primary flow incumbent-stall allowance also doubles on each retry:
 the configured limit, then 2x, 4x, and so on. A disabled stall limit stays
 disabled. Cycle/flow stage logs report the active allowance. Valid
@@ -515,6 +567,21 @@ the same filenames in the active save directory.
 
 ## Troubleshooting
 
+Legacy single-ASU solves automatically save a recovery RDS immediately after a
+valid exact result returns, before trade refinement, merging, or another solve.
+A second checkpoint saves the final run result. Python waits for each save to
+finish; a failed save stops further solving and reports the error. Check the
+`[checkpoint] Saved ...` log line for the full filename. These files retain the
+original geometry, GEOIDs, population/economic data and ASU assignments, and can
+be opened with **Load Data** or used as a warm start.
+
+Recovery files and legacy run logs live under `~/ASUbuildR/checkpoints/` on the
+machine running R (on EC2, normally `/home/anton/ASUbuildR/checkpoints/`). Set
+`ASU_CHECKPOINT_DIR` before launching the dashboard to choose another persistent
+folder. Each run/save has a unique name; older saves are not overwritten or
+automatically deleted. RDS files are uncompressed to save quickly. The small
+assignment request JSON is also retained if R cannot complete the save.
+
 - **Python not detected:** run `ASUbuildR::setup_asu_python()` and
   `ASUbuildR::check_asu_python()`, then restart the dashboard.
 - **Upload/matching fails:** check the workbook layout, state, GEOIDs, boundary
@@ -554,3 +621,9 @@ Set `options(asu.neighbor_cache_dir = "path/to/cache")` before launching the
 dashboard to choose a location, or `options(asu.neighbor_cache_dir = FALSE)` to
 disable caching. Delete the cache directory to force rebuilding. Invalid cache
 files are rebuilt automatically; inability to save a cache does not block a run.
+
+Nationwide solver initialization matches every uploaded GEOID before building the neighbor graph. Connecticut workbooks with legacy county GEOIDs use TIGER 2021 for Connecticut only; other states retain the selected geography year. The optional New England year override affects only New England states. A population year such as 2025 does not imply a 2025 geography vintage. Missing tract matches stop initialization with a diagnostic instead of creating blank counts.
+
+During reverse pruning, the live CP-SAT log and stage display report elapsed time, removed and remaining tracts, current and target unemployment rates, retained population and unemployment, and average removals per second. Updates appear approximately every 10 seconds, after a pruning step finishes, with immediate start and completion messages. Completion states whether the rate threshold was reached or no valid removal remained. These are preprocessing progress reports, not a percentage-complete estimate.
+
+After reverse pruning, warm-start trade refinement has a 30-second budget and reports HINT_TRADES progress every 10 seconds. The following articulation reroute also has a 30-second budget, checked inside its graph searches, and reports HINT_REROUTE progress. These cooperative budgets keep the best completed feasible hint; a single in-progress graph operation can briefly overrun a deadline. Stop/Skip is checked during reverse pruning and these refinements. Stop during hint preparation retains validated, nonoverlapping feasible hints as ASUs before returning. Exact CP-SAT time and cut limits are separate.

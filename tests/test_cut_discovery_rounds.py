@@ -88,6 +88,33 @@ class CutDiscoveryRoundsTest(unittest.TestCase):
                                created=created, proof=proof, bounds=bounds, reports=reports,
                                initial_rows=initial_rows, output=output.getvalue())
 
+    def test_valid_unemployment_stall_counts_equal_and_disconnected_rounds(self):
+        for status in (solver.cp_model.FEASIBLE, solver.cp_model.UNKNOWN):
+            for candidate in ([0], [0, 2]):
+                with self.subTest(status=status, candidate=candidate):
+                    rounds = [dict(candidates=[candidate], bound=900-i, status=status)
+                              for i in range(60)]
+                    result = self.run_rounds(rounds, max_rounds=100, stall=25)
+                    self.assertEqual(len(result.created), 50)
+                    self.assertEqual(result.result[:2], ([[0]], 10))
+                    self.assertEqual(result.proof, [False])
+                    self.assertIn('valid_unemp_stall=50/50', result.output)
+                    self.assertIn('stop_reason=VALID_UNEMP_STALL', result.output)
+                    self.assertEqual(result.bounds, [851])
+
+    def test_valid_callback_gain_resets_stall_even_with_disconnected_final(self):
+        for status in (solver.cp_model.FEASIBLE, solver.cp_model.UNKNOWN):
+            with self.subTest(status=status):
+                rounds = [dict(candidates=[[0, 2]], bound=900-i, status=status)
+                          for i in range(90)]
+                rounds[24]['candidates'] = [[0, 1], [0, 2]]
+                result = self.run_rounds(rounds, max_rounds=100, stall=25)
+                self.assertEqual(len(result.created), 75)
+                self.assertEqual(result.result[:2], ([[0, 1]], 20))
+                self.assertRegex(result.output, r'CUT_ROUND round=25 .*valid_unemp=20 .*valid_unemp_stall=0/50')
+                self.assertIn('valid_unemp_stall=50/50', result.output)
+                self.assertIn('stop_reason=VALID_UNEMP_STALL', result.output)
+
     def test_useful_cut_stops_round_and_only_certified_bound_is_carried(self):
         result = self.run_rounds([dict(candidates=[[0, 2]])])
         self.assertEqual(result.created[0].stop_calls, 1)
