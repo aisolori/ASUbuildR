@@ -201,9 +201,11 @@ if (is_dev_mode) {
   source(file.path(r_dir,"setup_asu_python.R"))
   source(file.path(r_dir, "read_asu_warm_start.R"))
   source(file.path(r_dir, "asu_summary.R"))
+  source(file.path(r_dir, "neighbor_cache.R"))
 } else {
   asu_read_warm_start <- getFromNamespace("asu_read_warm_start", "ASUbuildR")
   asu_summarize_tracts <- getFromNamespace("asu_summarize_tracts", "ASUbuildR")
+  asu_cached_neighbors <- getFromNamespace("asu_cached_neighbors", "ASUbuildR")
   message("→ Installed package mode: functions should already be available")
 }
 
@@ -1272,8 +1274,12 @@ if (identical(algo_choice, "cpsat")) {
     tr_sf <- purrr::map(st_fips, \(st) {
       tigris::tracts(state = st, year = sel_year, progress_bar = FALSE)
     }) |>
-      dplyr::bind_rows() |>
-      dplyr::mutate(continuous = sfdep::st_contiguity(geometry))
+      dplyr::bind_rows()
+    tr_sf$continuous <- asu_cached_neighbors(tr_sf, {
+      raw_nb <- lapply(sfdep::st_contiguity(sf::st_geometry(tr_sf)), function(v)
+        if (length(v) == 1L && v == 0L) integer(0) else as.integer(v))
+      fix_nb_islands(raw_nb, as.numeric(tr_sf$INTPTLAT), as.numeric(tr_sf$INTPTLON))
+    }, mode = "queen-island-v1", log = function(...) append_cpsat_log(paste0(...)))
     
     # Join with uploaded BLS
     cols_needed <- c("GEOID","tract_ASU_unemp","tract_ASU_emp","tract_pop_cur","tract_ASU_clf","tract_ASU_urate")
@@ -1289,57 +1295,8 @@ if (identical(algo_choice, "cpsat")) {
     merged_sf <- tr_sf |>
       dplyr::left_join(uploaded_data(), by="GEOID")
     
-    # Apply island fix
-    append_cpsat_log("[NB] Applying island fix to connect disconnected components")
-    
-    # Convert list column to regular lists
-    merged_sf$continuous <- lapply(merged_sf$continuous, function(x) {
-      # If it's scalar 0, replace with integer(0)
-      if (length(x) == 1 && x == 0) return(integer(0))
-      as.integer(x)
-    })
-    
-    # Use igraph to identify components
+    # The cached graph already includes island connections.
     nb <- merged_sf$continuous
-    g <- igraph::graph_from_adj_list(nb)
-    comps <- igraph::components(g)
-    main_component_id <- which.max(comps$csize)
-    main_indices <- which(comps$membership == main_component_id)
-    island_indices <- which(comps$membership != main_component_id)
-    
-    # If there are islands, connect them to the mainland
-    if (length(island_indices) > 0) {
-      append_cpsat_log(sprintf("[NB] Found %d tracts in islands, connecting to mainland", length(island_indices)))
-      
-      coords <- data.frame(
-        INTPTLAT = as.numeric(merged_sf$INTPTLAT),
-        INTPTLON = as.numeric(merged_sf$INTPTLON)
-      )
-      
-      island_component_ids <- setdiff(unique(comps$membership), main_component_id)
-      for (island_id in island_component_ids) {
-        island_members <- which(comps$membership == island_id)
-        # For all members of this island component, get distances to all in main
-        combis <- expand.grid(island = island_members, main = main_indices)
-        combis$dist <- sqrt(
-          (coords$INTPTLAT[combis$island] - coords$INTPTLAT[combis$main])^2 +
-          (coords$INTPTLON[combis$island] - coords$INTPTLON[combis$main])^2
-        )
-        closest <- combis[which.min(combis$dist), ]
-        g <- igraph::add_edges(g, c(closest$island, closest$main))
-        
-        # Update the neighborhood lists with the new connection
-        nb[[closest$island]] <- c(nb[[closest$island]], closest$main)
-        nb[[closest$main]] <- c(nb[[closest$main]], closest$island)
-      }
-      
-      append_cpsat_log("[NB] Island fix complete - all tracts now connected")
-    } else {
-      append_cpsat_log("[NB] No islands detected - all tracts already connected")
-    }
-    
-    # Update merged_sf with the fixed neighborhood structure
-    merged_sf$continuous <- nb
     nb_adjacency(list(geoids = merged_sf$GEOID, nb = nb))
 
     # Pre-simplify geometry inside withProgress so the initial map can render
@@ -1828,20 +1785,19 @@ print('[runner] OK', flush=True)
     # Map over each state to fetch tracts, bind into one map, then calculate contiguity
     tract_list <- purrr::map(state(), \(st) tigris::tracts(state = st, year = selected_year)) |> 
       dplyr::bind_rows() |>
-      dplyr::mutate(
-        row_num    = dplyr::row_number(),
-        continuous = sfdep::st_contiguity(geometry)
-      )
+      dplyr::mutate(row_num = dplyr::row_number())
+    tract_list$continuous <- asu_cached_neighbors(tract_list,
+      sfdep::st_contiguity(sf::st_geometry(tract_list)))
 
     # Build and cache island-fixed neighbor graph for contiguity checks.
     nb_adjacency(list(
       geoids = tract_list$GEOID,
-      nb     = fix_nb_islands(
+      nb     = asu_cached_neighbors(tract_list, fix_nb_islands(
         lapply(tract_list$continuous, function(x)
           if (length(x) == 1L && x == 0L) integer(0L) else as.integer(x)),
         as.numeric(tract_list$INTPTLAT),
         as.numeric(tract_list$INTPTLON)
-      )
+      ), mode = "queen-island-v1")
     ))
 
     ## 1b · Merge the BLS data (kept for potential checks/debug)
@@ -2899,12 +2855,14 @@ summarized_asu <- shiny::reactive({
   if (is.null(nb_check)) {
     # Fallback for sessions loaded from RDS: rebuild from current geometry.
     all_sf  <- full_data()
-    raw_nb  <- lapply(
+    raw_nb  <- asu_cached_neighbors(all_sf, lapply(
       suppressWarnings(sfdep::st_contiguity(all_sf$geometry)),
       function(x) if (length(x) == 1L && x == 0L) integer(0L) else as.integer(x)
-    )
+    ))
     fixed_nb <- if (all(c("INTPTLAT", "INTPTLON") %in% names(all_sf)))
-      fix_nb_islands(raw_nb, as.numeric(all_sf$INTPTLAT), as.numeric(all_sf$INTPTLON))
+      asu_cached_neighbors(all_sf,
+        fix_nb_islands(raw_nb, as.numeric(all_sf$INTPTLAT), as.numeric(all_sf$INTPTLON)),
+        mode = "queen-island-v1")
     else raw_nb
     nb_check <- list(geoids = all_sf$GEOID, nb = fixed_nb)
     nb_adjacency(nb_check)

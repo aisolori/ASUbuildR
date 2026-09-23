@@ -534,3 +534,23 @@ the same filenames in the active save directory.
 The experimental statewide joint strategy and user-imposed ASU tract limits
 have been removed from the dashboard, R wrapper, Python API and CLI.
 Connectivity cut passes and touching-ASU joint checks remain available.
+
+### Persistent neighbor cache
+
+The dashboard automatically caches tract adjacency lists as JSON in
+`rappdirs::user_cache_dir("ASUbuildR", "neighbors")`. CP-SAT reuses the completed
+island-connected graph on subsequent loads, skipping contiguity construction
+and island repair. The other initialization algorithms and saved-data summary
+checks also reuse cached graphs. Logs report when neighbors are built or reused.
+
+Cache keys include ordered GEOIDs, geometry and CRS, island-repair coordinates,
+spatial-library versions/settings, and the neighbor algorithm version. Changes
+to unemployment or population attributes do not invalidate the graph. Tract
+geometry still loads from the existing TIGER cache. Each solver run retains its
+own zero-based `nb.json`, so saved scripts remain self-contained; the persistent
+cache stores one-based R adjacency lists with validation metadata.
+
+Set `options(asu.neighbor_cache_dir = "path/to/cache")` before launching the
+dashboard to choose a location, or `options(asu.neighbor_cache_dir = FALSE)` to
+disable caching. Delete the cache directory to force rebuilding. Invalid cache
+files are rebuilt automatically; inability to save a cache does not block a run.
