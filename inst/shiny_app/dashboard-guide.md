@@ -81,6 +81,92 @@ small groups carefully. **CP-SAT (OR-Tools)** searches for connected groups
 meeting the configured population and rate thresholds while increasing the
 unemployment captured.
 
+### Component-first global strategy
+
+Choose **Component-first global (automatic ASU count)** to maximize captured
+unemployment over the full input graph without choosing a number of ASUs.
+The model selects tracts; each connected selected component becomes an ASU
+only if it independently meets both the population and unemployment-rate
+thresholds. Touching valid groups may become one component without losing
+captured unemployment. This requires the same minimum thresholds throughout
+the solve, with no maximum ASU size or separation requirement.
+
+The search begins with an optimistic model and adds valid component cuts:
+an invalid isolated component must lose at least one selected tract or connect
+to additional territory. Qualifying components from intermediate solutions
+provide valid incumbents, but are never locked into the global model. Future
+rounds can expand, split, merge, or replace them. The strategy keeps the best
+validated total unemployment found, not the relaxed objective when some
+components still fail eligibility.
+
+The global model carries its tightest certified unemployment upper bound into
+later rounds as an objective ceiling. After each solve, it cuts every invalid
+component in the returned candidate and at most eight extra components
+collected from intermediate candidates. Small input graphs (up to 256 tracts)
+also receive conditional population, rate, and positive-labor-force constraints
+around invalid components. These extra regional constraints are disabled for
+larger inputs because their cost outweighed their benefit in the Wisconsin run.
+All enabled cuts are valid restrictions, not permanent search boundaries.
+
+Short, targeted repair solves periodically revisit invalid components together
+with nearby valid ASUs and unassigned tracts. Repairs may reshape or replace
+the affected selections; they do not permanently freeze any ASU. When neither
+validated unemployment nor the upper bound improves, a stronger repair attempt
+is scheduled, then global search continues. By default, eligible repairs
+receive up to one second every five cut rounds; after eight stalled rounds they
+receive up to two seconds, at least four rounds apart. Repeated repairs with
+zero gain are spaced progressively farther apart. A repair
+uses at most 160 movable tracts; larger neighboring ASUs can participate as
+fixed aggregate components in that local model only. Only independently
+validated improvements become incumbents.
+Repair bounds describe restricted neighborhoods and are **never** reported as
+global upper bounds or used to declare global optimality.
+
+**Solve time limit (sec)** is a whole-search budget in this strategy, not a
+per-ASU limit, and includes model preparation, cut generation, and local repair.
+Input validation, shutdown, and final result writing can add overhead.
+Each cut solve receives at most five solver seconds or the remaining budget,
+whichever is smaller, with detailed solver logs suppressed. There is no Max
+ASUs cap or per-ASU concurrency setting. The configured worker count applies to
+each global solve. Stop ends the search and returns the best valid selection;
+**Skip Cut Round** ends the current round and lets global search continue.
+
+The log reports validated captured unemployment, a global upper bound, and
+the remaining gap. A bound on the relaxed model also bounds the valid problem;
+only closing that gap proves the valid solution optimal. A requested positive
+relative-gap tolerance may stop with a nonzero gap and is not exact optimality.
+A timeout without proof is a valid best-so-far result, not a failed search.
+This is an experimental strategy: it preserves feasible alternatives but does
+not guarantee faster solves or a proof within the time budget.
+Each cut round starts a new CP-SAT search. After three rounds without a
+candidate, the solver tries lighter startup settings and permits the current
+valid selection as a feasible model hint. A setting that produces candidates
+stays active; new cuts and local repairs do not send it back to previously
+unsuccessful settings. Three further misses allow another setting to be tried.
+
+If neither captured unemployment nor its upper bound improves for 180 seconds,
+the strategy returns the best valid selection with status `STALLED` and its
+remaining gap. New cuts do not reset that timer. Round logs report this objective
+stagnation separately from rounds without new cuts.
+
+A separate watchdog requests a stop at each round's five-second deadline.
+CP-SAT stops asynchronously, so native shutdown or a running Python callback
+can still extend elapsed time. A material overrun reduces the worker count for
+subsequent rounds. Compact diagnostics include configured budget, actual elapsed
+time, native solver time, callback time, time from stop request to return,
+active worker count, branches, conflicts, and model size.
+
+Python callers can select it with `component_global=True` in
+`build_many_asus_cpsat`; the CLI equivalent is `--component-global`.
+
+Optional saved ASUs are validated using the current data and graph, then used
+as a starting incumbent and a soft hint over the full graph. They impose no
+fixed boundaries or ASU-count limit. Imported assigned tracts must still match
+the current input; this option does not automatically clip a national RDS to
+a selected state. Strict valid-unemployment improvements update the map and
+durable progress JSON. The detached job exports a final RDS and can recover
+the last published assignments independently of the browser.
+
 ### CP-SAT parameters
 
 Version 0.6.51 enables `symmetry_level=3` for all ASU solver phases, including
@@ -262,16 +348,16 @@ Set these before starting. Changing a control does not reconfigure a running sol
 
 | Parameter | Meaning and effect |
 | --- | --- |
-| CP-SAT strategy | **Partitioning strategy (potential multiple ASUs)** creates seeds, expands territories, jointly reoptimizes touching ASUs, and polishes groups. **Legacy single-ASU solve** builds candidates from remaining tracts one at a time; it can still produce multiple ASUs. **Split saved ASUs (joint model)** splits imported parents only when separated children capture strictly more combined unemployment. Legacy is currently the selected default. |
+| CP-SAT strategy | **Partitioning strategy (potential multiple ASUs)** creates seeds, expands territories, jointly reoptimizes touching ASUs, and polishes groups. **Component-first global (automatic ASU count)** selects tracts globally and uses qualifying connected components as ASUs, without a count cap. **Legacy single-ASU solve** builds candidates from remaining tracts one at a time; it can still produce multiple ASUs. **Split saved ASUs (joint model)** splits imported parents only when separated children capture strictly more combined unemployment. Legacy is currently the selected default. |
 | UR threshold (τ) | Minimum aggregate rate as a **fraction**. Default `0.0645` means **6.45%**. Do not enter `6.45` here. |
 | Population threshold | Minimum combined population of a candidate. Default `10000`. |
-| Use saved ASUs as a warm start / Warm-start RDS | Upload a saved dashboard `.rds` (`sf` or data frame) containing `GEOID`/`geoid` and `asunum`/`asu_id`. Groups are matched to the current data by GEOID and validated before starting. Optional and off by default for Legacy and Partitioning; **mandatory for Split saved ASUs regardless of the checkbox**. |
-| Max ASUs | Limit used by the ASU creation loop. Default `30`. It is not a target count; fewer groups may be feasible and merges reduce the count. |
-| Time limit (sec) per window | Budget for an individual main candidate window (the tracts considered in that solve). Default `18000` is five hours. **Not a whole-run limit.** Use positive seconds. Partition expansion has a separate built-in 1800-second budget per solve, also used by default for final polishing. |
-| Incumbent stall limit (sec) | Stops the applicable search after this long without improving its best solution. Default `300` is five minutes; `0` disables it. Bound improvements alone do not reset this timer. |
+| Use saved ASUs as a warm start / Warm-start RDS | Upload a saved dashboard `.rds` (`sf` or data frame) containing `GEOID`/`geoid` and `asunum`/`asu_id`. Groups are matched to the current data by GEOID and validated before starting. Optional and off by default for Legacy, Partitioning, and Component-first global; **mandatory for Split saved ASUs regardless of the checkbox**. |
+| Max ASUs | Limit used by the ASU creation loop. Default `30`. It is not a target count; fewer groups may be feasible and merges reduce the count. Hidden and ignored for Component-first global. |
+| Solve time limit (sec) | Default `18000` is five hours. For Component-first global this is a **whole-search budget**. Otherwise it is the budget for an individual main candidate window, **not a whole-run limit**. Use positive seconds. Partition expansion has a separate built-in 1800-second budget per solve, also used by default for final polishing. |
+| Incumbent stall limit (sec) | Stops the applicable search after this long without improving its best solution. Default `300` is five minutes; `0` disables it. Bound improvements alone do not reset this timer. Hidden and disabled for Component-first global. |
 | Total CP-SAT workers (detected cores - 2) | Threads available to CP-SAT; initialized from detected physical cores with a minimum of one. More workers use more CPU and may use more memory; they do not guarantee better results. |
-| Concurrent ASU solves | Maximum simultaneous main candidate solves. Default `1`. Main windows share the worker budget. Partition expansions are sequential and receive the full worker budget. |
-| Relative gap (optional) | Allows earlier termination when the solution is close to its bound. `0.01` means approximately 1%. Blank leaves this optional tolerance unset. The gap concerns the current model, not proof of the best overall arrangement. |
+| Concurrent ASU solves | Maximum simultaneous main candidate solves. Default `1`. Main windows share the worker budget. Partition expansions are sequential and receive the full worker budget. Hidden for Component-first global, which runs one global solve at a time. |
+| Relative gap (optional) | Allows earlier termination when the solution is close to its bound. `0.01` means approximately 1%. Blank leaves this optional tolerance unset. In Component-first global the gap compares the best validated selection with the global upper bound. In other strategies it concerns the current model, not proof of the best overall arrangement. |
 
 **Rate units differ between tabs:**
 
@@ -294,6 +380,9 @@ infeasibility.
 
 | Stage | What is happening |
 | --- | --- |
+| COMPONENT_GLOBAL_* | Global component-cut search. Concise round and completion reports distinguish validated unemployment from the optimistic bound and report the global gap/status. A relaxed round's OPTIMAL status alone does not prove the valid ASU problem optimal. |
+| COMPONENT_GLOBAL_CUT_BATCH | Adds all previously unseen invalid components from the returned candidate plus up to eight from intermediate candidates. Reports new component cuts and any optional regional groups added on small inputs. |
+| COMPONENT_GLOBAL_REPAIR / COMPONENT_GLOBAL_REPAIR_COMPLETE | Runs a short, targeted neighborhood search periodically or after stalled improvement, then resumes unrestricted global search. Only validated gains update the incumbent; local bounds are not global proof. |
 | PARTITION_BUILD | Searching a main candidate window using remaining tracts. |
 | STATEWIDE_JOINT_SEED / STATEWIDE_JOINT_SEED_COMPLETE | Preparing valid component seeds. Reports seed budget, status, valid seeds, free slots, and baseline unemployment. |
 | STATEWIDE_JOINT / STATEWIDE_JOINT_COMPLETE | One all-tract joint model. Reports group slots, assignment/flow variable estimates, workers, time limit, and final status, active groups, merges, unemployment, gain, and elapsed time. |
@@ -381,7 +470,8 @@ ASU queue report `checking_asus=none asus_remaining=NA`.
 
 Load your current input data and choose its states, tract year, and thresholds
 as usual. In the CP-SAT controls, enable **Use saved ASUs as a warm start**,
-upload the RDS file, and set **Max ASUs** to at least the saved group count.
+upload the RDS file, and set **Max ASUs** to at least the saved group count
+(except for Component-first global, which has no count cap).
 The RDS is an assignment warm start, not a replacement for the current input
 data. Its geometry and economic columns are ignored; current population,
 employment, and the current neighbor graph determine validity.
@@ -391,7 +481,7 @@ values identify groups; `0`, `-1`, or missing assignments mean unassigned.
 Gaps in group numbers are compacted. New current tracts absent from the file
 remain unassigned. Extra unassigned file rows may be ignored, but an assigned
 tract missing from the current data is an error. Duplicate GEOIDs, conflicting
-ID columns, invalid groups, or too many groups for Max ASUs stop the run with
+ID columns, invalid groups, or too many groups for an applicable Max ASUs cap stop the run with
 an explanation; groups are not silently truncated or discarded.
 
 In **Legacy single-ASU**, each saved ASU is reoptimized once before looking for
@@ -409,7 +499,9 @@ searches may still use pruning because they have no saved candidate.
 
 In **Partitioning**, saved groups initialize existing assignments and remain
 subject to that strategy's later polishing, exchange, and merge rules.
-Max ASUs counts both imported and newly created groups in either strategy.
+Max ASUs counts both imported and newly created groups in those strategies.
+In **Component-first global**, imported groups instead provide an incumbent
+and a hint; all tracts remain globally reconsiderable and Max ASUs is ignored.
 
 The `WARM_START` stage reports imported ASUs, assigned tracts, and baseline
 unemployment. The original RDS is never modified. The edit tab's existing
@@ -594,7 +686,7 @@ be opened with **Load Data** or used as a warm start.
 
 ### Persistent solver jobs and browser disconnects
 
-All newly launched CP-SAT strategies (Legacy, Partitioning, and Split) now run
+All newly launched CP-SAT strategies (Legacy, Partitioning, Split, and Component-first global) run
 as detached jobs under `~/ASUbuildR/jobs/` on the machine running R. Set
 `ASU_JOB_DIR` before launching the dashboard to choose another writable,
 persistent directory. The old `ASU_CHECKPOINT_DIR` location is not used for new
@@ -608,9 +700,18 @@ the dashboard asks you to attach to an existing active job before starting anoth
 On a fresh dashboard, use **Persistent solver jobs** on the Data Initialization
 tab: **Refresh jobs**, choose the run, then **Attach to job**. No workbook upload
 is required to view that job's saved data. Attaching never reruns the solver.
-Running jobs restore live progress and Stop/Skip controls; finished or failed
-jobs show the final output or latest published committed assignments. A failed
-job is not automatically retried. Reopening a dashboard after restarting R must
+Only active jobs are available for attachment; the list refreshes every five
+seconds and restores live progress and Stop/Skip controls. Completed, stopped,
+failed, or interrupted jobs are hidden. On job-list refresh, completed job
+folders are permanently deleted once completion is more than 24 hours old,
+including inputs, logs, checkpoints, and results. Copy results you want to keep
+outside the job folder. Interrupted jobs are also deleted after 24 hours
+without recorded activity (using the latest timestamps in job files and status).
+Live supervisor/solver processes protect their job folders from deletion.
+Running, stopped, and failed jobs are preserved.
+Cleanup runs while a dashboard is open, not as a background timer
+when all dashboards are closed.
+A failed job is not automatically retried. Reopening a dashboard after restarting R must
 use the same `ASU_JOB_DIR` and OS user to discover those jobs.
 
 Each unique job directory contains:
@@ -643,9 +744,10 @@ ASUbuildR:::asu_job_recover('FULL/PATH/TO/job_...')
 This recovers assignments, not CP-SAT's search tree. Load the RDS or use it as a
 warm start for a new solve. Browser independence does not mean jobs survive a
 machine reboot, OS-enforced logout termination, disk failure, or out-of-memory
-kill. Jobs run as your OS user, not as a system service. No old job data is
-automatically deleted; monitor disk space, particularly for national geometry
-and uncompressed RDS checkpoints. The job list covers the configured folder on
+kill. Jobs run as your OS user, not as a system service. Completed and interrupted
+jobs are subject to the 24-hour cleanup described above; save wanted results
+elsewhere. Monitor disk space, particularly for national geometry and retained
+job checkpoints. The job list covers the configured folder on
 this machine; it does not attach to jobs on another server.
 
 - **Python not detected:** run `ASUbuildR::setup_asu_python()` and

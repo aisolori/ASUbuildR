@@ -46,15 +46,16 @@ run_checkpoint_runner <- function() {
   utils::write.csv(data.frame(geoid=data$GEOID,tract_ASU_unemp=data$tract_ASU_unemp,
     tract_ASU_emp=data$tract_ASU_emp,tract_pop2024=data$tract_pop_cur),settings$df_csv,row.names=FALSE)
   jsonlite::write_json(list(list(1L),list(0L)),settings$nb_json,auto_unbox=TRUE)
-  for (strategy in c("single","partition","split")) {
+  for (strategy in c("single","partition","split","component_global")) {
     settings$use_partitioning <- strategy=="partition"
     settings$use_split <- strategy=="split"
+    settings$use_component_global <- strategy=="component_global"
     settings$legacy_checkpoint <- strategy=="single"
     eval(expr,settings)
     runner <- file.path(folder,paste0(strategy,".py"))
     writeLines(settings$runner_code,runner)
     stopifnot(system2(python,c("-m","py_compile",shQuote(runner)))==0L)
-    if (strategy!="single") next
+    if (!strategy %in% c("single", "component_global")) next
     px <- processx::process$new(python,runner,stdout=file.path(folder,"stdout.log"),
       stderr=file.path(folder,"stderr.log"),windows_hide_window=TRUE)
     on.exit(if(px$is_alive()) px$kill(),add=TRUE)
@@ -67,6 +68,15 @@ run_checkpoint_runner <- function() {
       cat(readLines(file.path(folder,"stdout.log")),sep="\n")
       cat(readLines(file.path(folder,"stderr.log")),sep="\n")
       stop("Runner failed")
+    }
+    if (strategy=="component_global") {
+      output <- jsonlite::fromJSON(settings$out_json)
+      progress <- jsonlite::fromJSON(settings$progress_json)
+      stopifnot(identical(output$asu_id,c(1L,1L)), isTRUE(output$optimal),
+                output$total_unemp==60L, output$upper_bound==60L,
+                output$absolute_gap==0, output$relative_gap==0,
+                identical(progress$asu_id,c(1L,1L)))
+      next
     }
     # Both the exact result and final result must round-trip with full geometry.
     saves <- list.files(folder,pattern="\\.rds$",full.names=TRUE)
@@ -92,6 +102,7 @@ run_checkpoint_runner <- function() {
   }
   settings$use_partitioning <- FALSE
   settings$use_split <- FALSE
+  settings$use_component_global <- FALSE
   settings$legacy_checkpoint <- TRUE
   eval(expr, settings)
   writeLines(settings$runner_code, file.path(job, 'runner.py'))
@@ -109,6 +120,6 @@ run_checkpoint_runner <- function() {
             identical(sf::st_geometry(saved),sf::st_geometry(data)),
             length(list.files(job,pattern='legacy_solve_.*\\.rds$')) == 1L,
             length(list.files(job,pattern='legacy_done_.*\\.rds$')) == 1L)
-  cat("Generated runner: actual detached solve, independent early/final RDS saves, all strategies compile.\n")
+  cat("Generated runner: detached legacy solve, global solve and bound metadata, independent RDS saves, all four strategies compile.\n")
 }
 run_checkpoint_runner()

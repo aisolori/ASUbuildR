@@ -220,8 +220,8 @@ if (is_dev_mode) {
   for (helper in c("asu_load_tract_geography", "asu_join_tract_data", "asu_read_upload", "asu_state_slice", "asu_display_geometry", "asu_display_bounds",
                    "asu_payload_log", "asu_install_payload_logging", "asu_browser_source", "asu_map_source",
                    "asu_checkpoint_run_dir", "asu_service_checkpoints", "asu_job_root", "asu_job_run_dir",
-                   "asu_job_prepare", "asu_job_launch", "asu_job_handle", "asu_job_list",
-                   "asu_job_state", "asu_job_recover"))
+                   "asu_job_prepare", "asu_job_launch", "asu_job_handle", "asu_job_list", "asu_job_cleanup",
+                   "asu_job_state", "asu_job_recover", "asu_job_read"))
     assign(helper, getFromNamespace(helper, "ASUbuildR"))
   message("→ Installed package mode: functions should already be available")
 }
@@ -321,6 +321,7 @@ cpsat_stop_requested <- shiny::reactiveVal(FALSE)
 cpsat_skip_file  <- shiny::reactiveVal(NULL)
 cpsat_running <- shiny::reactiveVal(FALSE)
 cpsat_stage_text <- shiny::reactiveVal("idle")
+cpsat_active_strategy <- shiny::reactiveVal(NULL)
 
 append_cpsat_log <- function(..., .persist = TRUE) {
   raw <- paste0(..., collapse = "")
@@ -731,7 +732,7 @@ Once the file is loaded, a preview of the data will appear on the right, the sta
 Note: at this time, ASUbuildR assumes a state is using county-based census tracts. If a state uses another geography such as NECTAs as the basis for its ASU tract file, this process will require some modification.
 ```{r}
 shiny::h4("Persistent solver jobs")
-shiny::selectInput("saved_job", "Saved or running job", choices = c("Choose a job" = ""))
+shiny::selectInput("saved_job", "Running job", choices = c("Choose a job" = ""))
 shiny::actionButton("refresh_jobs", "Refresh jobs")
 shiny::actionButton("attach_job", "Attach to job")
 shiny::helpText("Jobs continue after this tab closes. Attach to monitor results or use Stop. Job files are kept on the machine running R.")
@@ -900,6 +901,7 @@ shiny::conditionalPanel(
       "CP-SAT strategy",
       choices = c(
         "Partitioning strategy (potential multiple ASUs)" = "partition",
+        "Component-first global (automatic ASU count)" = "component_global",
         "Legacy single-ASU solve" = "single",
         "Split saved ASUs (joint model)" = "split"
       ),
@@ -909,12 +911,12 @@ shiny::conditionalPanel(
     shiny::conditionalPanel(
       condition = "input.cpsat_use_warm_start === true || input.cpsat_strategy === 'split'",
       shiny::fileInput("cpsat_warm_start", "Warm-start RDS", accept = ".rds", multiple = FALSE),
-      shiny::helpText("Matches GEOID plus asunum/asu_id to the current input data. Saved groups must meet current thresholds and connectivity. Max ASUs includes these groups; assignments remain changeable.")
+      shiny::helpText("Matches GEOID plus asunum/asu_id to the current input data. Saved groups must meet current thresholds and connectivity. Max ASUs includes these groups except in Component-first global, which has no group-count cap. Assignments remain changeable.")
     ),
     shiny::conditionalPanel(
       condition = "input.cpsat_strategy === 'split'",
       shiny::helpText("Requires a warm-start RDS regardless of the checkbox. Tries imported ASUs once, highest captured unemployment first, using articulation points and narrow graph corridors as split hints. Each child must contain a parent tract, qualify independently, and avoid touching all other ASUs. Unassigned tracts are available; only strict combined unemployment gains are accepted."),
-      shiny::helpText("Increase Max ASUs above the imported count to leave room for children. Each split may create two or three children, limited further by the available slots. Solves run sequentially with all workers. Each starts with an untimed cut pass: 25 rounds or 10 stalled-upper-bound rounds. Individual rounds stop when a candidate exposes new connectivity cuts, without waiting for an optimal disconnected assignment. Time and incumbent-stall limits apply to the subsequent exact flow solve per parent. No merging or polishing follows.")
+      shiny::helpText("Increase Max ASUs above the imported count to leave room for children. Each split may create two or three children, limited further by the available slots. Solves run sequentially with all workers. Each starts with a cut pass: at most 100 rounds or 25 stalled-upper-bound rounds. Each quiet cut round waits for optimality or its five-second solver limit, unless interrupted; discovering a cut does not end the round. Time and incumbent-stall limits apply to the subsequent exact flow solve per parent. No merging or polishing follows.")
     ),
     shiny::conditionalPanel(
       condition = "input.cpsat_strategy === 'partition'",
@@ -936,11 +938,21 @@ shiny::conditionalPanel(
     ),
     shiny::numericInput("cpsat_tau",       "UR threshold (τ)",          value = 0.0645, min = 0, max = 1, step = 0.0001),
     shiny::numericInput("cpsat_pop",       "Population threshold",      value = 10000,  min = 0, step = 100),
-    shiny::numericInput("cpsat_max",       "Max ASUs",                  value = 30,     min = 1, step = 1),
-    shiny::numericInput("cpsat_timelimit", "Time limit (sec) per window", value = 18000, min = 0, step = 60),
-    shiny::numericInput("cpsat_incumbent_stall_seconds", "Incumbent stall limit (sec)", value = 300, min = 0, step = 30),
+    shiny::conditionalPanel(
+      condition = "input.cpsat_strategy !== 'component_global'",
+      shiny::numericInput("cpsat_max", "Max ASUs", value = 30, min = 1, step = 1),
+      shiny::numericInput("cpsat_incumbent_stall_seconds", "Incumbent stall limit (sec)", value = 300, min = 0, step = 30),
+      shiny::numericInput("cpsat_parallel_asus", "Concurrent ASU solves", value = 1, min = 1, step = 1),
+      shiny::helpText("The solve time limit applies per main window, not to the whole run. Partition expansion and final polishing use their separate budgets.")
+    ),
+    shiny::numericInput("cpsat_timelimit", "Solve time limit (sec)", value = 18000, min = 0, step = 60),
+    shiny::conditionalPanel(
+      condition = "input.cpsat_strategy === 'component_global'",
+      shiny::helpText("Experimental global selection: all tracts remain available and qualifying connected components become ASUs automatically. No Max ASUs cap, per-ASU concurrency, or incumbent-stall cutoff applies. The solve time limit is a whole-search budget including model preparation, cut generation, and local repair; input validation, shutdown, and final result writing can add overhead."),
+      shiny::helpText("Batched component cuts, regional eligibility constraints, and the best certified objective ceiling strengthen later rounds. Short neighborhood repairs run periodically and after stalled improvement, then unrestricted global search resumes. No ASU is permanently frozen, and local repair bounds never establish global optimality."),
+      shiny::helpText("Saved ASUs supply a valid starting solution and a soft hint, not fixed boundaries. Quiet cut rounds run for at most five solver seconds. The log reports validated captured unemployment and a global upper bound/gap. A time-limited result is not necessarily optimal, and speed is not guaranteed. Stop returns the best valid selection; Skip advances to the next cut round.")
+    ),
     shiny::numericInput("cpsat_workers",   "Total CP-SAT workers (detected cores - 2)", value = max(1, parallel::detectCores(logical = FALSE)-2), min = 1, step = 1),
-    shiny::numericInput("cpsat_parallel_asus", "Concurrent ASU solves", value = 1, min = 1, step = 1),
     shiny::numericInput("cpsat_relgap",        "Relative gap (optional)",    value = NULL, min = 0, step = 0.0001),
     shiny::uiOutput("cpsat_log_link")
   )
@@ -974,12 +986,14 @@ output$algo_blurb <- shiny::renderUI({
              <code>UR threshold (τ)</code>, <code>Population threshold</code>,
              <code>Max ASUs</code>, <code>Time limit</code>, optional
              <code>Relative gap</code>, <code>Total CP-SAT workers</code>, and
-             <code>Concurrent ASU solves</code>.</li>
+             <code>Concurrent ASU solves</code>. Component-first global instead
+             chooses its own ASU count and uses one whole-search time budget.</li>
        </ul>
        <p>
          While solving, a live <em>CP-SAT log</em> panel appears (top-right)
          showing progress. Single-ASU and partition expansion incumbents are
-         checked every minute. Subtle green/red fills show additions/removals
+         checked every minute. Component-first global publishes assignments
+         only when validated captured unemployment improves. Subtle green/red fills show additions/removals
          relative to each solve's starting hint; these temporary previews clear
          before results are committed. When the solver finishes, the map and summary table
          update automatically; tracts with <code>asunum = 0</code> are not in
@@ -1110,6 +1124,7 @@ attach_cpsat_job <- function(run_dir) {
   if (is.null(display_state()) || !display_state() %in% c(state(), "ALL")) display_state(state()[1L])
   cpsat_log_buf("")
   cpsat_run_dir(run_dir)
+  cpsat_active_strategy(asu_job_read(file.path(run_dir, "job.json"))$strategy)
   cpsat_df_csv(file.path(run_dir, "df.csv"))
   cpsat_nb_json(file.path(run_dir, "nb.json"))
   cpsat_out_json(file.path(run_dir, "out.json"))
@@ -1320,6 +1335,16 @@ attach_cpsat_job <- function(run_dir) {
           if (!is.null(resj$asu_id) && length(resj$asu_id) == nrow(merged_df)) {
             if (isTRUE(apply_asu_assignments(resj$asu_id, update_reset = TRUE))) {
               append_cpsat_log("[run] Solver finished OK; map/table updated.")
+              if (identical(cpsat_active_strategy(), "component_global")) {
+                append_cpsat_log(sprintf(
+                  "[STAGE] COMPONENT_GLOBAL_RESULT status=%s optimal=%s valid_unemp=%s upper_bound=%s absolute_gap=%s relative_gap=%s",
+                  as.character(resj$status %||% "UNKNOWN"),
+                  if (isTRUE(resj$optimal)) "true" else "false",
+                  as.character(resj$total_unemp %||% "NA"),
+                  as.character(resj$upper_bound %||% "NA"),
+                  as.character(resj$absolute_gap %||% "NA"),
+                  as.character(resj$relative_gap %||% "NA")))
+              }
             } else {
               append_cpsat_log("[run][warn] Output JSON had invalid assignment shape.")
             }
@@ -1346,15 +1371,23 @@ attach_cpsat_job <- function(run_dir) {
     })
 }
 
-shiny::observeEvent(input$refresh_jobs, {
+shiny::observe({
+  input$refresh_jobs
+  shiny::invalidateLater(5000, session)
   choices <- asu_job_list()
-  shiny::updateSelectInput(session, "saved_job", choices = c("Choose a job" = "", choices))
-}, ignoreNULL = FALSE)
+  selected <- shiny::isolate(input$saved_job)
+  if (length(selected) != 1L || !selected %in% unname(choices)) selected <- ""
+  shiny::updateSelectInput(session, "saved_job",
+    choices = c("Choose a job" = "", choices), selected = selected)
+})
 shiny::observeEvent(input$attach_job, {
   folder <- input$saved_job
   shiny::req(length(folder) == 1L, nzchar(folder))
   # Never accept arbitrary filesystem paths supplied by a browser client.
-  shiny::req(folder %in% unname(asu_job_list()))
+  if (!folder %in% unname(asu_job_list())) {
+    shiny::showNotification("This job is no longer running. Refresh the job list.", type = "warning")
+    return()
+  }
   tryCatch(attach_cpsat_job(folder), error = function(e)
     shiny::showNotification(conditionMessage(e), type = "error", duration = NULL))
 })
@@ -1415,13 +1448,19 @@ if (identical(algo_choice, "cpsat")) {
     cpsat_strategy <- if (is.null(input$cpsat_strategy) || identical(input$cpsat_strategy, "")) "partition" else as.character(input$cpsat_strategy)
     use_partitioning <- identical(cpsat_strategy, "partition")
     use_split <- identical(cpsat_strategy, "split")
+    use_component_global <- identical(cpsat_strategy, "component_global")
+    if (use_component_global) {
+      parallel_asus <- 1L
+      incumbent_stall_seconds <- 0L
+      append_cpsat_log("[run] component-global mode: automatic ASU count; whole-search time budget; no incumbent-stall cutoff")
+    }
     partition_seed_strategy <- if (use_partitioning && identical(input$cpsat_partition_seed_strategy, "surplus_prune")) "surplus_prune" else "connectivity_free"
     expansion_incumbent_stall_seconds <- if (is.null(input$cpsat_expansion_incumbent_stall_seconds) || is.na(input$cpsat_expansion_incumbent_stall_seconds)) 300L else max(0L, as.integer(input$cpsat_expansion_incumbent_stall_seconds))
     if (use_partitioning) append_cpsat_log("[run] partition expansion mode: sequential")
     rel_gap  <- if (!is.null(input$cpsat_relgap) && !is.na(input$cpsat_relgap)) as.numeric(input$cpsat_relgap) else NA_real_
-    append_cpsat_log(sprintf("[run] params: strategy=%s tau=%.6f pop=%d max=%d limit=%ds stall=%ds workers=%d concurrent_asus=%d rel_gap=%s",
+    append_cpsat_log(sprintf("[run] params: strategy=%s tau=%.6f pop=%d max=%s limit=%ds stall=%ds workers=%d concurrent_asus=%d rel_gap=%s",
            cpsat_strategy,
-           tau, pop_thr, max_asus, tlimit, incumbent_stall_seconds, workers, parallel_asus,
+           tau, pop_thr, if (use_component_global) "automatic" else as.character(max_asus), tlimit, incumbent_stall_seconds, workers, parallel_asus,
                              if (is.na(rel_gap)) "None" else as.character(rel_gap)))
     # ---- 2) Build tracts + neighbors ----------------------------------
     shiny::incProgress(0.15, detail = "Downloading tracts & building neighbors")
@@ -1486,7 +1525,8 @@ if (identical(algo_choice, "cpsat")) {
         imported <- asu_read_warm_start(
           input$cpsat_warm_start$datapath, merged_df$GEOID, data = merged_df,
           neighbors = lapply(merged_sf$continuous, function(iv) as.integer(iv) - 1L),
-          tau = tau, pop_thresh = pop_thr, max_asus = max_asus)
+          tau = tau, pop_thresh = pop_thr,
+          max_asus = if (use_component_global) NULL else max_asus)
         if (use_split && imported$asu_count < 1L) stop("Split saved ASUs requires at least one assigned ASU in the RDS file.")
         imported
       }, error = function(e) e)
@@ -1538,7 +1578,7 @@ if (identical(algo_choice, "cpsat")) {
 
     # ---- 3) Persistent job folder + files ------------------------------------
     shiny::incProgress(0.10, detail = "Writing inputs")
-    legacy_checkpoint <- !use_partitioning && !use_split
+    legacy_checkpoint <- !use_partitioning && !use_split && !use_component_global
     run_dir <- asu_job_run_dir()
     dir.create(run_dir, recursive = TRUE, showWarnings = FALSE)
 
@@ -1609,6 +1649,7 @@ kwargs = dict(
     legacy_checkpoint_callback=save_checkpoint if checkpoint_folder else None,
     initial_asu_id=df['warm_start_asu'].tolist() if 'warm_start_asu' in df.columns else None,
     split_warm_start=%s,
+    component_global=%s,
     tau=%s, pop_thresh=%d, max_asus=%d,
     time_limit=%d, workers=%d, parallel_asus=%d, verbose=True,
     configure_subsolvers=True,
@@ -1653,9 +1694,9 @@ kwargs = dict(
 REL = %s
 if REL is not None and not (isinstance(REL, float) and math.isnan(REL)):
     kwargs['rel_gap'] = REL
-print('[runner] window scope: ' + ('parent plus reachable unassigned tracts, excluding other-ASU contacts' if kwargs['split_warm_start'] else 'all remaining tracts'), flush=True)
-print('[runner] strategy: ' + ('split' if kwargs['split_warm_start'] else 'partition' if kwargs['harvest_connectivity_free_asus'] else 'single'), flush=True)
-print('[runner] search: ' + ('joint separated children' if kwargs['split_warm_start'] else 'flow-capacity-hybrid'), flush=True)
+print('[runner] window scope: ' + ('all tracts; warm-start memberships are changeable' if kwargs['component_global'] else 'parent plus reachable unassigned tracts, excluding other-ASU contacts' if kwargs['split_warm_start'] else 'all remaining tracts'), flush=True)
+print('[runner] strategy: ' + ('component_global' if kwargs['component_global'] else 'split' if kwargs['split_warm_start'] else 'partition' if kwargs['harvest_connectivity_free_asus'] else 'single'), flush=True)
+print('[runner] search: ' + ('global component cuts; automatic ASU count' if kwargs['component_global'] else 'joint separated children' if kwargs['split_warm_start'] else 'flow-capacity-hybrid'), flush=True)
 print('[runner] launching CP-SAT…', flush=True)
 res = build_many_asus_cpsat(**kwargs)
 print('[runner] solver finished; writing json', flush=True)
@@ -1665,14 +1706,20 @@ asu_id = [int(x) for x in asu_id]
 if checkpoint_folder:
     save_checkpoint('LEGACY_DONE', asu_id)
 output_path = r'%s'
+output = {'asu_id': asu_id}
+if kwargs['component_global'] and isinstance(res, dict):
+    for key in ('status', 'optimal', 'total_unemp', 'upper_bound', 'absolute_gap', 'relative_gap', 'rounds'):
+        if key in res:
+            output[key] = res[key]
 with open(output_path + '.tmp','w') as g:
-    json.dump({'asu_id': asu_id}, g)
+    json.dump(output, g)
 os.replace(output_path + '.tmp', output_path)
 print('[runner] OK', flush=True)
 ",
       py_mod_path, df_csv, nb_json,
         if (legacy_checkpoint) as.character(jsonlite::toJSON(run_dir, auto_unbox = TRUE)) else "None",
         if (use_split) "True" else "False",
+        if (use_component_global) "True" else "False",
         format(tau, scientific = FALSE), pop_thr, max_asus, tlimit, workers, parallel_asus,
   if (use_partitioning) "True" else "False",
   partition_seed_strategy,
@@ -1884,7 +1931,7 @@ output$log_overlay <- shiny::renderUI({
       class = "btn-sm btn-warning", style = "margin-right:4px;"
     ),
     shiny::actionButton(
-      "skip_asu", "Skip to Next ASU",
+      "skip_asu", if (identical(cpsat_active_strategy(), "component_global")) "Skip Cut Round" else "Skip to Next ASU",
       class = "btn-sm btn-info", style = "margin-right:4px;"
     ),
     shiny::downloadButton("save_live_log", "Save log as...", class = "btn-sm asu-save-as",
@@ -1905,14 +1952,18 @@ shiny::observeEvent(input$stop_solve, {
   append_cpsat_log("[run] Stop requested by user; waiting for solver to return its current incumbent…")
 })
 
-# Halt only the ASU currently being solved (via stop_search()) and let the
-# builder move on to the next ASU window, instead of stopping the whole run.
+# End the current solve and advance according to the attached job's strategy.
 shiny::observeEvent(input$skip_asu, {
   kf <- cpsat_skip_file()
   shiny::req(!is.null(kf), isTRUE(cpsat_running()))
   if (!file.exists(kf)) file.create(kf)
-  cpsat_stage_text("skip current asu requested")
-  append_cpsat_log("[run] Skip requested; ending the current solve and retaining eligible incumbent improvements. Bridge mode advances to the next pair; other queued work follows its stage-specific retry policy.")
+  if (identical(cpsat_active_strategy(), "component_global")) {
+    cpsat_stage_text("skip cut round requested")
+    append_cpsat_log("[run] Skip requested; ending this global cut round, preserving the best valid selection, and continuing the global search.")
+  } else {
+    cpsat_stage_text("skip current asu requested")
+    append_cpsat_log("[run] Skip requested; ending the current solve and retaining eligible incumbent improvements. Bridge mode advances to the next pair; other queued work follows its stage-specific retry policy.")
+  }
 })
 
 # Add this observer to handle closing the log manually

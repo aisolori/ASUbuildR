@@ -127,14 +127,70 @@ asu_job_handle <- function(folder) {
        read_all_output_lines = read_new, read_all_error_lines = function() character())
 }
 
+asu_job_cleanup <- function(now = as.numeric(Sys.time())) {
+  root <- asu_job_root()
+  if (!dir.exists(root)) return(invisible(character()))
+  root <- normalizePath(root, winslash = '/', mustWork = TRUE)
+  folders <- list.dirs(root, recursive = FALSE, full.names = TRUE)
+  removed <- character()
+  for (folder in folders) {
+    # Delete only direct, real job directories within the configured job root.
+    # Never follow a link/junction to some other collection of files.
+    link <- Sys.readlink(folder)
+    if (!is.na(link) && nzchar(link)) next
+    target <- normalizePath(folder, winslash = '/', mustWork = TRUE)
+    if (!identical(dirname(target), root) || !startsWith(basename(target), 'job_') ||
+        !file.exists(file.path(target, 'job.json'))) next
+    state <- asu_job_read(file.path(target, 'status.json'))
+    if (is.null(state)) next
+    # A completed status can precede supervisor exit. Preserve any live owner
+    # or solver PID conservatively (including a possibly recycled PID).
+    pids <- c(asu_job_read(file.path(target, 'owner.json'))$pid,
+              state$supervisor_pid, state$solver_pid)
+    live_pids <- tryCatch(ps::ps_pids(), error = function(e) NULL)
+    if (is.null(live_pids) || any(pids %in% live_pids)) next
+    current <- asu_job_state(target)
+    if (isTRUE(current$alive) ||
+        !current$status %in% c('completed', 'interrupted')) next
+    finished <- state$finished_at
+    if (identical(current$status, 'interrupted')) {
+      # Interrupted processes may never write finished_at. Use the newest
+      # recorded activity, including logs/checkpoints from a surviving child.
+      files <- list.files(target, recursive = TRUE, full.names = TRUE,
+                          all.files = TRUE)
+      stamps <- as.numeric(file.info(files)$mtime)
+      recorded <- unlist(state[c('finished_at', 'updated_at', 'started_at')],
+                         use.names = FALSE)
+      if (is.numeric(recorded)) stamps <- c(stamps, recorded)
+      if (!length(stamps) || any(!is.finite(stamps))) next
+      finished <- max(stamps)
+    }
+    if (!is.numeric(finished) || length(finished) != 1L ||
+        !is.finite(finished) || now - finished <= 86400) next
+    if (unlink(target, recursive = TRUE) == 0L && !dir.exists(target)) {
+      removed <- c(removed, target)
+      message('[job cleanup] Deleted ', current$status,
+              ' job older than 24 hours: ', target)
+    }
+  }
+  invisible(removed)
+}
+
 asu_job_list <- function() {
+  asu_job_cleanup()
   root <- asu_job_root()
   folders <- if (dir.exists(root)) list.dirs(root, recursive = FALSE, full.names = TRUE) else character()
   folders <- folders[file.exists(file.path(folders, 'job.json'))]
   folders <- sort(folders, decreasing = TRUE)
-  stats::setNames(folders, vapply(folders, function(folder) {
+  # Check process liveness, not just a persisted status that may be stale.
+  states <- lapply(folders, asu_job_state)
+  active <- vapply(states, function(state) isTRUE(state$alive), logical(1))
+  folders <- folders[active]
+  states <- states[active]
+  stats::setNames(folders, vapply(seq_along(folders), function(i) {
+    folder <- folders[i]
     paste(basename(folder), asu_job_read(file.path(folder, 'job.json'))$strategy,
-          paste0('[', asu_job_state(folder)$status, ']'))
+          paste0('[', states[[i]]$status, ']'))
   }, character(1)))
 }
 

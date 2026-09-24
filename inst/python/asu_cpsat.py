@@ -11517,6 +11517,7 @@ def build_many_asus_cpsat(
     polish_consolidated_asus: bool = False,
     split_warm_start: bool = False,
     legacy_checkpoint_callback: Optional[Callable] = None,
+    component_global: bool = False,
 ) -> Dict[str, np.ndarray]:
     """
     Build ASUs in batches of up to `parallel_asus` disjoint candidate windows, solved
@@ -11524,7 +11525,15 @@ def build_many_asus_cpsat(
     `legacy_checkpoint_callback(phase, asu_id)`, when supplied, synchronously
     receives validated legacy exact-solve assignments before post-solve refinement.
     Exceptions propagate, preventing further optimization after a failed save.
-    Partition and split strategies do not call this callback.
+    Partition, split, and component-global strategies do not call this callback.
+    With component_global=True, use the separate unlabelled component solver:
+    time_limit is the overall search budget and max_asus is ignored. Every
+    selected component must qualify independently. Saved ASUs are initial
+    feasible hints, not fixed groups; no seed/root or ASU-count restriction is
+    imposed. Per-ASU expansion/polish/stall/flow options do not apply. Quiet
+    cut rounds are capped at five seconds. Stop ends the search; Skip advances
+    to another round. Only strict valid unemployment gains publish durable
+    progress snapshots. Returned bounds/status distinguish proof from timeout.
     Standalone-component harvest-expansion solves run sequentially and each receives
     the full configured worker budget, independent of `parallel_asus`. Two ASUs
     built in the same batch that end up touching (share a
@@ -11656,6 +11665,9 @@ def build_many_asus_cpsat(
     remaining tract has positive surplus left. `capacity_sweep_time_limit`
     bounds each individual CP-SAT solve in this pass.
     """
+    if component_global and (split_warm_start or harvest_connectivity_free_asus
+                             or partition_seed_strategy != "connectivity_free"):
+        raise ValueError("component_global cannot be combined with partition or split strategies")
     if partition_seed_strategy not in ("connectivity_free", "surplus_prune"):
         raise ValueError("partition_seed_strategy must be connectivity_free or surplus_prune")
     if bridge_pair is not None:
@@ -11720,7 +11732,7 @@ def build_many_asus_cpsat(
 
     n = len(df)
     asu_id = _validate_initial_asu_id(
-        initial_asu_id, nb, u, E, P, tau, pop_thresh, max_asus,
+        initial_asu_id, nb, u, E, P, tau, pop_thresh, n if component_global else max_asus,
         )
     initial_units = [np.flatnonzero(asu_id == label).tolist()
                      for label in np.unique(asu_id[asu_id > 0])]
@@ -11750,6 +11762,7 @@ def build_many_asus_cpsat(
         exploring_candidate_idx: Optional[Sequence[int]] = None,
         exploring_added_idx: Optional[Sequence[int]] = None,
         exploring_removed_idx: Optional[Sequence[int]] = None,
+        metadata: Optional[Dict] = None,
     ) -> None:
         if not progress_out_path:
             return
@@ -11787,6 +11800,11 @@ def build_many_asus_cpsat(
                 "exploring_removed_idx": exploring_removed,
                 "updated_at": time.time(),
             }
+            if metadata:
+                for key in ("status", "optimal", "upper_bound", "absolute_gap",
+                            "relative_gap", "rounds"):
+                    if key in metadata:
+                        payload[key] = metadata[key]
             with progress_write_lock:
                 tmp_path = f"{progress_out_path}.tmp"
                 with open(tmp_path, "w", encoding="utf-8") as handle:
@@ -11815,6 +11833,23 @@ def build_many_asus_cpsat(
                 )
 
     _emit_progress("INIT")
+
+    if component_global:
+        from asu_component_global import solve_component_global
+
+        def publish_component_global(values, phase, metadata):
+            nonlocal asu_id
+            asu_id = np.asarray(values, dtype=int).copy()
+            _emit_progress(phase, metadata=metadata)
+
+        result = solve_component_global(
+            nb, u, E, P, tau, pop_thresh, time_limit=time_limit, workers=workers,
+            initial_asu_id=asu_id, stop_path=stop_flag_path, skip_path=skip_flag_path,
+            verbose=verbose, publish=publish_component_global, rel_gap=rel_gap,
+        )
+        asu_id = np.asarray(result["asu_id"], dtype=int).copy()
+        _emit_progress("DONE", metadata=result)
+        return result
 
     if split_warm_start:
         if not initial_units:
@@ -14598,6 +14633,10 @@ def main():
         help="Time limit in seconds for the graph-cut-only re-optimization",
     )
     ap.add_argument(
+        "--component-global", action="store_true",
+        help="Component-first global solve: automatic ASU count, overall --time-limit, no fixed roots",
+    )
+    ap.add_argument(
         "--harvest-connectivity-free-asus",
         action="store_true",
         help=(
@@ -14812,6 +14851,7 @@ def main():
         use_graph_cut_repair=args.use_graph_cut_repair,
         graph_cut_repair_time_limit=args.graph_cut_repair_time_limit,
         harvest_connectivity_free_asus=args.harvest_connectivity_free_asus,
+        component_global=args.component_global,
         partition_seed_strategy=args.partition_seed_strategy,
         harvest_all_connectivity_free_components=args.harvest_all_connectivity_free_components,
         joint_partition_expansion=args.joint_partition_expansion,
