@@ -11847,10 +11847,20 @@ def build_many_asus_cpsat(
             return None
         mapping = tuple(int(node) for node in local_to_global)
         baseline = {mapping[int(node)] for node in baseline_local}
+        best_preview_unemp = sum(int(u[node]) for node in baseline)
+        last_preview_selection = baseline
 
         def report(selected_local, objective):
+            nonlocal best_preview_unemp, last_preview_selection
             selected = {mapping[int(node)] for node in selected_local}
+            # Callers validate connectivity/eligibility before reporting.
+            # Compare actual unemployment, not a tie-breaking solver objective.
+            valid_unemp = sum(int(u[node]) for node in selected)
             with preview_lock:
+                if selected == last_preview_selection or valid_unemp <= best_preview_unemp:
+                    return
+                best_preview_unemp = valid_unemp
+                last_preview_selection = selected
                 preview_deltas[key] = (selected - baseline, baseline - selected)
                 added, removed = set(), set()
                 for delta_added, delta_removed in preview_deltas.values():
