@@ -394,10 +394,22 @@ tract missing from the current data is an error. Duplicate GEOIDs, conflicting
 ID columns, invalid groups, or too many groups for Max ASUs stop the run with
 an explanation; groups are not silently truncated or discarded.
 
-In **Legacy single-ASU** and **Partitioning**, saved groups initialize the
-existing assignments. New ASUs are sought in remaining tracts; the normal
-later polishing, exchange, and merge rules can reconsider saved groups.
-Max ASUs counts both imported and newly created groups.
+In **Legacy single-ASU**, each saved ASU is reoptimized once before looking for
+new ASUs. Its saved selection is a hint and its unemployment total is a minimum
+objective, not a fixed membership. The solver can add, drop, or exchange tracts
+within its current group plus reachable unassigned territory. Other saved ASUs
+remain protected; one anchor tract chosen from the target ASU remains selected.
+Reverse-pruning and hint-refinement are skipped for these already-valid seeds.
+`LEGACY_REOPTIMIZE` reports the window and objective floor; completed replacements
+are validated, cannot lose captured unemployment, and are checkpointed before
+later solves. No replacement leaves the saved ASU intact. Stop/Skip remain active.
+This pass uses the normal per-ASU solve time and all workers, even when Max ASUs
+already equals the imported count; a zero solve time skips it. Subsequent new-ASU
+searches may still use pruning because they have no saved candidate.
+
+In **Partitioning**, saved groups initialize existing assignments and remain
+subject to that strategy's later polishing, exchange, and merge rules.
+Max ASUs counts both imported and newly created groups in either strategy.
 
 The `WARM_START` stage reports imported ASUs, assigned tracts, and baseline
 unemployment. The original RDS is never modified. The edit tab's existing
@@ -474,9 +486,10 @@ across merges and renumbering; the remaining queue finishes before a restart.
 If a later polish releases tracts that enlarge an earlier ASU's reachable
 window, that ASU can receive a follow-up solve even without a merge. Follow-ups
 use the same polish ordering and skip unchanged or merely smaller windows.
-The whole run allows at most three such follow-up rounds, sharing up to 180
-seconds (or the initial ASU count times the per-ASU polish limit, if smaller).
-These extra-work limits do not replace ordinary merge restarts. The log uses
+The whole run allows at most three such follow-up rounds, with no shared
+time cap. Each ASU receives its normal configured per-ASU polish time limit;
+Stop/Skip and the five-second cut-round limit still apply.
+The follow-up round limit does not replace ordinary merge restarts. The log uses
 `FINAL_POLISH_RECHECK` and `FINAL_POLISH_RECHECK_LIMIT`; reaching a limit does
 not prove that further improvement is impossible.
 

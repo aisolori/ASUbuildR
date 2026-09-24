@@ -274,7 +274,7 @@ options(
 
 )
 
-options(shiny.maxRequestSize = 50 * 1024^2)  # Set to 50MB or your desired limit
+options(shiny.maxRequestSize = 1000 * 1024^2)  # Set to 50MB or your desired limit
 
 # Record serialized output sizes, never dataset contents.
 asu_install_payload_logging(session)

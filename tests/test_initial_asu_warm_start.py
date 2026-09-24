@@ -55,7 +55,9 @@ class InitialAsuWarmStartTest(unittest.TestCase):
                 if partition:
                     self.assertGreaterEqual(len(polish), 2)
                 else:
-                    self.assertEqual(calls, [])
+                    self.assertEqual(len(calls), 2)
+                    self.assertEqual([call['hint_obj'] for call in calls], [10, 20])
+                    self.assertIn('[STAGE] LEGACY_REOPTIMIZE', output.getvalue())
                 self.assertEqual("[STAGE] SINGLE_ASU_TAKEOVER" in output.getvalue(), partition)
                 self.assertIn("[STAGE] FINAL_RESIDUAL_CHECK", output.getvalue())
                 residual.assert_called_once()

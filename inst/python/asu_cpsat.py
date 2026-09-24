@@ -11614,7 +11614,13 @@ def build_many_asus_cpsat(
     Every positive group is validated before use; 0/-1 mean unassigned. IDs
     are compacted and imported groups count toward max_asus. The dashboard
     aligns RDS files by GEOID before supplying this vector; all strategies
-    resume from those validated assignments.
+    resume from those validated assignments. Legacy first reoptimizes each
+    imported ASU once, using its saved membership as a hint and unemployment
+    floor, before searching for additional ASUs. Only a selected anchor is
+    required; other saved groups remain excluded from its reachable window.
+    This pass skips pruning/hint preparation and runs even at max_asus, with
+    time_limit and the full worker budget per imported ASU. Replacements are
+    validated and cannot reduce captured unemployment; time_limit=0 skips it.
 
     `split_warm_start` instead tries each imported parent once, highest captured
     unemployment first. Joint children may release parent tracts and use
@@ -12036,6 +12042,95 @@ def build_many_asus_cpsat(
         k = len(updated)
         _emit_progress("PARTITION_TOUCHING_JOINT_COMMIT")
         return True
+
+    # Reopen imported Legacy groups before searching only the residual graph.
+    # A saved feasible selection is already a better starting point than
+    # rebuilding a pruning hint. Protect peers, not the target's membership.
+    if initial_units and not harvest_connectivity_free_asus and float(time_limit) > 0:
+        imported_ids = np.unique(asu_id[asu_id > 0]).astype(int).tolist()
+        for position, label in enumerate(imported_ids, 1):
+            if _stop_requested(stop_flag_path):
+                break
+            if _stop_requested(skip_flag_path):
+                _consume_flag(skip_flag_path)
+                continue
+            current = np.flatnonzero(asu_id == label).tolist()
+            baseline = int(u[current].sum())
+            root = _pick_capacity_root(current, u, E, P, tau)
+            sub = _reachable_polish_window(root, label, asu_id, nb)
+            local = {node: index for index, node in enumerate(sub)}
+            local_nb = [[local[v] for v in nb[node] if v in local] for node in sub]
+            hint = [local[node] for node in current]
+            stable_values = ([str(df.iloc[node]['geoid']) for node in sub]
+                             if 'geoid' in df.columns else [str(node).zfill(12) for node in sub])
+            ranks = [0] * len(sub)
+            for rank, index in enumerate(sorted(range(len(sub)), key=lambda i: (stable_values[i], i))):
+                ranks[index] = rank
+            with _stage_checking([label], len(imported_ids) - position):
+                if verbose:
+                    _stage_print(f'[STAGE] LEGACY_REOPTIMIZE asu={label} '
+                                 f'position={position}/{len(imported_ids)} '
+                                 f'window_tracts={len(sub)} saved_tracts={len(current)} '
+                                 f'unemp_floor={baseline} root={root} '
+                                 f'time_limit={float(time_limit):.3f}s '
+                                 'hint=saved_asu reverse_prune=skipped peers=protected', flush=True)
+                _emit_progress('LEGACY_REOPTIMIZE')
+                result = _solve_window(
+                    nb_local=local_nb, u_g=u[sub], E_g=E[sub], P_g=P[sub],
+                    tau=tau, pop_thresh=pop_thresh, root_local=local[root],
+                    hint=hint, hint_obj=baseline, forced_selected=None,
+                    time_limit=time_limit, workers=workers, rel_gap=rel_gap, log=verbose,
+                    deterministic_ties=deterministic_ties, tie_break_rank=ranks,
+                    objective_shaving=objective_shaving,
+                    use_root_articulation_implications=use_root_articulation_implications,
+                    use_signed_flow=use_signed_flow, use_arborescence=use_arborescence,
+                    configure_subsolvers=configure_subsolvers,
+                    use_tract_first_search=use_tract_first_search,
+                    use_flow_first_search=use_flow_first_search,
+                    use_tract_capacity_search=use_tract_capacity_search,
+                    use_flow_capacity_hybrid_search=use_flow_capacity_hybrid_search,
+                    incumbent_stall_seconds=incumbent_stall_seconds,
+                    use_flow_count_envelope=use_flow_count_envelope,
+                    use_small_root_separators=use_small_root_separators,
+                    root_separator_max_size=root_separator_max_size,
+                    root_separator_clause_limit=root_separator_clause_limit,
+                    root_separator_target_limit=root_separator_target_limit,
+                    use_separator_cardinality_bounds=use_separator_cardinality_bounds,
+                    solution_pool_size=solution_pool_size,
+                    use_bridge_edge_bounds=use_bridge_edge_bounds,
+                    use_articulation_edge_bounds=use_articulation_edge_bounds,
+                    use_distance_flow_bounds=use_distance_flow_bounds,
+                    use_global_capacity_cardinality_bound=use_global_capacity_cardinality_bound,
+                    use_bridge_subtree_pruning=use_bridge_subtree_pruning,
+                    stop_flag_path=stop_flag_path, skip_flag_path=skip_flag_path,
+                    incumbent_report_callback=_incumbent_preview(('legacy_reoptimize', label), sub, hint),
+                    incumbent_report_interval_seconds=60.0,
+                    incumbent_interrupt_callback=None,
+                )
+                _clear_incumbent_previews()
+                selected = [] if result is None else result.sel_idx_local
+                valid_indices = (len(selected) > 0 and
+                                 all(isinstance(i, (int, np.integer)) and 0 <= i < len(sub)
+                                     for i in selected) and len(set(selected)) == len(selected))
+                candidate = [sub[i] for i in selected] if valid_indices else []
+                accepted = (bool(candidate) and int(u[candidate].sum()) >= baseline
+                            and component_ok(candidate, u, E, P, tau, pop_thresh, nb,
+                                             required=[root]))
+                if accepted:
+                    updated = asu_id.copy()
+                    updated[current] = -1
+                    updated[candidate] = label
+                    # Persist validated replacements before any later solve.
+                    if legacy_checkpoint_callback is not None and not np.array_equal(updated, asu_id):
+                        legacy_checkpoint_callback('LEGACY_REOPTIMIZE', _sequential_asu_ids(updated).tolist())
+                    asu_id[:] = updated
+                    remaining[:] = asu_id <= 0
+                _emit_progress('LEGACY_REOPTIMIZE_COMPLETE')
+                if verbose:
+                    value = int(u[asu_id == label].sum())
+                    _stage_print(f'[STAGE] LEGACY_REOPTIMIZE_COMPLETE asu={label} '
+                                 f'accepted={bool(accepted)} unemp={value} gain={value-baseline} '
+                                 f'status={result.status if result is not None else "NO_SOLUTION"}', flush=True)
 
     while k < max_asus:
         if _stop_requested(stop_flag_path):
@@ -13434,9 +13529,7 @@ def build_many_asus_cpsat(
     polish_attempts: set = set()
     polish_last_windows: Dict[int, Set[int]] = {}
     polish_last_ownership = {}
-    polish_followup_seconds = min(
-        180.0, polish_time_limit * max(1, len(np.unique(asu_id[asu_id > 0]))),
-    )
+    # Follow-ups get the normal per-ASU budget, without a shared wall-time cap.
     polish_followup_rounds = 0
     polish_skipped_ids: Set[int] = set()
 
@@ -13755,7 +13848,7 @@ def build_many_asus_cpsat(
     polish_round = 0
 
     def _run_final_polish() -> None:
-        nonlocal polish_round, polish_followup_seconds, polish_followup_rounds
+        nonlocal polish_round, polish_followup_rounds
         if not polish_enabled:
             return
         # Both ordinary and supernode partition polishing give ASUs with
@@ -13812,11 +13905,6 @@ def build_many_asus_cpsat(
                 asu_number = remaining_ids[0]
                 polish_position += 1
                 polish_count = polish_position + len(remaining_ids) - 1
-                if pending_ids is not None and polish_followup_seconds <= 0:
-                    if verbose:
-                        _stage_print("[STAGE] FINAL_POLISH_RECHECK_LIMIT reason=time_budget", flush=True)
-                    return
-                attempt_started = time.monotonic()
                 asus_before_polish = len(np.unique(asu_id[asu_id > 0]))
                 turn_nodes = np.flatnonzero(asu_id == asu_number).tolist()
                 with _stage_checking([asu_number], len(remaining_ids) - 1):
@@ -13825,11 +13913,6 @@ def build_many_asus_cpsat(
                         polish_position,
                         polish_count,
                         polish_round,
-                        seconds=polish_followup_seconds if pending_ids is not None else None,
-                    )
-                if pending_ids is not None:
-                    polish_followup_seconds = max(
-                        0.0, polish_followup_seconds - (time.monotonic() - attempt_started),
                     )
                 if not completed:
                     polish_completed = False
@@ -13915,12 +13998,12 @@ def build_many_asus_cpsat(
                     pending_ids.add(candidate_id)
             if not pending_ids:
                 break
-            if polish_followup_rounds >= 3 or polish_followup_seconds <= 0:
+            if polish_followup_rounds >= 3:
                 if verbose:
                     _stage_print(
                         f"[STAGE] FINAL_POLISH_RECHECK_LIMIT pending={len(pending_ids)} "
                         f"rounds={polish_followup_rounds}/3 "
-                        f"seconds_remaining={polish_followup_seconds:.3f}",
+                        "reason=round_limit time_budget=unlimited",
                         flush=True,
                     )
                 break
@@ -13929,7 +14012,7 @@ def build_many_asus_cpsat(
                 _stage_print(
                     f"[STAGE] FINAL_POLISH_RECHECK reason=reachable_window_grew "
                     f"queued={len(pending_ids)} followup_round={polish_followup_rounds}/3 "
-                    f"seconds_remaining={polish_followup_seconds:.3f} priority={polish_priority}",
+                    f"time_budget=unlimited priority={polish_priority}",
                     flush=True,
                 )
 
