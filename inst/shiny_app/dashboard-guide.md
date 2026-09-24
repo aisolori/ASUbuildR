@@ -91,15 +91,15 @@ when the custom worker portfolio is disabled. It is an experiment: extra
 presolve work may or may not improve the incumbent or proof within the total
 solve budget.
 
-Partition polishing starts each pass with the highest total `q_surplus` first,
-breaking ties by ASU number. Surplus includes all member tracts, including
-negative-surplus tracts, at the current unemployment-rate threshold.
+Partition polishing starts each pass with the lowest total unemployment first,
+breaking ties by ASU number. This is the sum of unemployed-person counts across
+all member tracts, not the unemployment rate or `q_surplus`.
 A merge is committed immediately, but surviving
 ASUs still waiting in that pass keep their turns. Absorbed ASUs are removed;
 groups containing an ASU already checked wait for the next pass. Once the
-remaining queue finishes, a new pass recalculates surplus order from the
+remaining queue finishes, a new pass recalculates unemployment order from the
 updated assignments. This ordering also applies with merging disabled and to
-follow-up polishing passes. Logs report `priority=q_surplus_descending`.
+follow-up polishing passes. Logs report `priority=unemployment_ascending`.
 
 Partitioning's **Initial ASU seed method** defaults to connected components of
 the connectivity-free solution. The optional **Surplus pruning** method starts
@@ -128,7 +128,7 @@ Dashboard runs disable the standalone `[graph-cut]` hint stage and corridor
 `[repair]`. Legacy single-ASU windows proceed from their other starting-solution
 heuristics to the main solver, which retains its internal `[cut-pass]`.
 That pass carries its generated cuts and tighter bounds into the exact solve.
-The single-ASU `[cut-pass]` has no time limit, including within each round.
+The single-ASU `[cut-pass]` uses a five-second solver limit for each round.
 It stops after 100 rounds, 25 consecutive rounds without a lower proven
 upper bound, or 50 consecutive rounds without higher valid unemployment,
 whichever happens first. Each improvement resets only its own stall counter.
@@ -140,11 +140,11 @@ limit; it stays at 50 even when supernode retries increase other limits.
 Proof, Stop/Skip, and
 solver failure can end it earlier. Cut-pass time is additional to the configured
 solve budget, which still limits the other solve phases.
-Within each round, a callback stops search once an incumbent exposes a new
-connectivity cut. Separator rows are added only after the solve returns.
-Already-known/dominated cuts and connected incumbents alone do not trigger
-this early stop. Valid connected improvements survive restarts and Stop/Skip.
-`round_end=NEW_CONNECTIVITY_CUTS` identifies early discovery stops in the logs.
+Within each round, a callback retains useful disconnected candidates and valid
+connected improvements without stopping search. Separator rows are added only
+after the solve returns. Valid connected improvements survive restarts and Stop/Skip.
+`round_end=SOLVER_RETURNED` identifies normal returns; round summaries remain
+visible, but detailed CP-SAT search logs are suppressed for cut solves.
 This applies to Legacy and to Partitioning's individual single-ASU solves.
 Partitioning still uses the connectivity-free relaxation to generate seeds.
 
@@ -187,24 +187,21 @@ rows, count bounds, objective bounds, and gain-based exclusions. A proven
 economic impossibility returns the unchanged parent without running cut or
 flow solves and is logged as `ASU_SPLIT_ECONOMIC_SCREEN`.
 
-Each parent starts with an untimed, flow-free connectivity cut pass: at most
-**25 rounds or 10 consecutive stalled-upper-bound rounds**. Proof, cancellation,
+Each parent starts with a flow-free connectivity cut pass with five-second rounds:
+at most **100 rounds or 25 consecutive stalled-upper-bound rounds**. Proof, cancellation,
 or solver failure may end it earlier. Within each round, the solver checks
-incumbents for disconnected children and stops as soon as it discovers new
-connectivity cuts. It adds those cuts after the solver stops, then restarts
-unless the pass has reached its round/stall limit. Connected incumbents or
-already-known cuts alone do not trigger this early stop. The same callback
-behavior is enabled in Legacy's main cut pass and Partitioning's individual,
-touching-ASU joint, and supernode-polishing cut passes. Existing time budgets
-and total round caps are unchanged; initial upper-bound stall limits are ten.
+incumbents for disconnected children but continues after discovering cuts.
+It adds those cuts after the solver returns, then restarts unless the pass
+has reached its proof, round, or stall limit. The same behavior applies to
+Legacy's main cut pass and Partitioning's individual, touching-ASU joint,
+and supernode-polishing cut passes. Existing overall phase budgets still apply.
 
-`ASU_SPLIT_CUT_ROUND` reports `round_end=NEW_CONNECTIVITY_CUTS` for these early
-stops. The solver status may be `FEASIBLE`, not `OPTIMAL`. Only certified solver
+`ASU_SPLIT_CUT_ROUND` reports `round_end=SOLVER_RETURNED` for normal returns.
+On a time limit, the solver status may be `FEASIBLE` or `UNKNOWN`, not `OPTIMAL`. Only certified solver
 upper bounds carry forward, never a disconnected incumbent's objective as an
 upper bound. Valid connected split incumbents found during a round are retained.
-Faster cut discovery can leave weaker bounds and more work for exact flow;
-presolve still runs each round, and there is no time guarantee before finding
-a useful candidate. Cuts and tighter bounds remain in the
+Five-second rounds may finish without a useful candidate; presolve still runs
+each round and consumes part of that limit. Cuts and tighter bounds remain in the
 same model when exact connectivity flows are added. A valid connected optimum
 of the cut model needs no further flow solve. **Time limit per window** and
 **Incumbent stall limit** apply only to that subsequent exact solve per parent;
@@ -305,7 +302,7 @@ infeasibility.
 | PARTITION_EXPANSION_COMPLETE | Summarizing that round. Rejected seeds did not produce valid ASUs; the whole run can continue. |
 | PARTITION_TOUCHING_JOINT / PARTITION_TOUCHING_JOINT_COMPLETE | Jointly reoptimizing a touching partition cluster with reachable unassigned tracts. Reports source stage, group/window size, budget/workers, movable roots, baseline unemployment, gain, deactivated slots, acceptance, and elapsed time. `CACHED` skips an unchanged attempted neighborhood, not a proof of optimality. |
 | PARTITION_BUILD_MERGE / PARTITION_COMBINE | Legacy touching-group combining; partitioning uses the joint check instead. |
-| FINAL_POLISH | Processes ASUs from highest to lowest total q_surplus. After a merge, pending surviving ASUs finish their turns; the next pass recalculates surplus from updated memberships. |
+| FINAL_POLISH | Processes ASUs from lowest to highest total unemployment. After a merge, pending surviving ASUs finish their turns; the next pass recalculates unemployment from updated memberships. |
 | FINAL_POLISH_MERGE | Committing a merge and finishing remaining queued ASUs before restarting polishing. |
 | SINGLE_ASU_TAKEOVER / TAKEOVER_DONOR_REPAIR | Partitioning only. Runs flow-free graph cuts before the takeover flow solve, then repairs affected groups before accepting or rejecting the attempt. |
 | FINAL_RESIDUAL_CHECK | Checking remaining tract components near the end. |
@@ -315,35 +312,42 @@ Stages may repeat or be skipped depending on the strategy and results.
 Legacy single-ASU runs proceed to the final residual check after their ASU
 search passes; they do not run `SINGLE_ASU_TAKEOVER` or its donor repairs.
 
-In Partitioning, the single-ASU takeover uses the same untimed cut pass:
+Across all strategies, each connectivity-cut solve has a **five-second limit**
+(including presolve), or less when the enclosing phase has less time remaining.
+Finding a cut does not interrupt the solve: it continues until optimality or
+the time limit, unless Stop/Skip, infeasibility, or a solver error ends it sooner.
+Cuts are added between solves, not during a live solve. Connected incumbents are
+retained. Cut rounds show concise summaries instead of the full CP-SAT log.
+Model setup, cut generation, and solver shutdown can add wall-clock overhead
+outside the solver's five-second search limit. Exact-flow solve logging is unchanged.
+
+In Partitioning, the single-ASU takeover uses the same cut-pass limits as Legacy:
 100 rounds maximum, 25 rounds without an improved upper bound, or 50 rounds
 without improved valid unemployment, whichever happens first.
 All generated cuts strengthen the subsequent exact model.
-A round can stop early on a newly discovered connectivity cut, just as in
-Legacy's main cut pass; it need not prove a disconnected assignment optimal.
+A time-limited round need not prove a disconnected assignment optimal.
 A proven optimum can skip further primary optimization; Stop and Skip remain active.
 
 The post-polish bridge-pair pass has been removed (both cuts and flow).
 Supernode polishing starts with connectivity cuts on the contracted graph.
-Its rounds check ASUs from highest to lowest total q_surplus, breaking ties by
+Its rounds check ASUs from lowest to highest total unemployment, breaking ties by
 ASU ID. After a merge, remaining surviving ASUs finish before the queue restarts
-in this same surplus order. Ordinary polishing with merging
-disabled also uses highest-surplus-first order.
+in this same unemployment order. Ordinary polishing with merging
+disabled also uses lowest-unemployment-first order.
 `FINAL_POLISH_SUPERNODES_CUT_ROUND` reports the upper bound and its stall count.
 The first cut pass stops after 100 cut rounds, 25 consecutive rounds without a
 better upper bound, or 50 consecutive rounds without higher valid unemployment,
 whichever happens first. A better bound resets its stall
 count, not the total round count. There is no individual-cut-count cap.
 Proof, cancellation, and the overall polish time limit can stop it sooner.
-Individual supernode cut rounds also stop on new connectivity cuts; their
-existing ten-second per-round ceiling and shared polish budget still apply.
-Partitioning's touching-ASU joint cut passes use this callback too, retaining
-their existing per-round and overall cut-pass time budgets.
+Individual supernode and touching-ASU joint cut rounds use the same five-second
+ceiling and continue after cut discovery. Their shared overall phase budgets
+still apply.
 Exact flow retains the cuts and best connected solution and uses the remaining
 time. If primary flow stalls with a valid incumbent that absorbs another ASU,
 that solution returns immediately for merge validation/commit and the polish
-queue continues with remaining surviving ASUs before restarting in highest
-surplus order. Equal statewide unemployment is sufficient; coverage cannot
+queue continues with remaining surviving ASUs before restarting in lowest
+total unemployment order. Equal statewide unemployment is sufficient; coverage cannot
 decrease. `FINAL_POLISH_SUPERNODES_STALL_MERGE` reports this handoff.
 Otherwise, if the primary flow solve reaches its incumbent stall limit without a
 proof, another flow-free cut pass runs with the total-round and upper-bound-stall
@@ -575,12 +579,61 @@ finish; a failed save stops further solving and reports the error. Check the
 original geometry, GEOIDs, population/economic data and ASU assignments, and can
 be opened with **Load Data** or used as a warm start.
 
-Recovery files and legacy run logs live under `~/ASUbuildR/checkpoints/` on the
-machine running R (on EC2, normally `/home/anton/ASUbuildR/checkpoints/`). Set
-`ASU_CHECKPOINT_DIR` before launching the dashboard to choose another persistent
-folder. Each run/save has a unique name; older saves are not overwritten or
-automatically deleted. RDS files are uncompressed to save quickly. The small
-assignment request JSON is also retained if R cannot complete the save.
+### Persistent solver jobs and browser disconnects
+
+All newly launched CP-SAT strategies (Legacy, Partitioning, and Split) now run
+as detached jobs under `~/ASUbuildR/jobs/` on the machine running R. Set
+`ASU_JOB_DIR` before launching the dashboard to choose another writable,
+persistent directory. The old `ASU_CHECKPOINT_DIR` location is not used for new
+dashboard jobs; existing checkpoints there remain untouched.
+
+Closing/navigating away from the browser, losing its WebSocket, or ending the
+launching R process does not request solver termination. Explicit **Stop** and
+**Skip** still send their usual flags. To avoid an accidental duplicate solve,
+the dashboard asks you to attach to an existing active job before starting another.
+
+On a fresh dashboard, use **Persistent solver jobs** on the Data Initialization
+tab: **Refresh jobs**, choose the run, then **Attach to job**. No workbook upload
+is required to view that job's saved data. Attaching never reruns the solver.
+Running jobs restore live progress and Stop/Skip controls; finished or failed
+jobs show the final output or latest published committed assignments. A failed
+job is not automatically retried. Reopening a dashboard after restarting R must
+use the same `ASU_JOB_DIR` and OS user to discover those jobs.
+
+Each unique job directory contains:
+
+- `solver.log`: Python stdout/stderr written directly to disk, independent of Shiny.
+- `events.log`: viewer attach/disconnect and explicit user-control events.
+- `supervisor.log`: detached supervisor startup/errors.
+- `job.json`, `owner.json`, `status.json`: configuration, process identity,
+  running/terminal state, timestamps and solver exit code. A failed RDS export
+  has a separate `recovery_exit_code`; JSON recovery remains available.
+- `input.rds`, `df.csv`, `nb.json`: immutable source geometry, ordered data and graph.
+- `python/`, `runner.py`, `recover.R`: snapshotted job code, so later source edits
+  cannot silently change a running job's checkpoint code or solver module.
+- `progress.json`: atomically replaced committed assignments for all strategies.
+- `out.json`, `result.rds`: final assignments and dashboard-loadable output when
+  the solve returns successfully, including an explicit Stop that returns results.
+- `recovered.rds`: latest published progress exported if the solver fails and
+  a valid progress snapshot exists. The unfinished candidate may not be committed.
+  Repeated manual exports use a unique filename instead of overwriting earlier saves.
+- Legacy `*.request.json`, `*.ack.json`, and `*.rds` checkpoints: independent R
+  subprocesses now service these; they never wait for a browser/Shiny observer.
+
+If the machine or supervisor dies before exporting an RDS, the saved input and
+progress JSON can still be converted from an R session with the updated package:
+
+```r
+ASUbuildR:::asu_job_recover('FULL/PATH/TO/job_...')
+```
+
+This recovers assignments, not CP-SAT's search tree. Load the RDS or use it as a
+warm start for a new solve. Browser independence does not mean jobs survive a
+machine reboot, OS-enforced logout termination, disk failure, or out-of-memory
+kill. Jobs run as your OS user, not as a system service. No old job data is
+automatically deleted; monitor disk space, particularly for national geometry
+and uncompressed RDS checkpoints. The job list covers the configured folder on
+this machine; it does not attach to jobs on another server.
 
 - **Python not detected:** run `ASUbuildR::setup_asu_python()` and
   `ASUbuildR::check_asu_python()`, then restart the dashboard.

@@ -43,7 +43,7 @@ class AsuSplitTest(unittest.TestCase):
             groups, status = self.solve(path_graph(5), [10, 10, 1, 10, 10], [1, 2, 3])
         self.assertEqual(status, "OPTIMAL")
         self.assertEqual({frozenset(g) for g in groups}, {frozenset([0, 1]), frozenset([3, 4])})
-        self.assertTrue(math.isinf(limits[0]))
+        self.assertEqual(limits[0], 5.0)
         self.assertFalse(any(v.name.startswith("split_flow_") for v in models[0].Proto().variables))
 
     def test_no_gain_is_not_a_split(self):
@@ -132,8 +132,9 @@ class AsuSplitTest(unittest.TestCase):
         runner = ast.parse(template % tuple(range(1, count + 1)))
         kwargs = next(n.value for n in ast.walk(runner) if isinstance(n, ast.Assign)
                       and any(isinstance(t, ast.Name) and t.id == "kwargs" for t in n.targets))
-        self.assertEqual(next(k.value.value for k in kwargs.keywords if k.arg == "split_warm_start"), 4)
-        self.assertRegex(args, r'nb_json,\s*if \(use_split\) "True" else "False"')
+        # Persistent runners have an additional checkpoint-directory placeholder.
+        self.assertEqual(next(k.value.value for k in kwargs.keywords if k.arg == "split_warm_start"), 5)
+        self.assertRegex(args, r'nb_json,\s*if \(legacy_checkpoint\)[^\n]+\s*if \(use_split\) "True" else "False"')
         self.assertIn('if (use_split || isTRUE(input$cpsat_use_warm_start))', source)
         self.assertIn("input.cpsat_use_warm_start === true || input.cpsat_strategy === 'split'", source)
 
@@ -175,12 +176,12 @@ class AsuSplitTest(unittest.TestCase):
             groups, status = self.solve(path_graph(5), [10, 10, 1, 10, 10], [1, 2, 3])
         self.assertEqual(status, "OPTIMAL")
         self.assertEqual(sum(len(g) for g in groups), 4)
-        self.assertEqual(options["max_rounds"], 25)
-        self.assertEqual(options["upper_bound_stall_rounds"], 10)
-        self.assertIsNone(options["round_seconds"])
+        self.assertEqual(options["max_rounds"], 100)
+        self.assertEqual(options["upper_bound_stall_rounds"], 25)
+        self.assertEqual(options["round_seconds"], 5.0)
         self.assertEqual(options["objective_floor"], 22)
         self.assertTrue(options["bound_stall_only"])
-        self.assertTrue(options["stop_on_new_cuts"])
+        self.assertFalse(options["stop_on_new_cuts"])
         self.assertTrue(any(v.name.startswith("split_flow_") for v in calls[0].Proto().variables))
         self.assertEqual(before, [str(c) for c in calls[0].Proto().constraints][:len(before)])
 

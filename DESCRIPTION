@@ -39,6 +39,7 @@ Imports:
     crayon,
     Rcpp,
     processx,
+    ps,
     rappdirs
 LinkingTo: Rcpp
 SystemRequirements: C++11; Pandoc (>= 1.12.3); Python (>= 3.9) with packages: ortools, numpy, pandas, networkx, openpyxl, python-igraph

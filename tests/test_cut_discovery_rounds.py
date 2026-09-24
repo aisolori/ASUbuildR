@@ -1,4 +1,4 @@
-"""End split rounds on useful cuts, without mistaking incumbents for bounds."""
+"""Run bounded cut rounds to completion, without mistaking incumbents for bounds."""
 import contextlib
 import io
 import math
@@ -16,7 +16,7 @@ import asu_cpsat as solver
 
 class CutDiscoveryRoundsTest(unittest.TestCase):
     def run_rounds(self, rounds, *, enabled=True, seen=None, max_rounds=25,
-                   stall=5, n=3):
+                   stall=5, n=3, round_seconds=None, deadline=math.inf):
         model = solver.cp_model.CpModel()
         row = [model.NewBoolVar(f"x_{i}") for i in range(n)]
         roots = [model.NewBoolVar(f"r_{i}") for i in range(n)]
@@ -79,10 +79,10 @@ class CutDiscoveryRoundsTest(unittest.TestCase):
                 patch.object(solver, "_configure_asu_solver_portfolio"), contextlib.redirect_stdout(output):
             result = solver._joint_connectivity_cut_pass(
                 model, [row], [roots], nb, np.full(n, 10), [[0]], valid,
-                math.inf, 2, lambda: cancelled[0], log=True, objective=objective,
+                deadline, 2, lambda: cancelled[0], log=True, objective=objective,
                 max_rounds=min(max_rounds, len(rounds)), upper_bound_stall_rounds=stall,
                 bound_stall_only=True, seen_cuts=seen, proof_out=proof, bound_out=bounds,
-                round_seconds=None, stop_on_new_cuts=enabled,
+                round_seconds=round_seconds, stop_on_new_cuts=enabled,
                 report=lambda nodes, value: reports.append((nodes, value)))
         return SimpleNamespace(result=result, model=model, row=row, objective=objective,
                                created=created, proof=proof, bounds=bounds, reports=reports,
@@ -115,14 +115,14 @@ class CutDiscoveryRoundsTest(unittest.TestCase):
                 self.assertIn('valid_unemp_stall=50/50', result.output)
                 self.assertIn('stop_reason=VALID_UNEMP_STALL', result.output)
 
-    def test_useful_cut_stops_round_and_only_certified_bound_is_carried(self):
+    def test_useful_cut_does_not_stop_round_and_only_certified_bound_is_carried(self):
         result = self.run_rounds([dict(candidates=[[0, 2]])])
-        self.assertEqual(result.created[0].stop_calls, 1)
-        self.assertTrue(math.isinf(result.created[0].parameters.max_time_in_seconds))
+        self.assertEqual(result.created[0].stop_calls, 0)
+        self.assertEqual(result.created[0].parameters.max_time_in_seconds, 5.0)
         self.assertEqual(result.result, ([[0]], 10, "FEASIBLE"))
         self.assertEqual(result.bounds, [101])  # Ceiling of 100.25, not incumbent 20.
         self.assertEqual(result.proof, [False])
-        self.assertIn("round_end=NEW_CONNECTIVITY_CUTS", result.output)
+        self.assertIn("round_end=SOLVER_RETURNED", result.output)
         self.assertIn("cuts_added=1", result.output)
         self.assertEqual(len(result.model.Proto().constraints), result.initial_rows + 2)
         # A better connected selection must survive both the new cut and bound.
@@ -139,6 +139,22 @@ class CutDiscoveryRoundsTest(unittest.TestCase):
                 result = self.run_rounds([dict(candidates=[[0, 2]], bound=bound)])
                 self.assertEqual(result.bounds, [None])
                 self.assertEqual(len(result.model.Proto().constraints), result.initial_rows + 1)
+
+    def test_round_cap_and_quiet_logs_apply_even_to_legacy_unlimited_callers(self):
+        for seconds, expected in ((None, 5.0), (100.0, 5.0), (2.0, 2.0)):
+            with self.subTest(seconds=seconds):
+                result = self.run_rounds([dict(candidates=[[0, 2]])], round_seconds=seconds)
+                params = result.created[0].parameters
+                self.assertEqual(params.max_time_in_seconds, expected)
+                self.assertFalse(params.log_search_progress)
+                self.assertFalse(params.log_to_stdout)
+                self.assertFalse(params.log_to_response)
+                self.assertIn('stop_on_new_cuts=False', result.output)
+
+    def test_shorter_phase_deadline_is_respected(self):
+        result = self.run_rounds([dict(candidates=[[0, 2]])],
+                                 deadline=solver.time.monotonic() + 2.0)
+        self.assertTrue(0 < result.created[0].parameters.max_time_in_seconds <= 2.0)
 
     def test_known_cut_or_connected_incumbent_does_not_trigger_discovery_stop(self):
         known = self.run_rounds([dict(candidates=[[0, 2]])], seen={(0, 2, (2,))})
@@ -169,19 +185,19 @@ class CutDiscoveryRoundsTest(unittest.TestCase):
         self.assertEqual(result.reports, [([0, 1], 20)])
         self.assertIn("cuts_added=0", result.output)
 
-    def test_stall_and_round_limits_still_apply_after_early_cut_discovery(self):
+    def test_stall_and_round_limits_still_apply_after_cut_discovery(self):
         rounds = [dict(candidates=[[0, i]], bound=200) for i in range(2, 14)]
         stalled = self.run_rounds(rounds, n=15, stall=10)
         self.assertEqual(len(stalled.created), 11)  # Initial bound + ten stalls.
-        self.assertTrue(all(instance.stop_calls == 1 for instance in stalled.created))
+        self.assertTrue(all(instance.stop_calls == 0 for instance in stalled.created))
         self.assertIn("stop_reason=UPPER_BOUND_STALL", stalled.output)
         capped = self.run_rounds(rounds, n=15, stall=10, max_rounds=3)
         self.assertEqual(len(capped.created), 3)
         self.assertIn("stop_reason=ROUND_LIMIT", capped.output)
 
-    def test_opt_in_does_not_change_other_callers_solver_invocation(self):
+    def test_callback_retains_incumbents_for_all_callers(self):
         result = self.run_rounds([dict(candidates=[[0, 2]])], enabled=False)
-        self.assertFalse(result.created[0].had_callback)
+        self.assertTrue(result.created[0].had_callback)
         self.assertEqual(result.created[0].stop_calls, 0)
         self.assertIn("cuts_added=1", result.output)
 
@@ -194,14 +210,20 @@ class CutDiscoveryRoundsTest(unittest.TestCase):
         objective = 10 * row[0] + 20 * row[2]
         model.Maximize(objective)
         proof, bounds, output = [], [], io.StringIO()
-        configure = solver._configure_asu_solver_portfolio
+        real_solve = solver.cp_model.CpSolver.Solve
+        statuses, detailed_logs = [], []
 
-        def quiet(parameters, workers):
-            configure(parameters, workers)
-            parameters.log_to_stdout = False
+        def capture(engine, model, *args, **kwargs):
+            self.assertEqual(engine.parameters.max_time_in_seconds, 5.0)
+            self.assertFalse(engine.parameters.log_search_progress)
+            self.assertFalse(engine.parameters.log_to_stdout)
+            engine.log_callback = detailed_logs.append
+            status = real_solve(engine, model, *args, **kwargs)
+            statuses.append(status)
+            return status
 
         with contextlib.redirect_stdout(output), \
-                patch.object(solver, "_configure_asu_solver_portfolio", side_effect=quiet):
+                patch.object(solver.cp_model.CpSolver, "Solve", new=capture):
             groups, value, status = solver._joint_connectivity_cut_pass(
                 model, [row], [roots], [[1], [0, 2], [1]], np.array([10, 0, 20]), [[0]],
                 lambda groups: groups == [[0]], math.inf, 1, lambda: None,
@@ -211,7 +233,9 @@ class CutDiscoveryRoundsTest(unittest.TestCase):
         self.assertEqual((groups, value, status), ([[0]], 10, "OPTIMAL"))
         self.assertEqual(proof, [True])
         self.assertEqual(bounds, [10])
-        self.assertIn("round_end=NEW_CONNECTIVITY_CUTS", output.getvalue())
+        self.assertEqual(statuses, [solver.cp_model.OPTIMAL, solver.cp_model.OPTIMAL])
+        self.assertEqual(detailed_logs, [])
+        self.assertIn("round_end=SOLVER_RETURNED", output.getvalue())
 
 
 if __name__ == "__main__":

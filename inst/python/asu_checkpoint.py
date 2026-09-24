@@ -1,6 +1,7 @@
 """Synchronously request an RDS save from the dashboard before further solving."""
 import json
 import os
+import subprocess
 from pathlib import Path
 import time
 import uuid
@@ -17,6 +18,14 @@ def request_rds_checkpoint(folder, phase, asu_id, timeout=600.0):
         os.fsync(stream.fileno())
     os.replace(pending, request)
     print(f"[checkpoint] Waiting for RDS save: {stem}.rds", flush=True)
+    config_path = Path(folder) / 'job.json'
+    if config_path.exists():
+        config = json.loads(config_path.read_text(encoding='utf-8'))
+        # Durable jobs save synchronously in their own R process, never Shiny.
+        flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+        subprocess.run([config['rscript'], '--vanilla', str(Path(folder) / 'recover.R'),
+                        str(folder), 'checkpoint'], check=True,
+                       stdin=subprocess.DEVNULL, creationflags=flags, timeout=timeout)
     deadline = time.monotonic() + timeout
     while not ack.exists():
         if time.monotonic() >= deadline:

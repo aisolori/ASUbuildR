@@ -55,9 +55,9 @@ class SplitTighteningTest(unittest.TestCase):
         tight, _ = self.capture(nb, u, [0] * 7, [10000] * 7, parent)
         self.assertEqual(self.check_fixed_groups(loose, disconnected, parent), solver.cp_model.OPTIMAL)
         self.assertEqual(self.check_fixed_groups(tight, disconnected, parent), solver.cp_model.INFEASIBLE)
-        self.assertEqual(tight["options"]["max_rounds"], 25)
-        self.assertEqual(tight["options"]["upper_bound_stall_rounds"], 10)
-        self.assertIsNone(tight["options"]["round_seconds"])
+        self.assertEqual(tight["options"]["max_rounds"], 100)
+        self.assertEqual(tight["options"]["upper_bound_stall_rounds"], 25)
+        self.assertEqual(tight["options"]["round_seconds"], 5.0)
         self.assertFalse(any(v.name.startswith("split_flow_") for v in tight["model"].Proto().variables))
 
     def test_unassigned_bypass_is_not_cut_by_parent_articulation(self):

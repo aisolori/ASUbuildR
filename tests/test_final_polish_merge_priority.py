@@ -125,6 +125,8 @@ class FinalPolishMergePriorityTest(unittest.TestCase):
         self.assertEqual(calls, [(1, (0,)), (3, (4,)), (4, (6,)), (2, (2,))])
         self.assertEqual(result["n_asu"], 4)
         self.assertIn("merged_first=none", log)
+        self.assertIn("priority=unemployment_ascending", log)
+        self.assertIn("lowest total unemployment first", log)
 
 
 if __name__ == "__main__":

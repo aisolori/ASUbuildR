@@ -211,6 +211,7 @@ if (is_dev_mode) {
   source(file.path(r_dir, "neighbor_cache.R"))
   source(file.path(r_dir, "browser_data.R"))
   source(file.path(r_dir, "solver_checkpoint.R"))
+  source(file.path(r_dir, "solver_jobs.R"))
   source(file.path(r_dir, "tract_geography.R"))
 } else {
   asu_read_warm_start <- getFromNamespace("asu_read_warm_start", "ASUbuildR")
@@ -218,7 +219,9 @@ if (is_dev_mode) {
   asu_cached_neighbors <- getFromNamespace("asu_cached_neighbors", "ASUbuildR")
   for (helper in c("asu_load_tract_geography", "asu_join_tract_data", "asu_read_upload", "asu_state_slice", "asu_display_geometry", "asu_display_bounds",
                    "asu_payload_log", "asu_install_payload_logging", "asu_browser_source", "asu_map_source",
-                   "asu_checkpoint_run_dir", "asu_service_checkpoints"))
+                   "asu_checkpoint_run_dir", "asu_service_checkpoints", "asu_job_root", "asu_job_run_dir",
+                   "asu_job_prepare", "asu_job_launch", "asu_job_handle", "asu_job_list",
+                   "asu_job_state", "asu_job_recover"))
     assign(helper, getFromNamespace(helper, "ASUbuildR"))
   message("→ Installed package mode: functions should already be available")
 }
@@ -319,7 +322,7 @@ cpsat_skip_file  <- shiny::reactiveVal(NULL)
 cpsat_running <- shiny::reactiveVal(FALSE)
 cpsat_stage_text <- shiny::reactiveVal("idle")
 
-append_cpsat_log <- function(...) {
+append_cpsat_log <- function(..., .persist = TRUE) {
   raw <- paste0(..., collapse = "")
   lines <- strsplit(raw, "\n", fixed = TRUE)[[1]]
   stage_lines <- grep("\\[STAGE\\]", lines, value = TRUE)
@@ -335,7 +338,7 @@ append_cpsat_log <- function(...) {
   if (nchar(new) > 12000) new <- substr(new, nchar(new) - 11999, nchar(new))
   cpsat_log_buf(new)
   lf <- cpsat_log_file()
-  if (!is.null(lf)) try(cat(line, "\n", file = lf, append = TRUE), silent = TRUE)
+  if (.persist && !is.null(lf)) try(cat(line, "\n", file = file.path(dirname(lf), "events.log"), append = TRUE), silent = TRUE)
 }
 
 # keep log output live even if hidden
@@ -348,12 +351,12 @@ output$show_cpsat_log_flag <- shiny::renderText({
 })
 shiny::outputOptions(output, "show_cpsat_log_flag", suspendWhenHidden = FALSE)
 
-# Kill the solver process if the user closes the browser before it finishes.
+# Disconnect detaches only the viewer; the supervisor and solver own their files.
 session$onSessionEnded(function() {
-  px <- shiny::isolate(cpsat_solver_proc())
-  if (!is.null(px) && px$is_alive()) px$kill()
-
-
+  folder <- shiny::isolate(cpsat_run_dir())
+  if (!is.null(folder)) try(cat(format(Sys.time(), "%Y-%m-%d %H:%M:%S %z"),
+    " [session] Browser session ended; viewer did not terminate the job.\n",
+    file = file.path(folder, "events.log"), append = TRUE), silent = TRUE)
 })
 
 # ---- New England year override logic ---------------------------------
@@ -727,6 +730,11 @@ If the necessary data is not in columns **A through AB** within the Excel file, 
 Once the file is loaded, a preview of the data will appear on the right, the state and year information will display below, and the analyst may proceed to the next tab (Load Initial ASU).
 Note: at this time, ASUbuildR assumes a state is using county-based census tracts. If a state uses another geography such as NECTAs as the basis for its ASU tract file, this process will require some modification.
 ```{r}
+shiny::h4("Persistent solver jobs")
+shiny::selectInput("saved_job", "Saved or running job", choices = c("Choose a job" = ""))
+shiny::actionButton("refresh_jobs", "Refresh jobs")
+shiny::actionButton("attach_job", "Attach to job")
+shiny::helpText("Jobs continue after this tab closes. Attach to monitor results or use Stop. Job files are kept on the machine running R.")
 shiny::fileInput("file", "Choose Excel File", accept = c(".xls", ".xlsx"))
 shiny::selectInput("display_state_upload", "Display area:", choices = character(0))
 shiny::textOutput("upload_status")
@@ -1085,6 +1093,272 @@ palette_logic <- function(n_asu) {
 
 
 
+# A viewer can attach after a browser disconnect or an R/dashboard restart.
+attach_cpsat_job <- function(run_dir) {
+  initial_sf <- readRDS(file.path(run_dir, "input.rds"))
+  merged_df <- sf::st_drop_geometry(initial_sf)
+  input_df <- utils::read.csv(file.path(run_dir, "df.csv"), colClasses = c(geoid = "character"))
+  if (!identical(as.character(merged_df$GEOID), input_df$geoid)) stop("Job GEOID order mismatch")
+  graph <- jsonlite::fromJSON(file.path(run_dir, "nb.json"), simplifyVector = FALSE)
+  nb_adjacency(list(geoids = merged_df$GEOID,
+                   nb = lapply(graph, function(v) as.integer(unlist(v)) + 1L)))
+  full_data(initial_sf)
+  full_data_reset(initial_sf)
+  selected_tracts(NULL)
+  highlighted_tracts(character(0))
+  state(sort(unique(substr(initial_sf$GEOID, 1L, 2L))))
+  if (is.null(display_state()) || !display_state() %in% c(state(), "ALL")) display_state(state()[1L])
+  cpsat_log_buf("")
+  cpsat_run_dir(run_dir)
+  cpsat_df_csv(file.path(run_dir, "df.csv"))
+  cpsat_nb_json(file.path(run_dir, "nb.json"))
+  cpsat_out_json(file.path(run_dir, "out.json"))
+  cpsat_progress_json(file.path(run_dir, "progress.json"))
+  cpsat_log_file(file.path(run_dir, "solver.log"))
+  cpsat_log_saved(file.path(run_dir, "solver.log"))
+  cpsat_stop_file(file.path(run_dir, "stop.flag"))
+  cpsat_skip_file(file.path(run_dir, "skip.flag"))
+  cpsat_stop_requested(file.exists(cpsat_stop_file()))
+  cpsat_solver_proc(asu_job_handle(run_dir))
+  cpsat_running(TRUE)
+  cpsat_stage_text(asu_job_state(run_dir)$status)
+  append_cpsat_log(paste0("[session] Attached to persistent job: ", run_dir))
+    apply_asu_assignments <- function(asu_values, update_reset = FALSE, map_only = FALSE) {
+      asu_id_vals <- suppressWarnings(as.integer(asu_values))
+      if (length(asu_id_vals) != nrow(merged_df) || any(is.na(asu_id_vals))) {
+        return(FALSE)
+      }
+
+      if (isTRUE(map_only)) {
+        color_df <- data.frame(
+          GEOID = as.character(merged_df$GEOID),
+          asunum = ifelse(asu_id_vals < 0L, 0L, as.integer(asu_id_vals))
+        )
+        push_asu_tooltip_updates(color_df)
+        color_df <- asu_state_slice(color_df, display_state())
+        cm <- calculate_tract_colors(color_df)
+        fill_expr <- mapgl::match_expr(
+          column  = "GEOID",
+          values  = cm$values,
+          stops   = cm$stops,
+          default = "#E0E0E0"
+        )
+        for (map_id in c("initial_map", "edit_map")) {
+          try(
+            mapgl::maplibre_proxy(map_id) |>
+              mapgl::set_paint_property("basemap", "fill-color", fill_expr),
+            silent = TRUE
+          )
+        }
+        return(TRUE)
+      }
+
+      # The persistent input already contains clean original geometry/columns.
+      live_sf <- initial_sf |>
+        dplyr::mutate(asunum = pmax(0L, asu_id_vals))
+
+      full_data(live_sf)
+      if (isTRUE(update_reset)) {
+        full_data_reset(live_sf)
+      }
+      asu_summary(
+        live_sf |>
+          sf::st_drop_geometry() |>
+          dplyr::filter(asunum > 0) |>
+          dplyr::group_by(asunum) |>
+          dplyr::summarise(
+            Tracts              = dplyr::n(),
+            Population          = sum(tract_pop_cur,   na.rm = TRUE),
+            `Labor Force`       = sum(tract_ASU_clf,   na.rm = TRUE),
+            Unemployment        = sum(tract_ASU_unemp, na.rm = TRUE),
+            `Unemployment Rate` = round((Unemployment/`Labor Force`)*100, 5),
+            .groups = "drop"
+          )
+      )
+      output$asu <- shiny::renderTable(asu_summary(), digits = 3)
+      update_map_efficiently("initial_map")
+      update_map_efficiently("edit_map")
+      TRUE
+    }
+
+    # The Python builder starts with -1 for every tract. Seed the comparison
+    # with that same state so its INIT snapshot does not trigger a redundant
+    # all-grey repaint. Later phase-only snapshots are skipped the same way.
+    last_progress_asu <- shiny::reactiveVal(rep.int(-1L, nrow(merged_df)))
+    last_exploring_geoids <- shiny::reactiveVal(character(0))
+    last_exploring_candidate_geoids <- shiny::reactiveVal(character(0))
+    last_exploring_added_geoids <- shiny::reactiveVal(character(0))
+    last_exploring_removed_geoids <- shiny::reactiveVal(character(0))
+
+    # stream logs and finalize when done
+    if (!is.null(session$userData$cpsatObs)) {
+      try(session$userData$cpsatObs$destroy(), silent = TRUE)
+    }
+    tmr <- shiny::reactiveTimer(1000)
+    session$userData$cpsatObs <- shiny::observe({
+      tmr()
+      px <- cpsat_solver_proc()
+      shiny::req(!is.null(px))
+
+      out <- try(px$read_output_lines(), silent = TRUE)
+      err <- try(px$read_error_lines(),  silent = TRUE)
+      if (!inherits(out,"try-error") && length(out)) append_cpsat_log(paste(out, collapse="\n"), .persist = FALSE)
+      if (!inherits(err,"try-error") && length(err)) append_cpsat_log(paste(err, collapse="\n"), .persist = FALSE)
+
+      # Checkpoints are saved by independent R subprocesses, never by this viewer.
+
+      pf <- cpsat_progress_json()
+      if (!is.null(pf) && file.exists(pf)) {
+        progress_payload <- try(jsonlite::fromJSON(pf), silent = TRUE)
+        if (!inherits(progress_payload, "try-error") && !is.null(progress_payload$asu_id)) {
+          progress_asu <- suppressWarnings(as.integer(progress_payload$asu_id))
+          valid_progress <- length(progress_asu) == nrow(merged_df) &&
+            !any(is.na(progress_asu))
+
+          if (valid_progress && !identical(progress_asu, last_progress_asu())) {
+            # The JSON is cheap to read on every tick. The assignment comparison
+            # updates the map, committed data, and summary table only when tract
+            # membership or compact ASU numbering actually changed. Expansion
+            # results must be available for saving before polishing finishes.
+            if (isTRUE(apply_asu_assignments(
+              progress_asu,
+              update_reset = FALSE,
+              map_only = FALSE
+            ))) {
+              last_progress_asu(progress_asu)
+            }
+          }
+
+          overlay_specs <- list(
+            list(
+              payload = "exploring_idx",
+              layer = "exploring",
+              previous = last_exploring_geoids
+            ),
+            list(
+              payload = "exploring_candidate_idx",
+              layer = "exploring_candidate",
+              previous = last_exploring_candidate_geoids
+            ),
+            list(
+              payload = "exploring_added_idx",
+              layer = "exploring_added",
+              previous = last_exploring_added_geoids
+            ),
+            list(
+              payload = "exploring_removed_idx",
+              layer = "exploring_removed",
+              previous = last_exploring_removed_geoids
+            )
+          )
+          for (overlay_spec in overlay_specs) {
+            overlay_idx <- suppressWarnings(as.integer(
+              progress_payload[[overlay_spec$payload]] %||% integer(0)
+            ))
+            # Suppress retained/candidate outlines, including older snapshots.
+            if (overlay_spec$layer %in% c("exploring", "exploring_candidate")) {
+              overlay_idx <- integer(0)
+            }
+            overlay_idx <- unique(overlay_idx[
+              !is.na(overlay_idx) & overlay_idx >= 0L &
+                overlay_idx < nrow(merged_df)
+            ])
+            overlay_geoids <- sort(as.character(
+              merged_df$GEOID[overlay_idx + 1L]
+            ))
+            if (!identical(overlay_geoids, overlay_spec$previous())) {
+              for (map_id in c("initial_map", "edit_map")) {
+                try(
+                  apply_overlay_filter(
+                    mapgl::maplibre_proxy(map_id),
+                    overlay_spec$layer,
+                    overlay_geoids
+                  ),
+                  silent = TRUE
+                )
+              }
+              overlay_spec$previous(overlay_geoids)
+            }
+          }
+        }
+      }
+
+      if (!px$is_alive()) {
+        for (layer_id in c(
+          "exploring", "exploring_candidate",
+          "exploring_added", "exploring_removed"
+        )) {
+          for (map_id in c("initial_map", "edit_map")) {
+            try(
+              apply_overlay_filter(
+                mapgl::maplibre_proxy(map_id),
+                layer_id,
+                character(0)
+              ),
+              silent = TRUE
+            )
+          }
+        }
+        last_exploring_geoids(character(0))
+        last_exploring_candidate_geoids(character(0))
+        last_exploring_added_geoids(character(0))
+        last_exploring_removed_geoids(character(0))
+
+        # drain remaining
+        out_all <- try(px$read_all_output_lines(), silent = TRUE)
+        err_all <- try(px$read_all_error_lines(),  silent = TRUE)
+        if (!inherits(out_all,"try-error") && length(out_all)) append_cpsat_log(paste(out_all, collapse="\n"), .persist = FALSE)
+        if (!inherits(err_all,"try-error") && length(err_all)) append_cpsat_log(paste(err_all, collapse="\n"), .persist = FALSE)
+
+        status <- px$get_exit_status()
+        append_cpsat_log(paste0("[run] Exit status: ", status))
+        cpsat_stage_text(asu_job_state(run_dir)$status)
+        session$userData$cpsatObs$destroy()
+
+        if (identical(status, 0L) && file.exists(cpsat_out_json())) {
+          resj <- jsonlite::fromJSON(cpsat_out_json())
+          if (!is.null(resj$asu_id) && length(resj$asu_id) == nrow(merged_df)) {
+            if (isTRUE(apply_asu_assignments(resj$asu_id, update_reset = TRUE))) {
+              append_cpsat_log("[run] Solver finished OK; map/table updated.")
+            } else {
+              append_cpsat_log("[run][warn] Output JSON had invalid assignment shape.")
+            }
+          } else {
+            append_cpsat_log("[run][warn] Output JSON invalid or length mismatch.")
+          }
+        } else {
+          append_cpsat_log("[run][error] Solver failed or out.json missing.")
+        }
+
+        lf <- cpsat_log_file()
+        if (!is.null(lf) && file.exists(lf)) cpsat_log_saved(lf)
+        cpsat_log_file(NULL)
+        sf <- cpsat_stop_file()
+        # Keep stop.flag as part of the durable job history.
+        cpsat_stop_file(NULL)
+        cpsat_stop_requested(FALSE)
+        kf <- cpsat_skip_file()
+        # Keep any remaining skip flag for diagnostics.
+        cpsat_skip_file(NULL)
+        cpsat_progress_json(NULL)
+        cpsat_running(FALSE)
+      }
+    })
+}
+
+shiny::observeEvent(input$refresh_jobs, {
+  choices <- asu_job_list()
+  shiny::updateSelectInput(session, "saved_job", choices = c("Choose a job" = "", choices))
+}, ignoreNULL = FALSE)
+shiny::observeEvent(input$attach_job, {
+  folder <- input$saved_job
+  shiny::req(length(folder) == 1L, nzchar(folder))
+  # Never accept arbitrary filesystem paths supplied by a browser client.
+  shiny::req(folder %in% unname(asu_job_list()))
+  tryCatch(attach_cpsat_job(folder), error = function(e)
+    shiny::showNotification(conditionMessage(e), type = "error", duration = NULL))
+})
+
 shiny::observeEvent(input$process, {
   ## 0) Basic checks ------------------------------------------------------
   shiny::req(uploaded_data(), state(), tigris_year())
@@ -1101,6 +1375,13 @@ shiny::observeEvent(input$process, {
 
   # --- CP-SAT branch (has its own withProgress) --------------------------
 if (identical(algo_choice, "cpsat")) {
+  jobs <- asu_job_list()
+  if (any(vapply(unname(jobs), function(folder) isTRUE(asu_job_state(folder)$alive), logical(1)))) {
+    shiny::showModal(shiny::modalDialog(title = "A solver job is already running",
+      "Use Refresh jobs and Attach to job to monitor or stop it. Disconnecting does not stop a job.",
+      easyClose = TRUE))
+    return()
+  }
   if (!isTRUE(getOption("asu_python_ready", FALSE))) {
     shiny::showModal(shiny::modalDialog(
       title = "Python Environment Not Ready",
@@ -1255,11 +1536,10 @@ if (identical(algo_choice, "cpsat")) {
       if (length(iv) == 0) list() else as.list(as.integer(iv) - 1L)
     })
 
-    # ---- 3) Temp run folder + files ------------------------------------
+    # ---- 3) Persistent job folder + files ------------------------------------
     shiny::incProgress(0.10, detail = "Writing inputs")
     legacy_checkpoint <- !use_partitioning && !use_split
-    run_dir <- if (legacy_checkpoint) asu_checkpoint_run_dir() else
-      file.path(tempdir(), paste0("cpsat_", format(Sys.time(), "%Y%m%d_%H%M%S")))
+    run_dir <- asu_job_run_dir()
     dir.create(run_dir, recursive = TRUE, showWarnings = FALSE)
 
     df_csv   <- file.path(run_dir, "df.csv")
@@ -1308,7 +1588,8 @@ os.environ.setdefault('MKL_NUM_THREADS','1')
 os.environ.setdefault('OPENBLAS_NUM_THREADS','1')
 print('[runner] starting'); print('Python:', sys.version.replace('\\n',' '))
 
-sys.path.insert(0, r'%s')
+snapshot = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'python')
+sys.path.insert(0, snapshot if os.path.isdir(snapshot) else r'%s')
 print('[runner] module path added')
 
 from asu_cpsat import build_many_asus_cpsat
@@ -1383,8 +1664,10 @@ asu_id = res['asu_id'] if isinstance(res, dict) else getattr(res,'asu_id')
 asu_id = [int(x) for x in asu_id]
 if checkpoint_folder:
     save_checkpoint('LEGACY_DONE', asu_id)
-with open(r'%s','w') as g:
+output_path = r'%s'
+with open(output_path + '.tmp','w') as g:
     json.dump({'asu_id': asu_id}, g)
+os.replace(output_path + '.tmp', output_path)
 print('[runner] OK', flush=True)
 ",
       py_mod_path, df_csv, nb_json,
@@ -1425,248 +1708,14 @@ print('[runner] OK', flush=True)
     }
     append_cpsat_log(paste0("[run] Using Python: ", pybin))
 
-    # ---- 6) Launch and STREAM output ----------------------------------
-    shiny::incProgress(0.35, detail = "Solving (streaming logs)…")
-    env_map <- c(
-      PYTHONUNBUFFERED = "1",
-      OMP_NUM_THREADS  = "1",
-      MKL_NUM_THREADS  = "1",
-      OPENBLAS_NUM_THREADS = "1"
-    )
-    px <- processx::process$new(
-      command = pybin,
-      args    = c(runner),
-      stdout  = "|",
-      stderr  = "|",
-      windows_hide_window = TRUE,
-      env     = env_map
-    )
-    cpsat_solver_proc(px)
-    append_cpsat_log(sprintf("[run] Python started (pid=%s). Streaming…", px$get_pid()))
+    # ---- 6) Launch independent job and attach this viewer ----------------
+    asu_job_prepare(run_dir, initial_sf, pybin, py_mod_path, cpsat_strategy,
+      settings = list(tau = tau, pop_threshold = pop_thr, workers = workers,
+                      time_limit = tlimit, tract_year = sel_year))
+    px <- asu_job_launch(run_dir)
+    append_cpsat_log(sprintf("[run] Detached job supervisor started (pid=%s).", px$get_pid()))
+    attach_cpsat_job(run_dir)
 
-    apply_asu_assignments <- function(asu_values, update_reset = FALSE, map_only = FALSE) {
-      asu_id_vals <- suppressWarnings(as.integer(asu_values))
-      if (length(asu_id_vals) != nrow(merged_df) || any(is.na(asu_id_vals))) {
-        return(FALSE)
-      }
-
-      if (isTRUE(map_only)) {
-        color_df <- data.frame(
-          GEOID = as.character(merged_df$GEOID),
-          asunum = ifelse(asu_id_vals < 0L, 0L, as.integer(asu_id_vals))
-        )
-        push_asu_tooltip_updates(color_df)
-        color_df <- asu_state_slice(color_df, display_state())
-        cm <- calculate_tract_colors(color_df)
-        fill_expr <- mapgl::match_expr(
-          column  = "GEOID",
-          values  = cm$values,
-          stops   = cm$stops,
-          default = "#E0E0E0"
-        )
-        for (map_id in c("initial_map", "edit_map")) {
-          try(
-            mapgl::maplibre_proxy(map_id) |>
-              mapgl::set_paint_property("basemap", "fill-color", fill_expr),
-            silent = TRUE
-          )
-        }
-        return(TRUE)
-      }
-
-      live_sf <- merged_sf |>
-        dplyr::mutate(asunum = ifelse(asu_id_vals < 0L, 0L, as.integer(asu_id_vals))) |>
-        dplyr::select(-dplyr::any_of("continuous")) |>
-        clean_sf_columns()
-
-      full_data(live_sf)
-      if (isTRUE(update_reset)) {
-        full_data_reset(live_sf)
-      }
-      asu_summary(
-        live_sf |>
-          sf::st_drop_geometry() |>
-          dplyr::filter(asunum > 0) |>
-          dplyr::group_by(asunum) |>
-          dplyr::summarise(
-            Tracts              = dplyr::n(),
-            Population          = sum(tract_pop_cur,   na.rm = TRUE),
-            `Labor Force`       = sum(tract_ASU_clf,   na.rm = TRUE),
-            Unemployment        = sum(tract_ASU_unemp, na.rm = TRUE),
-            `Unemployment Rate` = round((Unemployment/`Labor Force`)*100, 5),
-            .groups = "drop"
-          )
-      )
-      output$asu <- shiny::renderTable(asu_summary(), digits = 3)
-      update_map_efficiently("initial_map")
-      update_map_efficiently("edit_map")
-      TRUE
-    }
-
-    # The Python builder starts with -1 for every tract. Seed the comparison
-    # with that same state so its INIT snapshot does not trigger a redundant
-    # all-grey repaint. Later phase-only snapshots are skipped the same way.
-    last_progress_asu <- shiny::reactiveVal(rep.int(-1L, nrow(merged_df)))
-    last_exploring_geoids <- shiny::reactiveVal(character(0))
-    last_exploring_candidate_geoids <- shiny::reactiveVal(character(0))
-    last_exploring_added_geoids <- shiny::reactiveVal(character(0))
-    last_exploring_removed_geoids <- shiny::reactiveVal(character(0))
-
-    # stream logs and finalize when done
-    if (!is.null(session$userData$cpsatObs)) {
-      try(session$userData$cpsatObs$destroy(), silent = TRUE)
-    }
-    tmr <- shiny::reactiveTimer(300)
-    session$userData$cpsatObs <- shiny::observe({
-      tmr()
-      px <- cpsat_solver_proc()
-      shiny::req(!is.null(px))
-
-      out <- try(px$read_output_lines(), silent = TRUE)
-      err <- try(px$read_error_lines(),  silent = TRUE)
-      if (!inherits(out,"try-error") && length(out)) append_cpsat_log(paste(out, collapse="\n"))
-      if (!inherits(err,"try-error") && length(err)) append_cpsat_log(paste(err, collapse="\n"))
-
-      # Save before map/table work; the solver waits for this durable acknowledgment.
-      if (legacy_checkpoint) asu_service_checkpoints(run_dir, initial_sf, append_cpsat_log)
-
-      pf <- cpsat_progress_json()
-      if (!is.null(pf) && file.exists(pf)) {
-        progress_payload <- try(jsonlite::fromJSON(pf), silent = TRUE)
-        if (!inherits(progress_payload, "try-error") && !is.null(progress_payload$asu_id)) {
-          progress_asu <- suppressWarnings(as.integer(progress_payload$asu_id))
-          valid_progress <- length(progress_asu) == nrow(merged_df) &&
-            !any(is.na(progress_asu))
-
-          if (valid_progress && !identical(progress_asu, last_progress_asu())) {
-            # The JSON is cheap to read on every tick. The assignment comparison
-            # updates the map, committed data, and summary table only when tract
-            # membership or compact ASU numbering actually changed. Expansion
-            # results must be available for saving before polishing finishes.
-            if (isTRUE(apply_asu_assignments(
-              progress_asu,
-              update_reset = FALSE,
-              map_only = FALSE
-            ))) {
-              last_progress_asu(progress_asu)
-            }
-          }
-
-          overlay_specs <- list(
-            list(
-              payload = "exploring_idx",
-              layer = "exploring",
-              previous = last_exploring_geoids
-            ),
-            list(
-              payload = "exploring_candidate_idx",
-              layer = "exploring_candidate",
-              previous = last_exploring_candidate_geoids
-            ),
-            list(
-              payload = "exploring_added_idx",
-              layer = "exploring_added",
-              previous = last_exploring_added_geoids
-            ),
-            list(
-              payload = "exploring_removed_idx",
-              layer = "exploring_removed",
-              previous = last_exploring_removed_geoids
-            )
-          )
-          for (overlay_spec in overlay_specs) {
-            overlay_idx <- suppressWarnings(as.integer(
-              progress_payload[[overlay_spec$payload]] %||% integer(0)
-            ))
-            # Suppress retained/candidate outlines, including older snapshots.
-            if (overlay_spec$layer %in% c("exploring", "exploring_candidate")) {
-              overlay_idx <- integer(0)
-            }
-            overlay_idx <- unique(overlay_idx[
-              !is.na(overlay_idx) & overlay_idx >= 0L &
-                overlay_idx < nrow(merged_df)
-            ])
-            overlay_geoids <- sort(as.character(
-              merged_df$GEOID[overlay_idx + 1L]
-            ))
-            if (!identical(overlay_geoids, overlay_spec$previous())) {
-              for (map_id in c("initial_map", "edit_map")) {
-                try(
-                  apply_overlay_filter(
-                    mapgl::maplibre_proxy(map_id),
-                    overlay_spec$layer,
-                    overlay_geoids
-                  ),
-                  silent = TRUE
-                )
-              }
-              overlay_spec$previous(overlay_geoids)
-            }
-          }
-        }
-      }
-
-      if (!px$is_alive()) {
-        for (layer_id in c(
-          "exploring", "exploring_candidate",
-          "exploring_added", "exploring_removed"
-        )) {
-          for (map_id in c("initial_map", "edit_map")) {
-            try(
-              apply_overlay_filter(
-                mapgl::maplibre_proxy(map_id),
-                layer_id,
-                character(0)
-              ),
-              silent = TRUE
-            )
-          }
-        }
-        last_exploring_geoids(character(0))
-        last_exploring_candidate_geoids(character(0))
-        last_exploring_added_geoids(character(0))
-        last_exploring_removed_geoids(character(0))
-
-        # drain remaining
-        out_all <- try(px$read_all_output_lines(), silent = TRUE)
-        err_all <- try(px$read_all_error_lines(),  silent = TRUE)
-        if (!inherits(out_all,"try-error") && length(out_all)) append_cpsat_log(paste(out_all, collapse="\n"))
-        if (!inherits(err_all,"try-error") && length(err_all)) append_cpsat_log(paste(err_all, collapse="\n"))
-
-        status <- px$get_exit_status()
-        append_cpsat_log(paste0("[run] Exit status: ", status))
-        cpsat_stage_text(if (identical(status, 0L)) "completed" else "failed")
-        session$userData$cpsatObs$destroy()
-
-        if (identical(status, 0L) && file.exists(cpsat_out_json())) {
-          resj <- jsonlite::fromJSON(cpsat_out_json())
-          if (!is.null(resj$asu_id) && length(resj$asu_id) == nrow(merged_df)) {
-            if (isTRUE(apply_asu_assignments(resj$asu_id, update_reset = TRUE))) {
-              append_cpsat_log("[run] Solver finished OK; map/table updated.")
-            } else {
-              append_cpsat_log("[run][warn] Output JSON had invalid assignment shape.")
-            }
-          } else {
-            append_cpsat_log("[run][warn] Output JSON invalid or length mismatch.")
-          }
-        } else {
-          append_cpsat_log("[run][error] Solver failed or out.json missing.")
-        }
-
-        lf <- cpsat_log_file()
-        if (!is.null(lf) && file.exists(lf)) cpsat_log_saved(lf)
-        cpsat_log_file(NULL)
-        sf <- cpsat_stop_file()
-        if (!is.null(sf)) unlink(sf)
-        cpsat_stop_file(NULL)
-        cpsat_stop_requested(FALSE)
-        kf <- cpsat_skip_file()
-        if (!is.null(kf)) unlink(kf)
-        cpsat_skip_file(NULL)
-        cpsat_progress_json(NULL)
-        cpsat_running(FALSE)
-      }
-    })
   })
 
   # stop the parent observer here so non-CP-SAT code below doesn’t run
@@ -1868,8 +1917,13 @@ shiny::observeEvent(input$skip_asu, {
 
 # Add this observer to handle closing the log manually
 shiny::observeEvent(input$close_log, {
-  cpsat_running(FALSE)
-  cpsat_stage_text("idle")
+  px <- cpsat_solver_proc()
+  if (!is.null(px) && px$is_alive()) {
+    shiny::showNotification("This job is still running. Use Stop to end it; closing the browser only detaches.")
+  } else {
+    cpsat_running(FALSE)
+    cpsat_stage_text("idle")
+  }
 })
 
 output$cpsat_log_link <- shiny::renderUI({

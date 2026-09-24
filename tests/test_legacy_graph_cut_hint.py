@@ -74,7 +74,9 @@ class LegacyGraphCutHintTest(unittest.TestCase):
         self.assertIn("upper_bound_stall=3/3", log)
         self.assertIn("stop_reason=UPPER_BOUND_STALL", log)
         self.assertNotIn("[repair]", log)
-        self.assertTrue(all(0 < item.parameters.max_time_in_seconds <= 10 for item in created))
+        self.assertTrue(all(0 < item.parameters.max_time_in_seconds <= 5 for item in created))
+        self.assertTrue(all(not item.parameters.log_search_progress for item in created))
+        self.assertTrue(all(not item.parameters.log_to_stdout for item in created))
 
     def run_cut_loop(self, bounds, stall_rounds):
         created = []

@@ -325,7 +325,8 @@ class TouchingJointTest(unittest.TestCase):
             return real_solve(instance, model, *args, **kwargs)
 
         def capture_pass(*args, **kwargs):
-            self.assertTrue(kwargs['stop_on_new_cuts'])
+            self.assertFalse(kwargs['stop_on_new_cuts'])
+            self.assertEqual(kwargs['round_seconds'], 5.0)
             result = real_pass(*args, **kwargs)
             cut_models.append(args[0].Clone())
             return result

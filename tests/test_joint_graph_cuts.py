@@ -227,7 +227,8 @@ class JointGraphCutsTest(unittest.TestCase):
                         [[0]], lambda groups: True, time.monotonic()+2, 2,
                         lambda: None, objective=objective)
                 self.assertEqual(best, 30)
-                self.assertEqual(len(model.Proto().constraints), 1 if expected is None else 2)
+                # Incumbent tracking adds a valid objective floor as well.
+                self.assertEqual(len(model.Proto().constraints), 2 if expected is None else 3)
                 if expected is not None:
                     constraints = model.Proto().constraints
                     self.assertEqual(list(constraints[len(constraints)-1].linear.domain)[-1], expected)
@@ -272,7 +273,7 @@ class JointGraphCutsTest(unittest.TestCase):
                 self.bound = bounds[len(created)]
                 created.append(self)
 
-            def Solve(self, unused_model):
+            def Solve(self, unused_model, unused_callback=None):
                 return solver.cp_model.FEASIBLE
 
             def StatusName(self, unused_status):

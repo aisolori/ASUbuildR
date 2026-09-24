@@ -104,7 +104,8 @@ class SupernodePolishTest(unittest.TestCase):
         configured_limit = []
 
         def cuts(*args, **kwargs):
-            self.assertTrue(kwargs['stop_on_new_cuts'])
+            self.assertFalse(kwargs['stop_on_new_cuts'])
+            self.assertEqual(kwargs['round_seconds'], 5.0)
             self.assertEqual(kwargs['upper_bound_stall_rounds'], 25)
             configured_limit.append(kwargs['max_rounds'])
             return real_cuts(*args, **kwargs)
@@ -443,9 +444,10 @@ class SupernodePolishTest(unittest.TestCase):
         self.assertEqual(result['n_asu'], 1)
         self.assertEqual(len(set(result['asu_id'])), 1)
         self.assertIn('statewide_gain=25 absorbed_asus=1', output.getvalue())
-        # ASU 2 has higher aggregate surplus and goes first. ASU 1 is a donor.
-        self.assertIn('checking_asu=2 position=1/2', output.getvalue())
-        self.assertIn('model_nodes=5 donors=1', output.getvalue())
+        # ASU 1 has lower total unemployment and goes first. ASU 2 is a donor.
+        self.assertIn('checking_asu=1 position=1/2', output.getvalue())
+        # The two-tract ASU 2 is contracted to one donor supernode.
+        self.assertIn('model_nodes=4 donors=1', output.getvalue())
         stage_lines = [line for line in output.getvalue().splitlines() if '[STAGE]' in line]
         self.assertTrue(stage_lines)
         for line in stage_lines:
@@ -454,7 +456,7 @@ class SupernodePolishTest(unittest.TestCase):
         self.assertIn('total_unemp=30', stage_lines[0])
         completed = next(line for line in stage_lines if '[STAGE] FINAL_POLISH_COMPLETE ' in line)
         self.assertIn('total_unemp=55', completed)
-        self.assertIn('priority=q_surplus_descending', output.getvalue())
+        self.assertIn('priority=unemployment_ascending', output.getvalue())
 
     def test_surviving_asu_stage_id_matches_dashboard_after_donor_absorption(self):
         frame = pd.DataFrame({'tract_ASU_unemp': [30, 20, 10],
@@ -484,16 +486,20 @@ class SupernodePolishTest(unittest.TestCase):
     def test_merge_disabled_keeps_other_asus_protected(self):
         frame = pd.DataFrame({'tract_ASU_unemp': [10, 20, 5],
                               'tract_ASU_emp': [0, 0, 0], 'tract_pop2024': [10000]*3})
-        with patch.object(solver, '_solve_supernode_polish',
-                          side_effect=AssertionError('supernodes ran with merging disabled')):
+        output = io.StringIO()
+        with (contextlib.redirect_stdout(output),
+              patch.object(solver, '_solve_supernode_polish',
+                           side_effect=AssertionError('supernodes ran with merging disabled'))):
             result = solver.build_many_asus_cpsat(
                 frame, [[1], [0, 2], [1]], .2, 10000, max_asus=2,
                 initial_asu_id=[1, 2, -1], harvest_connectivity_free_asus=True,
                 standalone_expansion_time_limit=0, final_asu_polish_time_limit=2,
                 final_consolidation=False, merge_adjacent=False,
-                time_limit=0, workers=2, verbose=False, deterministic_ties=False)
+                time_limit=0, workers=2, verbose=True, deterministic_ties=False)
         self.assertEqual(result['n_asu'], 2)
         self.assertNotEqual(result['asu_id'][0], result['asu_id'][1])
+        self.assertIn('checking_asu=1 position=1/2', output.getvalue())
+        self.assertIn('priority=unemployment_ascending', output.getvalue())
 
 
 if __name__ == '__main__':

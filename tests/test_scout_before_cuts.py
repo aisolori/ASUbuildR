@@ -24,6 +24,10 @@ class ScoutBeforeCutsTest(unittest.TestCase):
         def capture(instance, model, *args, **kwargs):
             self.assertEqual(model.Validate(), '')
             snapshots.append((model.Clone(), instance.parameters.max_time_in_seconds))
+            if args and type(args[0]).__name__ == 'SingleCutDiscovery':
+                self.assertLessEqual(instance.parameters.max_time_in_seconds, 5.0)
+                self.assertFalse(instance.parameters.log_search_progress)
+                self.assertFalse(instance.parameters.log_to_stdout)
             instance.parameters.log_to_stdout = False
             if skip_first_scout and len(snapshots) == 1:
                 return solver.cp_model.UNKNOWN
@@ -112,7 +116,7 @@ class ScoutBeforeCutsTest(unittest.TestCase):
         self.assertNotIn('scout:', log)
         self.assertIn('primary optimum proved', log)
 
-    def test_cut_callback_stops_on_new_cuts_and_preserves_connected_incumbents(self):
+    def test_cut_callback_continues_on_new_cuts_and_preserves_connected_incumbents(self):
         real_solve = solver.cp_model.CpSolver.Solve
         for final_selected in ({0, 2, 3}, {0, 1, 2}):
             cuts, requests = [], []
@@ -122,16 +126,16 @@ class ScoutBeforeCutsTest(unittest.TestCase):
                     return real_solve(instance, model, *args, **kwargs)
                 cuts.append(model.Clone())
                 callback = args[0]
-                self.assertTrue(math.isinf(instance.parameters.max_time_in_seconds))
+                self.assertEqual(instance.parameters.max_time_in_seconds, 5.0)
                 before = len(model.Proto().constraints)
                 callback.StopSearch = lambda: requests.append(True)
-                # Preserve connected improvements even when parallel shutdown
+                # Preserve connected improvements even when continued search
                 # leaves a different final incumbent than the violating one.
                 for selected in ({0, 1, 2}, {0, 2, 3}):
                     callback.BooleanValue = lambda var: int(var.name.split('_')[1]) in selected
                     callback.on_solution_callback()
                     self.assertEqual(len(model.Proto().constraints), before)
-                    self.assertEqual(len(requests), int(selected == {0, 2, 3}))
+                    self.assertEqual(len(requests), 0)
                 instance.BooleanValue = lambda var: int(var.name.split('_')[1]) in final_selected
                 instance.ObjectiveValue = lambda: 16 if final_selected == {0, 1, 2} else 17
                 instance.BestObjectiveBound = lambda: 18
@@ -141,8 +145,8 @@ class ScoutBeforeCutsTest(unittest.TestCase):
                     patch.object(solver.cp_model.CpSolver, 'Solve', new=discovered):
                 result, models, log = self.run_window(scout_before_cuts=False, deterministic_ties=True)
             self.assertEqual((result.obj, result.status), (16, 'OPTIMAL'))
-            self.assertEqual(requests, [True])
-            self.assertIn('round_end=NEW_CONNECTIVITY_CUTS', log)
+            self.assertEqual(requests, [])
+            self.assertIn('round_end=SOLVER_RETURNED', log)
             self.assertTrue(any(self.has_flow(model) for model, _ in models))
             self.assertGreater(len(models[1][0].Proto().constraints), len(cuts[0].Proto().constraints))
 
@@ -218,7 +222,7 @@ class ScoutBeforeCutsTest(unittest.TestCase):
                 self.assertIn('stop_reason=VALID_UNEMP_STALL', log)
                 self.assertIn('upper_bound_stall=0/25', log)
 
-    def test_cut_time_is_unlimited_and_does_not_consume_exact_solve_budget(self):
+    def test_five_second_cut_rounds_do_not_consume_exact_solve_budget(self):
         real_solve = solver.cp_model.CpSolver.Solve
         real_clock = solver.time.monotonic
         elapsed = [0.0]
@@ -227,7 +231,7 @@ class ScoutBeforeCutsTest(unittest.TestCase):
         def long_round(instance, model, *args, **kwargs):
             if not self.has_flow(model):
                 cut_limits.append(instance.parameters.max_time_in_seconds)
-                elapsed[0] += 120.0  # Every round exceeds the old entire budget.
+                elapsed[0] += 5.0  # Repeated rounds exceed the separate exact budget.
                 instance.BooleanValue = lambda var: var.name in ('x_0', 'x_2', 'x_3')
                 instance.BestObjectiveBound = lambda: 18
                 return solver.cp_model.FEASIBLE
@@ -238,12 +242,12 @@ class ScoutBeforeCutsTest(unittest.TestCase):
               patch.object(solver.cp_model.CpSolver, 'Solve', new=long_round)):
             result, _, log = self.run_window(scout_before_cuts=False)
         self.assertEqual(len(cut_limits), 26)
-        self.assertTrue(all(math.isinf(limit) for limit in cut_limits))
+        self.assertTrue(all(limit == 5.0 for limit in cut_limits))
         self.assertTrue(exact_limits)
         self.assertTrue(all(0 < limit <= 10 for limit in exact_limits))
         self.assertGreater(exact_limits[0], 8)
         self.assertEqual((result.obj, result.status), (16, 'OPTIMAL'))
-        self.assertIn('time_limit=none', log)
+        self.assertIn('round_time_limit=5.000s stop_on_new_cuts=False', log)
         self.assertIn('stop_reason=UPPER_BOUND_STALL', log)
 
     def test_cut_upper_bound_improvement_resets_stall(self):
@@ -267,7 +271,7 @@ class ScoutBeforeCutsTest(unittest.TestCase):
         self.assertIn('upper_bound=1650 upper_bound_stall=0/25', log)
         self.assertIn('stop_reason=UPPER_BOUND_STALL', log)
 
-    def test_untimed_cut_round_honors_stop_and_skip_watchdog(self):
+    def test_timed_cut_round_honors_stop_and_skip_watchdog(self):
         for kind in ('stop', 'skip'):
             with self.subTest(kind=kind), TemporaryDirectory() as folder:
                 flag = Path(folder) / kind
@@ -275,7 +279,7 @@ class ScoutBeforeCutsTest(unittest.TestCase):
 
                 def interrupt(instance, model, *args, **kwargs):
                     self.assertFalse(self.has_flow(model))
-                    self.assertTrue(math.isinf(instance.parameters.max_time_in_seconds))
+                    self.assertEqual(instance.parameters.max_time_in_seconds, 5.0)
                     flag.touch()
                     self.assertTrue(stopped.wait(2), 'cut watchdog did not interrupt')
                     return solver.cp_model.UNKNOWN

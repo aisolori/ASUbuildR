@@ -71,6 +71,18 @@ except Exception:
 
 
 # ---------- Helpers ----------
+_CUT_ROUND_SECONDS = 5.0
+
+
+def _configure_cut_round_params(params, seconds=None):
+    """Cap each cut solve, including presolve, and suppress CP-SAT detail logs."""
+    params.max_time_in_seconds = min(
+        _CUT_ROUND_SECONDS, math.inf if seconds is None else float(seconds))
+    params.log_search_progress = False
+    params.log_to_stdout = False
+    params.log_to_response = False
+
+
 def _new_asu_solver():
     """Use bounded symmetry detection even for large ASU models."""
     solver = cp_model.CpSolver()
@@ -237,14 +249,13 @@ def _capacity_root_order(candidates, u, E, P, tau):
     )
 
 
-def _polish_asu_order(asu_id, u, E, tau):
-    """Highest aggregate q_surplus first; ASU ID breaks equal-surplus ties."""
+def _polish_asu_order(asu_id, u):
+    """Lowest total unemployment first; ASU ID breaks equal-count ties."""
     ids = np.unique(asu_id[asu_id > 0]).astype(int).tolist()
-    num, den = as_fraction_tau(tau)
     def priority(asu_number):
         nodes = np.flatnonzero(asu_id == asu_number)
-        surplus = sum(den * int(u[node]) - num * int(E[node]) for node in nodes)
-        return (-surplus, asu_number)
+        unemployed = sum(int(u[node]) for node in nodes)
+        return (unemployed, asu_number)
     return sorted(ids, key=priority)
 
 
@@ -1455,7 +1466,7 @@ _ASU_FULL_SUBSOLVER_PATTERN = (
     "variables_shaving_no_lp",
     "max_lp",
     "lb_tree_search",
-    "asu_probe_deep",
+    "asu_probe_mega_deep",
 
     "reduced_costs",
     "pseudo_costs",
@@ -1466,8 +1477,9 @@ _ASU_FULL_SUBSOLVER_PATTERN = (
 
     "variables_shaving_max_lp",
     "objective_shaving_no_lp",
-    "asu_probe_mega_deep",
-    "objective_lb_search_no_lp"
+    "objective_lb_search_no_lp",
+    "portfolio_no_lp",
+    "quick_restart_max_lp"
 )
 
 # Every entry here remains applicable when a model has no objective. Keeping a
@@ -1721,7 +1733,7 @@ def _configure_asu_solver_portfolio(
             params,
             "asu_flow_capacity_hybrid",
             search_branching=cp_model.PARTIAL_FIXED_SEARCH,
-            linearization_level=2,
+            linearization_level=1,
             root_lp_iterations=25_000,
             add_lp_constraints_lazily=False,
             max_cut_rounds_at_level_zero=10,
@@ -1744,7 +1756,7 @@ def _configure_asu_solver_portfolio(
     _append_asu_subsolver_params(
         params,
         "lb_tree_search",
-        save_lp_basis_in_lb_tree_search=True,
+        save_lp_basis_in_lb_tree_search=False,
         max_cut_rounds_at_level_zero=4,
         add_objective_cut=True,
         root_lp_iterations=100_000,
@@ -2961,11 +2973,11 @@ def solve_one_asu_cpsat(
     seconds (10% of the original budget) before generating cuts on a separate
     relaxation. False disables that early scout for controlled comparisons.
 
-    The cut pass has no wall-clock or per-round time limit. It stops after
+    Each cut solve has a five-second limit, including presolve. The pass stops after
     100 rounds or 25 consecutive rounds without a lower proven upper bound,
     or on proof, cancellation, or solver failure. Cut-pass elapsed time is
     excluded from `time_limit`, which still bounds the other solve phases.
-    Each round stops early when an incumbent exposes a new connectivity cut.
+    Finding a new connectivity cut does not stop a round early.
     The callback preserves valid connected incumbents and only collects a
     violating selection; separator rows are added after the solve returns.
 
@@ -3904,7 +3916,7 @@ def solve_one_asu_cpsat(
         _scout.parameters.max_time_in_seconds = _SCOUT_SECS
         _scout.parameters.log_search_progress = False
         _scout.parameters.cp_model_presolve = True
-        _scout.parameters.linearization_level = 2
+        _scout.parameters.linearization_level = 1
         _scout.parameters.cp_model_probing_level = 2
         _scout.parameters.cut_level = 1
         if configure_subsolvers:
@@ -4124,10 +4136,8 @@ def solve_one_asu_cpsat(
                            for target in _pick_component_targets(component)):
                         self.selection, self.components = selected, detached
                         break
-            if self.selection is not None:
-                # Only request shutdown here. Dynamic separator generation and
-                # all model/pool mutations happen after Solve returns.
-                self.StopSearch()
+            # Retain the first useful separator candidate but keep searching
+            # until optimality or the round deadline. Mutate only after Solve.
 
     # Populated once a round goes DISCONNECTED; nudges each following round
     # toward absorbing the smallest still-disconnected component first,
@@ -4139,7 +4149,8 @@ def solve_one_asu_cpsat(
     if log and not primary_proved:
         _stage_print("[STAGE] SINGLE_ASU_CUT_PASS max_rounds=100 "
                      f"upper_bound_stall_limit={cut_bound_stall.limit} "
-                     f"valid_unemp_stall_limit={cut_valid_stall.limit} time_limit=none stop_on_new_cuts=True", flush=True)
+                     f"valid_unemp_stall_limit={cut_valid_stall.limit} "
+                     f"round_time_limit={_CUT_ROUND_SECONDS:.3f}s stop_on_new_cuts=False", flush=True)
     while not primary_proved and cut_round < 100:
         if pending_expand:
             expand_component = pending_expand.pop(0)
@@ -4160,7 +4171,7 @@ def solve_one_asu_cpsat(
         solver.parameters.num_search_workers = max(1, int(workers))
         solver.parameters.log_search_progress = False  # silent; summary logged after loop
         solver.parameters.cp_model_presolve = True
-        solver.parameters.linearization_level = 2
+        solver.parameters.linearization_level = 1
         if configure_subsolvers:
             _configure_asu_solver_portfolio(
                 solver.parameters,
@@ -4172,8 +4183,9 @@ def solve_one_asu_cpsat(
             )
 
         discovery = SingleCutDiscovery()
+        _configure_cut_round_params(solver.parameters)
         status = _solve_primary_phase(solver, model, timed=False, callback=discovery)
-        round_end = ("NEW_CONNECTIVITY_CUTS" if discovery.selection is not None else "SOLVER_RETURNED")
+        round_end = "SOLVER_RETURNED"
         callback_improved = discovery.best is not None and discovery.best_obj > best_obj
         if callback_improved:
             best_connected, best_obj = discovery.best, discovery.best_obj
@@ -4264,7 +4276,7 @@ def solve_one_asu_cpsat(
         else:
             cut_valid_stall.observe(best_obj)
 
-        # Another worker may have changed the final incumbent during shutdown.
+        # Continued search may have changed the final incumbent since discovery.
         # Separate the saved violating candidate, not an unrelated final one.
         if discovery.selection is not None:
             selected = discovery.selection
@@ -4457,7 +4469,7 @@ def solve_one_asu_cpsat(
             proof_solver.parameters.max_time_in_seconds = proof_remaining
             proof_solver.parameters.log_search_progress = bool(log)
             proof_solver.parameters.cp_model_presolve = True
-            proof_solver.parameters.linearization_level = 2
+            proof_solver.parameters.linearization_level = 1
             if configure_subsolvers:
                 _configure_asu_solver_portfolio(
                     proof_solver.parameters,
@@ -4689,7 +4701,7 @@ def solve_one_asu_cpsat(
                     params,
                     "asu_flow_capacity_hybrid",
                     search_branching=cp_model.PARTIAL_FIXED_SEARCH,
-                    linearization_level=2,
+                    linearization_level=1,
                     root_lp_iterations=25_000,
                     add_lp_constraints_lazily=False,
                     max_cut_rounds_at_level_zero=10,
@@ -4718,7 +4730,7 @@ def solve_one_asu_cpsat(
             _append_asu_subsolver_params(
                 params,
                 "lb_tree_search",
-                save_lp_basis_in_lb_tree_search=True,
+                save_lp_basis_in_lb_tree_search=False,
                 max_cut_rounds_at_level_zero=10,
                 add_objective_cut=True,
                 root_lp_iterations = 100_000
@@ -4812,7 +4824,7 @@ def solve_one_asu_cpsat(
             params.max_time_in_seconds = max(0.01, float(max_seconds))
             params.log_search_progress = bool(search_log)
             params.cp_model_presolve = True
-            params.linearization_level = 2
+            params.linearization_level = 1
             params.cp_model_probing_level = 2
             params.cut_level = 2
             if hasattr(params, "fill_tightened_domains_in_response"):
@@ -5413,7 +5425,7 @@ def solve_one_asu_cpsat(
                 tie_solver.parameters.max_time_in_seconds = tie_stage_secs
                 tie_solver.parameters.log_search_progress = False
                 tie_solver.parameters.cp_model_presolve = True
-                tie_solver.parameters.linearization_level = 2
+                tie_solver.parameters.linearization_level = 1
                 if configure_subsolvers:
                     _configure_asu_solver_portfolio(
                         tie_solver.parameters,
@@ -6583,7 +6595,7 @@ def solve_local_repair(
     solver.parameters.max_time_in_seconds = float(time_limit)
     solver.parameters.log_search_progress = False
     solver.parameters.cp_model_presolve = True
-    solver.parameters.linearization_level = 2
+    solver.parameters.linearization_level = 1
     solver.parameters.random_seed = int(random_seed)
     _configure_asu_solver_portfolio(solver.parameters, num_workers)
 
@@ -6972,7 +6984,7 @@ def solve_connectivity_free_relaxation(
     solver.parameters.num_search_workers = max(1, int(workers))
     solver.parameters.max_time_in_seconds = max(0.01, float(time_limit))
     solver.parameters.cp_model_presolve = True
-    solver.parameters.linearization_level = 2
+    solver.parameters.linearization_level = 1
     solver.parameters.log_search_progress = False
     _configure_asu_solver_portfolio(solver.parameters, workers)
 
@@ -7812,7 +7824,7 @@ def _solve_supernode_polish(nb_local, u_g, E_g, P_g, tau, pop_thresh,
             upper_bound_stall_rounds=cut_stall_limit, bound_stall_only=True,
             seen_cuts=seen_cuts, initial_upper_bound=upper if cycle > 1 else None,
             stage_prefix='FINAL_POLISH_SUPERNODES', proof_out=cut_proof, bound_out=cut_bounds,
-            stop_on_new_cuts=True,
+            round_seconds=_CUT_ROUND_SECONDS, stop_on_new_cuts=False,
             repair_candidate=repair_cut_candidate if use_surplus_path_repair else None)
         if cut_bounds and cut_bounds[0] is not None:
             upper = min(upper, cut_bounds[0])
@@ -8477,7 +8489,7 @@ def _joint_connectivity_cut_pass(model, x, root_rows, nb, u,
                                  cut_cache=None, global_nodes=None,
                                  proof_out=None, bound_stall_only=False, bound_out=None,
                                  seen_cuts=None, initial_upper_bound=None,
-                                 repair_candidate=None, round_seconds=10.0,
+                                 repair_candidate=None, round_seconds=_CUT_ROUND_SECONDS,
                                  objective_floor=None, stop_on_new_cuts=False):
     """Solve/add root-aware cuts before flows; never publish disconnected groups.
 
@@ -8489,9 +8501,10 @@ def _joint_connectivity_cut_pass(model, x, root_rows, nb, u,
     unemployment stall limit. Only strict valid gains reset that counter.
     Proof, cancellation, invalidity,
     and deadline still stop.
-    stop_on_new_cuts interrupts a round when an incumbent exposes new violated
-    connectivity rows. Rows are added only AFTER Solve returns. Valid connected
-    incumbents are retained; only certified solver bounds tighten the objective.
+    Every round has a five-second solver limit (or a shorter supplied deadline).
+    stop_on_new_cuts is retained for compatibility but no longer interrupts
+    rounds. Rows are added only AFTER Solve returns. Valid connected incumbents
+    are retained; only certified solver bounds tighten the objective.
     """
     if bound_stall_only:
         if upper_bound_stall_rounds is None or upper_bound_stall_rounds < 1:
@@ -8539,7 +8552,8 @@ def _joint_connectivity_cut_pass(model, x, root_rows, nb, u,
               f"baseline_unemp={best_obj} time_limit={max(0, deadline-started):.3f}s "
               f"max_rounds={max_rounds} cut_limit={cut_limit} workers={workers} "
               f"valid_unemp_stall_limit={valid_stall.limit} "
-              f"stop_on_new_cuts={bool(stop_on_new_cuts)}", flush=True)
+              f"round_time_limit={min(_CUT_ROUND_SECONDS, math.inf if round_seconds is None else round_seconds):.3f}s "
+              "stop_on_new_cuts=False", flush=True)
     round_number = 0
     while round_number < max_rounds:
         round_number += 1
@@ -8549,12 +8563,10 @@ def _joint_connectivity_cut_pass(model, x, root_rows, nb, u,
             status_name = reason or ("CUT_LIMIT" if rows >= cut_limit else "TIME_LIMIT")
             break
         scout = _new_asu_solver()
-        # None leaves individual rounds untimed; existing callers keep 10s.
-        scout.parameters.max_time_in_seconds = (remaining if round_seconds is None
-                                                else min(round_seconds, remaining))
         scout.parameters.num_search_workers = max(1, int(workers))
-        scout.parameters.log_search_progress = bool(log)
         _configure_asu_solver_portfolio(scout.parameters, workers)
+        _configure_cut_round_params(
+            scout.parameters, remaining if round_seconds is None else min(round_seconds, remaining))
         done, interrupted = threading.Event(), []
 
         class CutDiscovery(cp_model.CpSolverSolutionCallback):
@@ -8580,13 +8592,10 @@ def _joint_connectivity_cut_pass(model, x, root_rows, nb, u,
                 elif not self.cuts:
                     self.cuts, self.detached = _joint_new_connectivity_cuts(
                         groups, root_rows, nb, u, self.BooleanValue, seen, cut_limit - rows)
-                if self.cuts:
-                    # Multiworker search can deliver another incumbent during
-                    # shutdown. Keep any valid improvement, but don't replace
-                    # the first useful batch or mutate the model in a callback.
-                    self.StopSearch()
+                # Keep searching after discovering cuts; retain connected
+                # improvements without mutating the live model.
 
-        discovery = CutDiscovery() if stop_on_new_cuts else None
+        discovery = CutDiscovery()
 
         def watch():
             while not done.wait(.1):
@@ -8599,16 +8608,14 @@ def _joint_connectivity_cut_pass(model, x, root_rows, nb, u,
         watcher = threading.Thread(target=watch, daemon=True)
         watcher.start()
         try:
-            status = scout.Solve(model, discovery) if discovery is not None else scout.Solve(model)
+            status = scout.Solve(model, discovery)
         finally:
             done.set()
             watcher.join()
         rounds = round_number
         status_name = interrupted[0] if interrupted else scout.StatusName(status)
-        round_end = (interrupted[0] if interrupted else
-                     "NEW_CONNECTIVITY_CUTS" if discovery is not None and discovery.cuts else
-                     "SOLVER_RETURNED")
-        if discovery is not None and discovery.best is not None and discovery.best_obj >= best_obj:
+        round_end = interrupted[0] if interrupted else "SOLVER_RETURNED"
+        if discovery.best is not None and discovery.best_obj >= best_obj:
             best, best_obj = discovery.best, discovery.best_obj
             if objective is not None:
                 model.Add(objective >= best_obj)
@@ -8685,7 +8692,7 @@ def _joint_connectivity_cut_pass(model, x, root_rows, nb, u,
         added, detached = 0, 0
         if not interrupted:
             cuts = []
-            if discovery is not None and discovery.cuts:
+            if discovery.cuts:
                 cuts, detached = discovery.cuts, discovery.detached
             elif not connected:
                 cuts, detached = _joint_new_connectivity_cuts(
@@ -9554,7 +9561,7 @@ def _solve_regional_exchange(units, nodes, nb, u, E, P, tau, pop_thresh,
             workers, cancellation, log=log, report=incumbent_report_callback,
             stage_prefix=stage_prefix, objective=objective,
             cut_cache=cut_cache, global_nodes=nodes, proof_out=cut_proof,
-            stop_on_new_cuts=True)
+            round_seconds=_CUT_ROUND_SECONDS, stop_on_new_cuts=False)
         proved_by_cuts = bool(cut_proof and cut_proof[0])
         if (best_obj >= baseline and (best_obj > incumbent_baseline or
                 (proved_by_cuts and allow_seed_consolidation
@@ -10316,32 +10323,6 @@ def solve_asu_graph_cut_only(
         separator_accepted += 1
         return tuple(sorted(candidate))
 
-    class _GraphCutProgress(cp_model.CpSolverSolutionCallback):
-        def __init__(self, log_enabled: bool, round_no: int, start: float) -> None:
-            super().__init__()
-            self._log = log_enabled
-            self._round = round_no
-            self._start = start
-            self._last_print = 0.0
-            self._best = -1
-
-        def on_solution_callback(self) -> None:
-            if not self._log:
-                return
-            obj = int(round(self.ObjectiveValue()))
-            if obj <= self._best:
-                return
-            now = time.monotonic()
-            if now - self._last_print < 2.0:
-                return
-            self._best = obj
-            self._last_print = now
-            print(
-                f"    [graph-cut] round {self._round}: candidate unemp={obj}, "
-                f"elapsed={now - self._start:.1f}s",
-                flush=True,
-            )
-
     while True:
         remaining = float(time_limit) - (time.monotonic() - start_time)
         if remaining <= 0:
@@ -10364,14 +10345,13 @@ def solve_asu_graph_cut_only(
 
         solver = _new_asu_solver()
         solver.parameters.num_search_workers = max(1, int(workers))
-        solver.parameters.max_time_in_seconds = min(10.0, remaining)
         solver.parameters.log_search_progress = False
         solver.parameters.cp_model_presolve = True
-        solver.parameters.linearization_level = 2
+        solver.parameters.linearization_level = 1
         _configure_asu_solver_portfolio(solver.parameters, workers)
 
-        progress = _GraphCutProgress(log, cut_round, start_time)
-        status = solver.Solve(model, progress)
+        _configure_cut_round_params(solver.parameters, remaining)
+        status = solver.Solve(model)
         status_name = solver.StatusName(status)
         if status == cp_model.INFEASIBLE:
             # The last objective floor bump can't be beaten -- best_connected is optimal.
@@ -11290,7 +11270,8 @@ def _solve_asu_split(parent, nodes, nb, u, E, P, tau, pop_thresh,
         cancellation, log=log, max_rounds=100, cut_limit=math.inf,
         upper_bound_stall_rounds=25, stage_prefix="ASU_SPLIT",
         objective=objective, objective_floor=baseline + 1,
-        proof_out=proof, bound_stall_only=True, round_seconds=None, stop_on_new_cuts=True)
+        proof_out=proof, bound_stall_only=True,
+        round_seconds=_CUT_ROUND_SECONDS, stop_on_new_cuts=False)
 
     def result():
         return [[nodes[i] for i in unit] for unit in best if unit]
@@ -11578,7 +11559,7 @@ def build_many_asus_cpsat(
     using the polish time limit. Accepted updates restart polishing. Each update
     increases total unemployment or reduces group count without losing coverage.
     After a merge, pending surviving ASUs finish their turns; the next pass
-    recalculates highest total q_surplus first from the updated memberships.
+    recalculates lowest total unemployment first from the updated memberships.
     Late exchanges, takeovers, and residual additions trigger this check too.
     The polish uses
     `final_asu_polish_time_limit` seconds per ASU, or the standalone expansion time
@@ -11641,8 +11622,9 @@ def build_many_asus_cpsat(
     and avoid touching any other ASU. Only strict combined unemployment gains
     replace a parent. Each split has two or three children; Max ASUs also caps
     the total across all parents. Articulation/corridor hints are
-    optional suggestions, not restrictions. An untimed 25-round/5-bound-stall
-    cut pass precedes the exact joint flow solve (time_limit per parent).
+    optional suggestions, not restrictions. A cut pass with five-second rounds,
+    capped at 100 rounds or 25 stalled-bound rounds, precedes the exact joint
+    flow solve (time_limit per parent).
     No build, merge, takeover, polish, or residual-addition stages follow.
     Before cut solving, full-graph separators and optimistic population/rate
     cardinality and objective bounds tighten each child and the disjoint union.
@@ -13776,9 +13758,9 @@ def build_many_asus_cpsat(
         nonlocal polish_round, polish_followup_seconds, polish_followup_rounds
         if not polish_enabled:
             return
-        # Both ordinary and supernode partition polishing prioritize the
-        # aggregate surplus available to fund expansion.
-        polish_priority = 'q_surplus_descending'
+        # Both ordinary and supernode partition polishing give ASUs with
+        # the fewest unemployed people the first opportunity to expand.
+        polish_priority = 'unemployment_ascending'
         pending_ids = None
         seen_states = set()
         start_polish_sweep = True
@@ -13795,7 +13777,7 @@ def build_many_asus_cpsat(
                 touching_sweep.begin()
                 start_polish_sweep = False
             polish_round += 1
-            polish_ids = _polish_asu_order(asu_id, u, E, tau)
+            polish_ids = _polish_asu_order(asu_id, u)
             if pending_ids is not None:
                 polish_ids = [k for k in polish_ids if k in pending_ids]
             total_polish_unemp = int(u[np.where(asu_id > 0)[0]].sum())
@@ -13811,7 +13793,7 @@ def build_many_asus_cpsat(
                 print(
                     f"\n[FINAL POLISH] round {polish_round}: "
                     f"{len(polish_ids)} ASU(s), "
-                    "highest total q_surplus first, "
+                    "lowest total unemployment first, "
                     "each seeing all currently "
                     f"unassigned tracts (up to {polish_time_limit:.1f}s each); "
                     f"total unemployment currently captured={total_polish_unemp}",
@@ -13918,7 +13900,7 @@ def build_many_asus_cpsat(
             # the same window, released tracts and reshaped donors alter the
             # contracted model and its objective coefficients.
             pending_ids = set()
-            for candidate_id in _polish_asu_order(asu_id, u, E, tau):
+            for candidate_id in _polish_asu_order(asu_id, u):
                 previous = polish_last_windows.get(candidate_id)
                 if previous is None or candidate_id in polish_skipped_ids:
                     continue

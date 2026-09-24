@@ -1,5 +1,6 @@
 # Execute the dashboard's actual generated runner and service its RDS requests.
 source("R/solver_checkpoint.R")
+source("R/solver_jobs.R")
 run_checkpoint_runner <- function() {
   python <- Sys.getenv("ASU_TEST_PYTHON")
   if (!nzchar(python)) {
@@ -77,6 +78,37 @@ run_checkpoint_runner <- function() {
         identical(saved$tract_pop_cur,data$tract_pop_cur))
     }
   }
-  cat("Generated runner: real solve, synchronized early/final RDS saves, all strategies compile.\n")
+  # Run the actual generated legacy solver through the detached supervisor.
+  # No Shiny observer or checkpoint servicing loop is involved.
+  job <- file.path(folder, 'persistent-real')
+  dir.create(job)
+  file.copy(settings$df_csv, file.path(job, 'df.csv'))
+  file.copy(settings$nb_json, file.path(job, 'nb.json'))
+  settings$run_dir <- normalizePath(job, winslash='/')
+  for (name in c('df_csv','nb_json','out_json','progress_json','stop_file','skip_file')) {
+    filename <- switch(name, df_csv='df.csv', nb_json='nb.json', out_json='out.json',
+                       progress_json='progress.json', stop_file='stop.flag', skip_file='skip.flag')
+    assign(name, file.path(settings$run_dir, filename), settings)
+  }
+  settings$use_partitioning <- FALSE
+  settings$use_split <- FALSE
+  settings$legacy_checkpoint <- TRUE
+  eval(expr, settings)
+  writeLines(settings$runner_code, file.path(job, 'runner.py'))
+  asu_job_prepare(settings$run_dir, data, python, settings$py_mod_path, 'single')
+  handle <- asu_job_launch(settings$run_dir)
+  start <- Sys.time()
+  while (handle$is_alive() && as.numeric(difftime(Sys.time(),start,units='secs')) < 60) Sys.sleep(.1)
+  state <- asu_job_state(settings$run_dir)
+  if (!identical(state$status, 'completed') || !identical(state$recovery_exit_code, 0L)) {
+    cat(asu_job_log_tail(settings$run_dir), sep='\n')
+    stop('Detached real solver failed: ', state$status)
+  }
+  saved <- readRDS(file.path(job,'result.rds'))
+  stopifnot(identical(saved$asunum,c(1L,1L)),
+            identical(sf::st_geometry(saved),sf::st_geometry(data)),
+            length(list.files(job,pattern='legacy_solve_.*\\.rds$')) == 1L,
+            length(list.files(job,pattern='legacy_done_.*\\.rds$')) == 1L)
+  cat("Generated runner: actual detached solve, independent early/final RDS saves, all strategies compile.\n")
 }
 run_checkpoint_runner()

@@ -55,7 +55,9 @@ class PartitionPublicationTest(unittest.TestCase):
         self.assertIn('checking_asus=candidate_tract_', output.getvalue())
         first_polish = next(line for line in output.getvalue().splitlines()
                             if '[STAGE] FINAL_POLISH ' in line and 'position=1/2' in line)
-        self.assertIn('checking_asus=1', first_polish)
+        # Build order remains unchanged; the lower-unemployment seed is ASU 2.
+        self.assertEqual(before_polish['asu_id'][0], 2)
+        self.assertIn('checking_asus=2', first_polish)
         self.assertIn('asus_remaining=1', first_polish)
 
 
