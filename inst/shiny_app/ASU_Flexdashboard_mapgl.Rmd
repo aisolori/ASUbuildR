@@ -49,6 +49,11 @@ table.dataTable td {
   window._asuTooltipState = window._asuTooltipState || {};
   window._asuTooltipInstallTimers = window._asuTooltipInstallTimers || {};
 
+  window.Shiny.addCustomMessageHandler("asu-show-initial-asu", function() {
+    // Use flexdashboard navigation so tab activation, URL and resize agree.
+    window.FlexDashboardUtils.showPage("#section-load-initial-asu");
+  });
+
   function escapeHtml(value) {
     return String(value == null ? "" : value)
       .replace(/&/g, "&amp;")
@@ -333,7 +338,12 @@ append_cpsat_log <- function(..., .persist = TRUE) {
     cpsat_stage_text(trimws(latest_stage))
   }
 
-  line <- paste0(format(Sys.time(), "%H:%M:%S "), raw)
+  # Solver lines already carry capture timestamps from the detached logger.
+  # Reattachment must not replace those with the viewer's current time.
+  line <- if (.persist) paste0(
+    format(Sys.time(), "%Y-%m-%dT%H:%M:%OS3+00:00 ", tz = "UTC"), lines,
+    collapse = "\n"
+  ) else raw
   old  <- cpsat_log_buf()
   new  <- if (nzchar(old)) paste(old, line, sep = "\n") else line
   if (nchar(new) > 12000) new <- substr(new, nchar(new) - 11999, nchar(new))
@@ -1072,9 +1082,6 @@ output$algo_blurb <- shiny::renderUI({
 
 shiny::uiOutput("algo_blurb")
 
-shiny::htmlOutput("total_unemp")
-
-shiny::tableOutput("asu")
 #shiny::verbatimTextOutput("cpsat_log_tail")
 
 palette_logic <- function(n_asu) {
@@ -1395,7 +1402,10 @@ shiny::observeEvent(input$attach_job, {
     shiny::showNotification("This job is no longer running. Refresh the job list.", type = "warning")
     return()
   }
-  tryCatch(attach_cpsat_job(folder), error = function(e)
+  tryCatch({
+    attach_cpsat_job(folder)
+    session$sendCustomMessage("asu-show-initial-asu", list())
+  }, error = function(e)
     shiny::showNotification(conditionMessage(e), type = "error", duration = NULL))
 })
 
@@ -2138,6 +2148,10 @@ output$initial_map <- mapgl::renderMaplibre({
 shiny::uiOutput("log_overlay")
 
 mapgl::maplibreOutput("initial_map", height = "100vh")
+
+shiny::h4("ASU summary")
+shiny::htmlOutput("total_unemp")
+shiny::div(style = "overflow-x: auto;", shiny::tableOutput("asu"))
 
 ```
 

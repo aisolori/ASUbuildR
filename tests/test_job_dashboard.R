@@ -48,6 +48,15 @@ test_job_dashboard <- function() {
     session$flushReact()
     stopifnot(identical(full_data()$asunum,c(1L,1L)),
       identical(readBin(file.path(folder,'solver.log'),'raw',n=10000),original))
+    # Replayed solver output keeps its capture time, not the attach time.
+    captured <- '2026-09-25T12:34:56.789+00:00 #Bound 1.0s'
+    cpsat_log_buf('')
+    append_cpsat_log(captured, .persist = FALSE)
+    stopifnot(identical(cpsat_log_buf(), captured))
+    append_cpsat_log('[session] first\n[session] second')
+    displayed <- strsplit(cpsat_log_buf(), '\n', fixed = TRUE)[[1]]
+    stopifnot(length(displayed) == 3L,
+              all(grepl('^[0-9]{4}-.*[+]00:00 ', displayed)))
     session$close()
   })
   stopifnot(!file.exists(file.path(folder,'stop.flag')),
@@ -55,3 +64,44 @@ test_job_dashboard <- function() {
   cat('PASS fresh-session attach / assignments / logs / disconnect does not request stop\n')
 }
 test_job_dashboard()
+
+# Exercise the actual Attach button observer: navigate only after success.
+test_attach_navigation <- function() {
+  script <- tempfile(fileext = '.R')
+  on.exit(unlink(script))
+  knitr::purl('inst/shiny_app/ASU_Flexdashboard_mapgl.Rmd', output = script, quiet = TRUE)
+  expressions <- as.list(parse(script))
+  observers <- Filter(function(e)
+    is.call(e) && identical(paste(deparse(e[[1]]), collapse = ''), 'shiny::observeEvent') &&
+    identical(e[[2]], quote(input$attach_job)), expressions)
+  stopifnot(length(observers) == 1L)
+  shiny::testServer(function(input, output, session) {
+    recorded <- new.env(parent = emptyenv())
+    recorded$messages <- list()
+    recorded$attachments <- character()
+    recorded$fail_attach <- FALSE
+    asu_job_list <- function() c('Active job' = 'active-job')
+    attach_cpsat_job <- function(folder) {
+      if (recorded$fail_attach) stop('Attachment failed')
+      recorded$attachments <- c(recorded$attachments, folder)
+    }
+    session$sendCustomMessage <- function(type, message) {
+      recorded$messages[[length(recorded$messages) + 1L]] <- list(type = type, message = message)
+    }
+    eval(observers[[1]], envir = environment())
+  }, {
+    session$setInputs(saved_job = 'active-job', attach_job = 1)
+    stopifnot(identical(recorded$attachments, 'active-job'), length(recorded$messages) == 1L,
+              identical(recorded$messages[[1]]$type, 'asu-show-initial-asu'))
+    recorded$fail_attach <- TRUE
+    session$setInputs(attach_job = 2)
+    stopifnot(length(recorded$messages) == 1L, length(recorded$attachments) == 1L)
+    recorded$fail_attach <- FALSE
+    session$setInputs(saved_job = 'finished-job', attach_job = 3)
+    stopifnot(length(recorded$messages) == 1L, length(recorded$attachments) == 1L)
+    session$setInputs(saved_job = '', attach_job = 4)
+    stopifnot(length(recorded$messages) == 1L, length(recorded$attachments) == 1L)
+  })
+  cat('PASS successful attach navigates; failed, stale, or empty selection does not\n')
+}
+test_attach_navigation()

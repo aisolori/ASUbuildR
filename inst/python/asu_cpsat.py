@@ -1465,7 +1465,7 @@ _ASU_FULL_SUBSOLVER_PATTERN = (
     "quick_restart_no_lp",
     "variables_shaving_no_lp",
     "max_lp",
-    "lb_tree_search",
+    "probing",
     "asu_probe_mega_deep",
 
     "reduced_costs",

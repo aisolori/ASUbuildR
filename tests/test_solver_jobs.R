@@ -80,6 +80,9 @@ test_solver_jobs <- function() {
   log <- readLines(file.path(folder,'solver.log'))
   stopifnot(any(grepl('AFTER_LAUNCHER_EXIT',log)), any(grepl('STDERR_SURVIVES',log)),
             any(grepl('Solver exit_code=0',log)), any(grepl('RDS saved:',log)))
+  stamp <- '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[.][0-9]{3}[+]00:00 '
+  stopifnot(all(grepl(stamp, log[nzchar(log)])),
+            file.exists(file.path(folder, 'solver.raw.log')))
   saved <- readRDS(file.path(folder,'result.rds'))
   stopifnot(identical(saved$asunum,c(1L,1L)),
             identical(sf::st_geometry(saved), sf::st_geometry(data)),
@@ -101,6 +104,8 @@ test_solver_jobs <- function() {
   stopifnot(state$status == 'failed', state$exit_code != 0L,
             file.exists(file.path(folder,'recovered.rds')),
             any(grepl('INTENTIONAL_TEST_FAILURE', asu_job_log_tail(folder))))
+  log <- readLines(file.path(folder, 'solver.log'))
+  stopifnot(all(grepl(stamp, log[nzchar(log)])))
   cat('PASS failed solve exit status / traceback / progress recovery\n')
 
   folder <- prepare('split')

@@ -723,7 +723,9 @@ the dashboard asks you to attach to an existing active job before starting anoth
 
 On a fresh dashboard, use **Persistent solver jobs** on the Data Initialization
 tab: **Refresh jobs**, choose the run, then **Attach to job**. No workbook upload
-is required to view that job's saved data. Attaching never reruns the solver.
+is required to view that job's saved data. A successful attachment opens
+**Load Initial ASU** to show the map, summary, and live log. Attaching never
+reruns the solver.
 Only active jobs are available for attachment; the list refreshes every five
 seconds and restores live progress and Stop/Skip controls. Completed, stopped,
 failed, or interrupted jobs are hidden. On job-list refresh, completed job
@@ -740,7 +742,14 @@ use the same `ASU_JOB_DIR` and OS user to discover those jobs.
 
 Each unique job directory contains:
 
-- `solver.log`: Python stdout/stderr written directly to disk, independent of Shiny.
+- `solver.log`: solver stdout/stderr with a UTC capture timestamp on every
+  nonempty line, independent of Shiny. Millisecond timestamps are added as
+  output is collected (normally polled every 0.1 seconds), not when a viewer
+  attaches. CP-SAT's own elapsed-time fields are preserved. Quiet cut rounds
+  still suppress detailed search logs.
+- `solver.raw.log`: original output spool, retained if the supervisor fails.
+  Native solver output and stderr use this regular file, not a browser-owned
+  pipe. The timestamped copy also includes recovery-process output.
 - `events.log`: viewer attach/disconnect and explicit user-control events.
 - `supervisor.log`: detached supervisor startup/errors.
 - `job.json`, `owner.json`, `status.json`: configuration, process identity,
@@ -773,6 +782,10 @@ jobs are subject to the 24-hour cleanup described above; save wanted results
 elsewhere. Monitor disk space, particularly for national geometry and retained
 job checkpoints. The job list covers the configured folder on
 this machine; it does not attach to jobs on another server.
+
+Timestamp changes apply to newly launched jobs after updating the package.
+Existing jobs use their snapshotted code; reattaching does not upgrade their
+logger or reconstruct missing timestamps in older output.
 
 - **Python not detected:** run `ASUbuildR::setup_asu_python()` and
   `ASUbuildR::check_asu_python()`, then restart the dashboard.
