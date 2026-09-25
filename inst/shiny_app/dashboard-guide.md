@@ -81,10 +81,12 @@ small groups carefully. **CP-SAT (OR-Tools)** searches for connected groups
 meeting the configured population and rate thresholds while increasing the
 unemployment captured.
 
-### Component-first global strategy
+### Component-first global strategy (Python/CLI and existing jobs)
 
-Choose **Component-first global (automatic ASU count)** to maximize captured
-unemployment over the full input graph without choosing a number of ASUs.
+Component-first global is no longer offered in the dashboard strategy selector.
+Its Python/CLI implementation and support for existing jobs remain available.
+The following reference describes its global unemployment objective without
+choosing a number of ASUs.
 The model selects tracts; each connected selected component becomes an ASU
 only if it independently meets both the population and unemployment-rate
 thresholds. Touching valid groups may become one component without losing
@@ -138,16 +140,17 @@ relative-gap tolerance may stop with a nonzero gap and is not exact optimality.
 A timeout without proof is a valid best-so-far result, not a failed search.
 This is an experimental strategy: it preserves feasible alternatives but does
 not guarantee faster solves or a proof within the time budget.
-Each cut round starts a new CP-SAT search. After three rounds without a
-candidate, the solver tries lighter startup settings and permits the current
-valid selection as a feasible model hint. A setting that produces candidates
-stays active; new cuts and local repairs do not send it back to previously
-unsuccessful settings. Three further misses allow another setting to be tried.
+Each cut round starts a new CP-SAT search. The solver tries another configuration
+after three consecutive rounds that either return no candidate or first produce
+one after 80% of the round budget (four seconds in a five-second round). It also
+switches after twelve rounds in the same configuration without improving
+captured unemployment or the upper bound, even when rounds return `FEASIBLE`.
+New cuts alone do not reset this counter. Improvements from local repairs do.
+The log reports each change as `COMPONENT_GLOBAL_SEARCH_MODE`, including its reason.
 
-If neither captured unemployment nor its upper bound improves for 180 seconds,
-the strategy returns the best valid selection with status `STALLED` and its
-remaining gap. New cuts do not reset that timer. Round logs report this objective
-stagnation separately from rounds without new cuts.
+There is no component-global stall cutoff. Stagnation changes the search settings;
+the run continues until its overall time budget, requested gap, optimality proof,
+or the user's Stop action. Round logs retain objective stagnation diagnostics.
 
 A separate watchdog requests a stop at each round's five-second deadline.
 CP-SAT stops asynchronously, so native shutdown or a running Python callback
@@ -348,16 +351,16 @@ Set these before starting. Changing a control does not reconfigure a running sol
 
 | Parameter | Meaning and effect |
 | --- | --- |
-| CP-SAT strategy | **Partitioning strategy (potential multiple ASUs)** creates seeds, expands territories, jointly reoptimizes touching ASUs, and polishes groups. **Component-first global (automatic ASU count)** selects tracts globally and uses qualifying connected components as ASUs, without a count cap. **Legacy single-ASU solve** builds candidates from remaining tracts one at a time; it can still produce multiple ASUs. **Split saved ASUs (joint model)** splits imported parents only when separated children capture strictly more combined unemployment. Legacy is currently the selected default. |
+| CP-SAT strategy | **Partitioning strategy (potential multiple ASUs)** creates seeds, expands territories, jointly reoptimizes touching ASUs, and polishes groups. **Legacy single-ASU solve** builds candidates from remaining tracts one at a time; it can still produce multiple ASUs. **Split saved ASUs (joint model)** splits imported parents only when separated children capture strictly more combined unemployment. Legacy is currently the selected default. |
 | UR threshold (τ) | Minimum aggregate rate as a **fraction**. Default `0.0645` means **6.45%**. Do not enter `6.45` here. |
 | Population threshold | Minimum combined population of a candidate. Default `10000`. |
-| Use saved ASUs as a warm start / Warm-start RDS | Upload a saved dashboard `.rds` (`sf` or data frame) containing `GEOID`/`geoid` and `asunum`/`asu_id`. Groups are matched to the current data by GEOID and validated before starting. Optional and off by default for Legacy, Partitioning, and Component-first global; **mandatory for Split saved ASUs regardless of the checkbox**. |
-| Max ASUs | Limit used by the ASU creation loop. Default `30`. It is not a target count; fewer groups may be feasible and merges reduce the count. Hidden and ignored for Component-first global. |
-| Solve time limit (sec) | Default `18000` is five hours. For Component-first global this is a **whole-search budget**. Otherwise it is the budget for an individual main candidate window, **not a whole-run limit**. Use positive seconds. Partition expansion has a separate built-in 1800-second budget per solve, also used by default for final polishing. |
-| Incumbent stall limit (sec) | Stops the applicable search after this long without improving its best solution. Default `300` is five minutes; `0` disables it. Bound improvements alone do not reset this timer. Hidden and disabled for Component-first global. |
+| Use saved ASUs as a warm start / Warm-start RDS | Upload a saved dashboard `.rds` (`sf` or data frame) containing `GEOID`/`geoid` and `asunum`/`asu_id`. Groups are matched to the current data by GEOID and validated before starting. Optional and off by default for Legacy and Partitioning; **mandatory for Split saved ASUs regardless of the checkbox**. |
+| Max ASUs | Limit used by the ASU creation loop. Default `30`. It is not a target count; fewer groups may be feasible and merges reduce the count. |
+| Solve time limit (sec) | Default `18000` is five hours. This is the budget for an individual main candidate window, **not a whole-run limit**. Use positive seconds. Partition expansion has a separate built-in 1800-second budget per solve, also used by default for final polishing. |
+| Incumbent stall limit (sec) | Stops the applicable search after this long without improving its best solution. Default `300` is five minutes; `0` disables it. Bound improvements alone do not reset this timer. |
 | Total CP-SAT workers (detected cores - 2) | Threads available to CP-SAT; initialized from detected physical cores with a minimum of one. More workers use more CPU and may use more memory; they do not guarantee better results. |
-| Concurrent ASU solves | Maximum simultaneous main candidate solves. Default `1`. Main windows share the worker budget. Partition expansions are sequential and receive the full worker budget. Hidden for Component-first global, which runs one global solve at a time. |
-| Relative gap (optional) | Allows earlier termination when the solution is close to its bound. `0.01` means approximately 1%. Blank leaves this optional tolerance unset. In Component-first global the gap compares the best validated selection with the global upper bound. In other strategies it concerns the current model, not proof of the best overall arrangement. |
+| Concurrent ASU solves | Maximum simultaneous main candidate solves. Default `1`. Main windows share the worker budget. Partition expansions are sequential and receive the full worker budget. |
+| Relative gap (optional) | Allows earlier termination when the solution is close to its bound. `0.01` means approximately 1%. Blank leaves this optional tolerance unset. The gap concerns the current model, not proof of the best overall arrangement. |
 
 **Rate units differ between tabs:**
 
@@ -686,7 +689,7 @@ be opened with **Load Data** or used as a warm start.
 
 ### Persistent solver jobs and browser disconnects
 
-All newly launched CP-SAT strategies (Legacy, Partitioning, Split, and Component-first global) run
+All newly launched dashboard CP-SAT strategies (Legacy, Partitioning, and Split) run
 as detached jobs under `~/ASUbuildR/jobs/` on the machine running R. Set
 `ASU_JOB_DIR` before launching the dashboard to choose another writable,
 persistent directory. The old `ASU_CHECKPOINT_DIR` location is not used for new

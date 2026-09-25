@@ -901,7 +901,6 @@ shiny::conditionalPanel(
       "CP-SAT strategy",
       choices = c(
         "Partitioning strategy (potential multiple ASUs)" = "partition",
-        "Component-first global (automatic ASU count)" = "component_global",
         "Legacy single-ASU solve" = "single",
         "Split saved ASUs (joint model)" = "split"
       ),
@@ -911,7 +910,7 @@ shiny::conditionalPanel(
     shiny::conditionalPanel(
       condition = "input.cpsat_use_warm_start === true || input.cpsat_strategy === 'split'",
       shiny::fileInput("cpsat_warm_start", "Warm-start RDS", accept = ".rds", multiple = FALSE),
-      shiny::helpText("Matches GEOID plus asunum/asu_id to the current input data. Saved groups must meet current thresholds and connectivity. Max ASUs includes these groups except in Component-first global, which has no group-count cap. Assignments remain changeable.")
+      shiny::helpText("Matches GEOID plus asunum/asu_id to the current input data. Saved groups must meet current thresholds and connectivity. Max ASUs includes these groups. Assignments remain changeable.")
     ),
     shiny::conditionalPanel(
       condition = "input.cpsat_strategy === 'split'",
@@ -938,20 +937,13 @@ shiny::conditionalPanel(
     ),
     shiny::numericInput("cpsat_tau",       "UR threshold (τ)",          value = 0.0645, min = 0, max = 1, step = 0.0001),
     shiny::numericInput("cpsat_pop",       "Population threshold",      value = 10000,  min = 0, step = 100),
-    shiny::conditionalPanel(
-      condition = "input.cpsat_strategy !== 'component_global'",
+    shiny::tagList(
       shiny::numericInput("cpsat_max", "Max ASUs", value = 30, min = 1, step = 1),
       shiny::numericInput("cpsat_incumbent_stall_seconds", "Incumbent stall limit (sec)", value = 300, min = 0, step = 30),
       shiny::numericInput("cpsat_parallel_asus", "Concurrent ASU solves", value = 1, min = 1, step = 1),
       shiny::helpText("The solve time limit applies per main window, not to the whole run. Partition expansion and final polishing use their separate budgets.")
     ),
     shiny::numericInput("cpsat_timelimit", "Solve time limit (sec)", value = 18000, min = 0, step = 60),
-    shiny::conditionalPanel(
-      condition = "input.cpsat_strategy === 'component_global'",
-      shiny::helpText("Experimental global selection: all tracts remain available and qualifying connected components become ASUs automatically. No Max ASUs cap, per-ASU concurrency, or incumbent-stall cutoff applies. The solve time limit is a whole-search budget including model preparation, cut generation, and local repair; input validation, shutdown, and final result writing can add overhead."),
-      shiny::helpText("Batched component cuts, regional eligibility constraints, and the best certified objective ceiling strengthen later rounds. Short neighborhood repairs run periodically and after stalled improvement, then unrestricted global search resumes. No ASU is permanently frozen, and local repair bounds never establish global optimality."),
-      shiny::helpText("Saved ASUs supply a valid starting solution and a soft hint, not fixed boundaries. Quiet cut rounds run for at most five solver seconds. The log reports validated captured unemployment and a global upper bound/gap. A time-limited result is not necessarily optimal, and speed is not guaranteed. Stop returns the best valid selection; Skip advances to the next cut round.")
-    ),
     shiny::numericInput("cpsat_workers",   "Total CP-SAT workers (detected cores - 2)", value = max(1, parallel::detectCores(logical = FALSE)-2), min = 1, step = 1),
     shiny::numericInput("cpsat_relgap",        "Relative gap (optional)",    value = NULL, min = 0, step = 0.0001),
     shiny::uiOutput("cpsat_log_link")
@@ -986,14 +978,12 @@ output$algo_blurb <- shiny::renderUI({
              <code>UR threshold (τ)</code>, <code>Population threshold</code>,
              <code>Max ASUs</code>, <code>Time limit</code>, optional
              <code>Relative gap</code>, <code>Total CP-SAT workers</code>, and
-             <code>Concurrent ASU solves</code>. Component-first global instead
-             chooses its own ASU count and uses one whole-search time budget.</li>
+             <code>Concurrent ASU solves</code>.</li>
        </ul>
        <p>
          While solving, a live <em>CP-SAT log</em> panel appears (top-right)
          showing progress. Single-ASU and partition expansion incumbents are
-         checked every minute. Component-first global publishes assignments
-         only when validated captured unemployment improves. Subtle green/red fills show additions/removals
+         checked every minute. Subtle green/red fills show additions/removals
          relative to each solve's starting hint; these temporary previews clear
          before results are committed. When the solver finishes, the map and summary table
          update automatically; tracts with <code>asunum = 0</code> are not in

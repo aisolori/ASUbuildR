@@ -27,7 +27,8 @@ _REPAIR_INTERVAL = 5
 _REPAIR_STALL_ROUNDS = 8
 _REPAIR_STALL_COOLDOWN = 4
 _UNKNOWN_FALLBACK_ROUNDS = 3
-_OBJECTIVE_STALL_SECONDS = 180.0
+_LATE_CANDIDATE_FRACTION = 0.8
+_OBJECTIVE_FALLBACK_ROUNDS = 12
 
 
 class _ComponentCutPool:
@@ -89,21 +90,33 @@ def _repair_schedule(rounds, stalled_rounds, last_repair_round,
 
 
 class _SearchPolicy:
-    """Keep a mode that returns candidates; only repeated misses change it."""
+    """Change search settings when candidates arrive too late or gains stall."""
     def __init__(self):
         self.mode = "standard"
         self.misses = 0
+        self.starved = 0
+        self.stagnant = 0
 
-    def observe(self, candidate, skipped=False):
+    def observe(self, candidate, skipped=False, *, first_candidate_seconds=None,
+                round_budget=5.0, progressed=False):
         if skipped:
             return
-        if candidate:
-            self.misses = 0
-            return
-        self.misses += 1
+        self.misses = 0 if candidate else self.misses + 1
+        late = (first_candidate_seconds is not None and round_budget > 0 and
+                first_candidate_seconds >= _LATE_CANDIDATE_FRACTION * round_budget)
+        self.starved = self.starved + 1 if not candidate or late else 0
+        self.stagnant = 0 if progressed else self.stagnant + 1
+        reason = None
         if self.misses >= _UNKNOWN_FALLBACK_ROUNDS:
+            reason = "no_candidate"
+        elif self.starved >= _UNKNOWN_FALLBACK_ROUNDS:
+            reason = "late_candidates"
+        elif self.stagnant >= _OBJECTIVE_FALLBACK_ROUNDS:
+            reason = "objective_stagnation"
+        if reason:
             self.mode = ("no_presolve" if self.mode == "no_symmetry" else "no_symmetry")
-            self.misses = 0
+            self.misses = self.starved = self.stagnant = 0
+        return reason
 
 
 def _integers(values, name, n):
@@ -547,9 +560,6 @@ def solve_component_global(
             _consume_flag(skip_path)
             if verbose:
                 _stage_print(f"[STAGE] COMPONENT_GLOBAL_ROUND_SKIPPED round={rounds}", flush=True)
-        search_policy.observe(
-            status in (cp_model.FEASIBLE, cp_model.OPTIMAL) or
-            callback.first_candidate_seconds is not None, skipped=skipped)
         if upper_bound <= best_u or time.monotonic() >= deadline:
             if verbose:
                 _stage_print(f"[STAGE] COMPONENT_GLOBAL_CUT_ROUND round={rounds} "
@@ -700,15 +710,18 @@ def solve_component_global(
                 if _stop_requested(skip_path):
                     _consume_flag(skip_path)
 
-        if (stalled_rounds >= _UNKNOWN_FALLBACK_ROUNDS * 2 and
-                time.monotonic() - last_progress_time >= _OBJECTIVE_STALL_SECONDS):
-            outcome = "STALLED"
-            if verbose:
-                _stage_print(f"[STAGE] COMPONENT_GLOBAL_STALLED rounds_without_progress="
-                             f"{stalled_rounds} seconds_without_progress="
-                             f"{time.monotonic() - last_progress_time:.1f} "
-                             f"valid_unemp={best_u} upper_bound={upper_bound}", flush=True)
-            break
+        # Repairs count as objective progress too. New cuts and merely returning
+        # FEASIBLE do not reset this policy's objective stagnation counter.
+        reason = search_policy.observe(
+            status in (cp_model.FEASIBLE, cp_model.OPTIMAL) or
+            callback.first_candidate_seconds is not None, skipped=skipped,
+            first_candidate_seconds=callback.first_candidate_seconds,
+            round_budget=round_budget,
+            progressed=best_u > previous_best or upper_bound < previous_bound)
+        if reason and verbose:
+            _stage_print(f"[STAGE] COMPONENT_GLOBAL_SEARCH_MODE round={rounds} "
+                         f"previous={search_mode} next={search_policy.mode} reason={reason} "
+                         f"valid_unemp={best_u} upper_bound={upper_bound}", flush=True)
 
     if _stop_requested(stop_path):
         outcome = "STOPPED"

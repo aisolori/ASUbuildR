@@ -39,14 +39,16 @@ class ComponentTighteningTest(unittest.TestCase):
         self.assertEqual(global_solver._repair_schedule(13, 12, 9, 2), (0.0, None))
         self.assertEqual(global_solver._repair_schedule(25, 24, 9, 2), (2.0, "stalled"))
 
-    def test_stalled_rounds_switch_search_settings_and_return_valid_partial_result(self):
+    def test_stalled_rounds_continue_past_old_cutoff_until_user_stop(self):
         settings = []
+        clock = [0.0]
 
         class UnknownSolver:
             def __init__(self):
                 self.parameters = cp_model.CpSolver().parameters
 
             def Solve(self, model, callback):
+                clock[0] += 200.0
                 settings.append((self.parameters.symmetry_level,
                                  self.parameters.cp_model_presolve,
                                  self.parameters.linearization_level))
@@ -60,15 +62,19 @@ class ComponentTighteningTest(unittest.TestCase):
 
         with (patch.object(shared, "_new_asu_solver", side_effect=UnknownSolver),
               patch.object(global_solver, "_repair_schedule", return_value=(0.0, None)),
-              patch.object(global_solver, "_OBJECTIVE_STALL_SECONDS", 0.0)):
+              patch.object(global_solver.time, "monotonic", side_effect=lambda: clock[0]),
+              patch.object(shared, "_stop_requested",
+                           side_effect=lambda path: path == "test-stop" and len(settings) >= 8)):
             result = global_solver.solve_component_global(
                 [[1], [0, 2], [1]], [5, 0, 1], [0, 100, 2], [5, 1, 5],
-                .5, 5, time_limit=5, workers=1)
-        self.assertEqual(result["status"], "STALLED")
+                .5, 5, time_limit=5000, workers=1, stop_path="test-stop")
+        self.assertEqual(result["status"], "STOPPED")
         self.assertEqual(result["total_unemp"], 5)
         self.assertEqual(result["upper_bound"], 6)
-        self.assertEqual(result["rounds"], 6)
-        self.assertEqual([row[0] for row in settings], [2, 2, 2, 0, 0, 0])
+        self.assertEqual(result["rounds"], 8)
+        self.assertEqual([row[0] for row in settings], [2, 2, 2, 0, 0, 0, 0, 0])
+        self.assertFalse(settings[-1][1])
+        self.assertGreater(clock[0], 180)
 
     def test_candidate_producing_fallback_is_retained(self):
         policy = global_solver._SearchPolicy()
@@ -76,7 +82,7 @@ class ComponentTighteningTest(unittest.TestCase):
             policy.observe(False)
         self.assertEqual(policy.mode, "no_presolve")
         for _ in range(20):
-            policy.observe(True)
+            policy.observe(True, progressed=True)
             self.assertEqual(policy.mode, "no_presolve")
         policy.observe(False, skipped=True)
         self.assertEqual(policy.misses, 0)
@@ -84,14 +90,39 @@ class ComponentTighteningTest(unittest.TestCase):
             policy.observe(False)
         self.assertEqual(policy.mode, "no_symmetry")
 
-    def test_new_cuts_do_not_reset_objective_stagnation(self):
+    def test_late_feasible_candidates_and_misses_activate_fallback(self):
+        policy = global_solver._SearchPolicy()
+        self.assertIsNone(policy.observe(True, first_candidate_seconds=4.9))
+        self.assertIsNone(policy.observe(False))
+        reason = policy.observe(True, first_candidate_seconds=4.8)
+        self.assertEqual(reason, "late_candidates")
+        self.assertEqual(policy.mode, "no_symmetry")
+
+    def test_early_feasible_candidates_without_gains_activate_fallback(self):
+        policy = global_solver._SearchPolicy()
+        for _ in range(11):
+            self.assertIsNone(policy.observe(True, first_candidate_seconds=.2))
+        policy.observe(True, skipped=True)
+        self.assertEqual(policy.stagnant, 11)
+        self.assertEqual(policy.observe(True, first_candidate_seconds=.2),
+                         "objective_stagnation")
+        self.assertEqual(policy.mode, "no_symmetry")
+        for _ in range(11):
+            policy.observe(True)
+        policy.observe(True, progressed=True)
+        self.assertEqual(policy.stagnant, 0)
+        self.assertEqual(policy.mode, "no_symmetry")
+
+    def test_new_cuts_and_objective_stagnation_do_not_terminate_search(self):
         calls = []
+        clock = [0.0]
 
         class CutSolver:
             def __init__(self):
                 self.parameters = cp_model.CpSolver().parameters
 
             def Solve(self, model, callback):
+                clock[0] += 200.0
                 calls.append(model)
                 return cp_model.FEASIBLE
 
@@ -99,7 +130,7 @@ class ComponentTighteningTest(unittest.TestCase):
                 return var.name in ("selected_0", f"selected_{len(calls)}")
 
             def BestObjectiveBound(self):
-                return 12
+                return 14
 
             def StatusName(self, status):
                 return "FEASIBLE"
@@ -109,13 +140,15 @@ class ComponentTighteningTest(unittest.TestCase):
 
         with (patch.object(shared, "_new_asu_solver", side_effect=CutSolver),
               patch.object(global_solver, "_repair_schedule", return_value=(0.0, None)),
-              patch.object(global_solver, "_OBJECTIVE_STALL_SECONDS", 0.0)):
+              patch.object(global_solver.time, "monotonic", side_effect=lambda: clock[0]),
+              patch.object(shared, "_stop_requested",
+                           side_effect=lambda path: path == "test-stop" and len(calls) >= 8)):
             result = global_solver.solve_component_global(
-                [[] for _ in range(8)], [5] + [1] * 7, [0] + [2] * 7, [5] * 8,
-                .5, 5, time_limit=5, workers=1)
-        self.assertEqual(result["status"], "STALLED")
-        self.assertEqual(result["rounds"], 6)
-        self.assertEqual(result["cuts"], 6)
+                [[] for _ in range(10)], [5] + [1] * 9, [0] + [2] * 9, [5] * 10,
+                .5, 5, time_limit=5000, workers=1, stop_path="test-stop")
+        self.assertEqual(result["status"], "STOPPED")
+        self.assertEqual(result["rounds"], 8)
+        self.assertEqual(result["cuts"], 7)
         self.assertEqual(result["total_unemp"], 5)
         self.assertFalse(result["optimal"])
 
@@ -148,14 +181,13 @@ class ComponentTighteningTest(unittest.TestCase):
         with (patch.object(shared, "_new_asu_solver", side_effect=WaitingSolver),
               patch.object(shared, "_configure_cut_round_params", side_effect=short_round),
               patch.object(global_solver, "_repair_schedule", return_value=(0.0, None)),
-              patch.object(global_solver, "_OBJECTIVE_STALL_SECONDS", 0.0),
               contextlib.redirect_stdout(log)):
             started = time.monotonic()
             result = global_solver.solve_component_global(
                 [[1], [0, 2], [1]], [5, 0, 1], [0, 100, 2], [5, 1, 5],
-                .5, 5, time_limit=5, workers=1, verbose=True)
+                .5, 5, time_limit=.25, workers=1, verbose=True)
         self.assertLess(time.monotonic() - started, 2)
-        self.assertEqual(result["status"], "STALLED")
+        self.assertEqual(result["status"], "TIME_LIMIT")
         self.assertTrue(all(engine.stopped.is_set() for engine in engines))
         self.assertIn("round_end=ROUND_TIME_LIMIT", log.getvalue())
         self.assertIn("callback_seconds=", log.getvalue())
