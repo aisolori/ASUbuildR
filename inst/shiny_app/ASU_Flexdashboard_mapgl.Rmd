@@ -723,7 +723,7 @@ asu_is_contiguous <- function(asu_geoids, stored_nb) {
 
 # Data Initialization
 ## Controls {data-width="150"}
-This screen allows you to import the BLS-provided ASU file, generally named like _NV_asu23.xlsx_ which will be the only external data import step necessary. The script will read the file, extract the state, and determine the population year from the Excel file.
+Import a state or national BLS ASU workbook, generally named like _NV_asu23.xlsx_. The importer reads all tract rows, identifies the uploaded states, and detects the population year. Solver scope includes all uploaded states; the display selector only changes what you see.
 
 You can specify which year of Census tract boundaries to use with the selector below. This is important because Census tract boundaries may change between years, and you'll want to use the appropriate year that matches the GEOIDs in your BLS file.
 
@@ -735,7 +735,7 @@ shiny::h4("Persistent solver jobs")
 shiny::selectInput("saved_job", "Running job", choices = c("Choose a job" = ""))
 shiny::actionButton("refresh_jobs", "Refresh jobs")
 shiny::actionButton("attach_job", "Attach to job")
-shiny::helpText("Jobs continue after this tab closes. Attach to monitor results or use Stop. Job files are kept on the machine running R.")
+shiny::helpText("CP-SAT jobs continue after a browser close or disconnect. Only running jobs are available to attach. Use Stop Solve to end a job; closing the log only hides it. Job files stay on the R server. Completed and interrupted jobs become eligible for deletion after 24 hours; save wanted results outside the job folder.")
 shiny::fileInput("file", "Choose Excel File", accept = c(".xls", ".xlsx"))
 shiny::selectInput("display_state_upload", "Display area:", choices = character(0))
 shiny::textOutput("upload_status")
@@ -910,12 +910,16 @@ shiny::conditionalPanel(
     shiny::conditionalPanel(
       condition = "input.cpsat_use_warm_start === true || input.cpsat_strategy === 'split'",
       shiny::fileInput("cpsat_warm_start", "Warm-start RDS", accept = ".rds", multiple = FALSE),
-      shiny::helpText("Matches GEOID plus asunum/asu_id to the current input data. Saved groups must meet current thresholds and connectivity. Max ASUs includes these groups. Assignments remain changeable.")
+      shiny::helpText("Matches GEOID/geoid plus asunum/asu_id to the current input data. Saved geometry and counts are not used. Every saved group must qualify on the current data and neighbor graph; assigned tracts missing from the input cause an error. Max ASUs includes imported groups. This warm-start upload is separate from Load Data on the Save and Load Data tab.")
+    ),
+    shiny::conditionalPanel(
+      condition = "input.cpsat_strategy === 'single'",
+      shiny::helpText("Legacy optimizes one ASU at a time, but can build multiple ASUs up to Max ASUs. With a warm start, it first reoptimizes each saved group using that group plus reachable unassigned tracts, protecting other groups. The saved unemployment total is a floor; membership can change, but one anchor tract remains fixed. New-ASU searches follow if slots remain.")
     ),
     shiny::conditionalPanel(
       condition = "input.cpsat_strategy === 'split'",
       shiny::helpText("Requires a warm-start RDS regardless of the checkbox. Tries imported ASUs once, highest captured unemployment first, using articulation points and narrow graph corridors as split hints. Each child must contain a parent tract, qualify independently, and avoid touching all other ASUs. Unassigned tracts are available; only strict combined unemployment gains are accepted."),
-      shiny::helpText("Increase Max ASUs above the imported count to leave room for children. Each split may create two or three children, limited further by the available slots. Solves run sequentially with all workers. Each starts with a cut pass: at most 100 rounds or 25 stalled-upper-bound rounds. Each quiet cut round waits for optimality or its five-second solver limit, unless interrupted; discovering a cut does not end the round. Time and incumbent-stall limits apply to the subsequent exact flow solve per parent. No merging or polishing follows.")
+      shiny::helpText("Increase Max ASUs above the imported count to leave room for two or three children per parent. Children cannot touch one another or other ASUs. Solves are sequential with all workers. The cut pass ends by 100 rounds, 25 rounds without a better upper bound, or 50 rounds without higher valid unemployment, and may finish earlier on proof or interruption. Each quiet cut solve has a five-second solver limit; finding a cut does not stop the round. Solve time and incumbent-stall limits apply to the subsequent exact flow solve per parent, not to the preceding cut pass. No merging or polishing follows.")
     ),
     shiny::conditionalPanel(
       condition = "input.cpsat_strategy === 'partition'",
@@ -929,11 +933,12 @@ shiny::conditionalPanel(
                           "Expansion incumbent stall limit (sec)", value = 300, min = 0, step = 30),
       shiny::checkboxInput("cpsat_final_consolidation", "Consolidate touching ASUs at the end", value = TRUE),
       shiny::checkboxInput("cpsat_polish_consolidated_asus", "Polish consolidated groups", value = TRUE),
-      shiny::helpText("Final consolidation preserves every selected tract. Optional polishing uses the final-polish budget and general stall limit, preserves selected tracts, then consolidates any new contacts. Stop still allows the quick consolidation but skips additional solves."),
+      shiny::helpText("Both final consolidation and consolidated-group polishing are enabled by default here. Final consolidation preserves every selected tract and total unemployment. If consolidation creates merged groups, optional polishing uses the final-polish budget and general stall limit, rejects changes that release selected tracts, then consolidates new contacts. Stop still allows the quick consolidation but skips additional solves. Turning off final consolidation does not disable earlier touching-group merges."),
       shiny::helpText("Finish retained-component repair and partition expansion solves after this many seconds without an incumbent improvement. 0 disables this limit; the solve time budget still applies. Final polishing uses the general stall limit."),
       shiny::helpText("Surplus pruning starts with all tracts and removes the lowest-surplus tracts while preserving population. A removal may split a component only if every resulting component meets the population threshold; each is then pruned independently toward the rate threshold. Stalled components are repaired using only retained tracts. Valid seeds then enter outward expansion and polishing, where pruned tracts become available again."),
-      shiny::helpText("Partitioning expands each ASU individually, sequentially, using all workers and a 1800-second limit per ASU."),
-      shiny::helpText("In partitioning, touching ASUs are jointly reoptimized with all reachable unassigned tracts instead of automatically merged. Roots and boundaries can move; the solver may keep separate groups or consolidate them. Combined unemployment cannot decrease. Graph cuts and a connectivity pre-pass are enabled automatically for these touching solves. Each touching-cluster solve uses all workers and the expansion/polish budget (1800 seconds in this dashboard); the pre-pass shares that budget.")
+      shiny::helpText("Connectivity-free components uses a relaxed selection without contiguity to form expansion seeds, including components that do not yet qualify. Only valid expanded groups are committed. Seeds are ranked by total rate surplus, then unemployment. Expansion solves run sequentially with all workers and a 1800-second main-solve budget each; their single-ASU cut passes add time."),
+      shiny::helpText("Final polishing starts with the lowest total unemployment first, not the lowest unemployment rate. Each ASU has a 1800-second polish budget. Follow-up checks allow up to three rounds with no shared time cap; Stop, per-ASU budgets, and stall limits still apply."),
+      shiny::helpText("Touching valid ASUs are first merged directly, preserving every selected tract and total unemployment. Joint reoptimization remains a fallback, not a required solve for every contact. Its expansion path uses cuts without an exact-flow follow-up; fallback exact touching solves share at most 180 seconds across the run. These limits are separate from individual expansion and polish budgets.")
     ),
     shiny::numericInput("cpsat_tau",       "UR threshold (τ)",          value = 0.0645, min = 0, max = 1, step = 0.0001),
     shiny::numericInput("cpsat_pop",       "Population threshold",      value = 10000,  min = 0, step = 100),
@@ -941,11 +946,12 @@ shiny::conditionalPanel(
       shiny::numericInput("cpsat_max", "Max ASUs", value = 30, min = 1, step = 1),
       shiny::numericInput("cpsat_incumbent_stall_seconds", "Incumbent stall limit (sec)", value = 300, min = 0, step = 30),
       shiny::numericInput("cpsat_parallel_asus", "Concurrent ASU solves", value = 1, min = 1, step = 1),
-      shiny::helpText("The solve time limit applies per main window, not to the whole run. Partition expansion and final polishing use their separate budgets.")
+      shiny::helpText("Solve time applies per main candidate window, not to the whole run; hint preparation and single-ASU cut passes can add time. Partition expansion and polishing have separate 1800-second budgets. Incumbent stall limits do not replace cut-pass round limits; 0 disables the stall timer, not the solve budget. Concurrent ASU solves is an upper limit for main windows; expansions, polishing, saved-group reoptimization, and splits are sequential.")
     ),
     shiny::numericInput("cpsat_timelimit", "Solve time limit (sec)", value = 18000, min = 0, step = 60),
     shiny::numericInput("cpsat_workers",   "Total CP-SAT workers (detected cores - 2)", value = max(1, parallel::detectCores(logical = FALSE)-2), min = 1, step = 1),
     shiny::numericInput("cpsat_relgap",        "Relative gap (optional)",    value = NULL, min = 0, step = 0.0001),
+    shiny::helpText("UR is a fraction: 0.0645 means 6.45%. Review-tab thresholds are separate. Relative gap 0.01 allows about a 1% model gap; it does not prove the best overall ASU arrangement. Settings are captured at launch; changing controls does not reconfigure a running job."),
     shiny::uiOutput("cpsat_log_link")
   )
 )
@@ -966,12 +972,16 @@ output$algo_blurb <- shiny::renderUI({
     shiny::HTML(
       paste0(python_status, "<p><strong>CP-SAT (OR-Tools) workflow</strong></p>
        <p>
-         This option builds ASUs by solving a mixed-integer model over tract
-         adjacency. The app will:
+         These strategies seek to maximize captured unemployment subject to
+         population, unemployment-rate, and graph-connectivity requirements.
+         They use staged CP-SAT models, not one proof of the best overall ASU
+         arrangement. The app will:
        </p>
        <ul>
          <li>Download Census tract shapes for the selected year and build
-             neighbour lists (contiguity).</li>
+             neighbour lists (queen contiguity, including corner contacts).
+             Disconnected components receive artificial island links; inspect
+             unusual connections, especially on nationwide data.</li>
          <li>Merge the BLS upload you provided (population, labor force,
              employment, unemployment, rate).</li>
          <li>Run the CP-SAT solver with your parameters:
@@ -982,11 +992,13 @@ output$algo_blurb <- shiny::renderUI({
        </ul>
        <p>
          While solving, a live <em>CP-SAT log</em> panel appears (top-right)
-         showing progress. Single-ASU and partition expansion incumbents are
-         checked every minute. Subtle green/red fills show additions/removals
+         showing progress. Supported searches periodically publish validated
+         improvements, usually about once per minute during longer solves.
+         Identical tract selections and candidates without a strict increase in
+         valid unemployment do not repaint the preview. Green/red fills show additions/removals
          relative to each solve's starting hint; these temporary previews clear
-         before results are committed. When the solver finishes, the map and summary table
-         update automatically; tracts with <code>asunum = 0</code> are not in
+         before results are committed. Committed results update during supported
+         stages and again when the solver finishes; tracts with <code>asunum = 0</code> are not in
          any ASU.
        </p>
        <p>
@@ -997,7 +1009,8 @@ output$algo_blurb <- shiny::renderUI({
        </p>
        <p>
          Click <em>Load tracts &amp; initialise</em> to start. You can refine
-         results on the <em>Modify ASU Selections</em> tab once the map renders.
+         results on the <em>Modify ASU Selections</em> tab after the job finishes
+         or an orderly Stop completes. A visible map can still be provisional.
        </p>")
     )
 
@@ -1010,12 +1023,14 @@ output$algo_blurb <- shiny::renderUI({
        <ul>
          <li><em>Load tracts &amp; initialise</em><br>
              ▸ downloads shapefiles, merges the BLS file, then runs the
-             <strong>Seed + Expand</strong> step automatically. This should only be run once.</li>
+             <strong>Seed + Expand</strong> step automatically. Running it again rebuilds the initial result; save wanted edits first.</li>
          <li><em>Run Hunter</em><br>
              ▸ performs the optimisation/trade pass that adds
-             high-unemployment neighbours and drops low-unemployment ones until
-             every ASU is as close as possible to the
-             <code>6.45%</code> threshold.</li>
+             neighbouring tracts and makes local trades to improve captured
+             unemployment under its rate rule. This is a heuristic, not an
+             optimality guarantee. Hunter initialization uses <code>6.45%</code>
+             and <code>10,000</code> population; CP-SAT controls do not change
+             these values. Review qualification again after improvement passes.</li>
          <li><em>Combine Groups</em><br>
              ▸ merges adjacent ASUs that share a boundary. Connected ASUs allow for more tracts to be added, so whenever ASUs are merged it is advisable to run another pass with the Tract Hunter.</li>
        </ul>
@@ -1028,15 +1043,17 @@ output$algo_blurb <- shiny::renderUI({
     ## ───────── SIMPLE SNAKE (ORIGINAL) METHOD ─────────
     shiny::HTML(
       "<p>
-        This button will launch two processes, which will take up to 5&nbsp;minutes
-        to complete. For smaller states, it may take under 15&nbsp;seconds.
+        This starts boundary loading and a greedy tract-growth heuristic.
+        Runtime depends on data size, cached geometry, and the server; there
+        is no fixed five-minute completion guarantee.
       </p>
       <p>
         First, the application will download census shapefiles by tract for the
         appropriate state and year. Next, after combining the BLS file with these
         shapefiles, it will iteratively search for contiguous geographic regions
-        until the combined unemployment rate in each region is as close to
-        6.45% as possible.
+        by adding available neighbours in rate order while targeting a combined
+        unemployment rate of at least 6.45%. This is a starting heuristic,
+        not an optimality guarantee; the CP-SAT controls do not change it.
       </p>
       <p>
         When this process is complete, a map will appear to the right, and a
@@ -2709,6 +2726,11 @@ Use **Save Data As...** to choose a filename and folder on your computer.
 After loading data, go directly to the ASU Modification tab to continue
 making edits. The export directory below is used only for LSS and summary CSV files.
 
+Loading an RDS restores map data and assignments and sets a new Reset baseline;
+it does not start or resume optimization. To reoptimize saved groups, upload the
+current workbook and use the CP-SAT **Warm-start RDS** control before launching.
+Finish or stop an active job before loading or editing another result.
+
 ```{r}
 shiny::includeScript(file.path(dirname(knitr::current_input(dir = TRUE)), "save-as.js"))
 
@@ -2792,7 +2814,10 @@ Note, you *may* go back and forth between the selection and review
 screens.
 
 When ready to create an output file, the *Generate LSS .txt File* button
-will create a formatted batch file for upload to LSS.
+will create a formatted batch file on the R server. It exports assigned groups,
+including any that fail review; it does not submit or validate them for you.
+LSS labels use the uploaded workbook's state setting. Use a matching single-state
+workbook; changing Display area does not make a nationwide export state-specific.
 
 ```{r}
 shiny::numericInput("asu_ur", "ASU Unemployment Rate Threshold:", value = 6.45, min = 0)

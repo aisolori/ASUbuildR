@@ -13,7 +13,7 @@ on the dashboard. Selecting or highlighting a tract does not change its ASU.
 4. Wait for completion, then use **Save and Load Data** to save a checkpoint.
 5. Inspect and edit assignments in **Modify ASU Selections**.
 6. Set the review thresholds and click **Generate ASU Summary** in
-   **ASU Review and Finalization**. Repeat after edits.
+   **ASU Review and Finalization**. Once generated, it updates after edits.
 7. Save again and generate the review CSV and LSS text file.
 
 Tract Hunter is initially selected and needs no Python setup. To use CP-SAT,
@@ -28,7 +28,7 @@ run `ASUbuildR::setup_asu_python()` in R, then restart the dashboard.
 | Display area | Selects one state or **All states (nationwide)** for the preview and both maps. The selectors on Data Initialization, Load Initial ASU, and Modify ASU Selections stay synchronized. This changes the display, not the solver's uploaded-state scope. |
 | Census Tract Year | Boundary vintage used for the map and tract matching. Separate from the population year read from the workbook. The current selector accepts 2010–2025 and initially shows 2024. |
 | Preview and detected state/year | Check that the state and tract values match the intended workbook before building. |
-| New England Year Override (on Load Initial ASU) | Uses the selected boundary year or **Force 2021 (last NECTA year)**. Choose a vintage matching the workbook's GEOIDs. This changes the boundary download; it does not convert the workbook's geography. |
+| New England Year Override (on Load Initial ASU) | Choose **Use selected year from Data Initialization** or **Use 2021 for New England states**. Connecticut legacy county GEOIDs automatically use 2021 geometry. Other states retain their selected vintage. This does not convert the workbook's geography. |
 
 Keep GEOIDs (tract identifiers) intact, including leading zeros. The importer
 expects county-based tract data. The first boundary download needs internet
@@ -172,13 +172,14 @@ the last published assignments independently of the browser.
 
 ### CP-SAT parameters
 
-Version 0.6.51 enables `symmetry_level=3` for all ASU solver phases, including
+The shared CP-SAT solver factory sets `symmetry_level=3`, including for
 large models that CP-SAT would otherwise skip. Symmetry detection retains a
 `symmetry_detection_deterministic_time_limit` of 1.0. This is deterministic
 solver time, not a one-second wall-clock guarantee. The setting applies even
 when the custom worker portfolio is disabled. It is an experiment: extra
 presolve work may or may not improve the incumbent or proof within the total
-solve budget.
+solve budget. The retained component-global backend can override this in its
+fallback modes; it is not a dashboard strategy choice.
 
 Partition polishing starts each pass with the lowest total unemployment first,
 breaking ties by ASU number. This is the sum of unemployed-person counts across
@@ -191,7 +192,10 @@ updated assignments. This ordering also applies with merging disabled and to
 follow-up polishing passes. Logs report `priority=unemployment_ascending`.
 
 Partitioning's **Initial ASU seed method** defaults to connected components of
-the connectivity-free solution. The optional **Surplus pruning** method starts
+the connectivity-free solution, with a 120-second relaxation budget in the dashboard.
+The dashboard admits all relaxed components as candidate seeds, including ones
+that do not yet meet rate or population requirements; only qualifying expansion
+results are committed. The optional **Surplus pruning** method starts
 with all available tracts and removes negative-surplus tracts in ascending
 `q_surplus` order, preserving the population threshold. Articulation tracts can
 be removed when every resulting component meets the population threshold,
@@ -277,7 +281,8 @@ economic impossibility returns the unchanged parent without running cut or
 flow solves and is logged as `ASU_SPLIT_ECONOMIC_SCREEN`.
 
 Each parent starts with a flow-free connectivity cut pass with five-second rounds:
-at most **100 rounds or 25 consecutive stalled-upper-bound rounds**. Proof, cancellation,
+at most **100 rounds, 25 consecutive stalled-upper-bound rounds, or 50 consecutive
+rounds without higher valid unemployment**, whichever comes first. Proof, cancellation,
 or solver failure may end it earlier. Within each round, the solver checks
 incumbents for disconnected children but continues after discovering cuts.
 It adds those cuts after the solver returns, then restarts unless the pass
@@ -294,7 +299,8 @@ each round and consumes part of that limit. Cuts and tighter bounds remain in th
 same model when exact connectivity flows are added. A valid connected optimum
 of the cut model needs no further flow solve. **Time limit per window** and
 **Incumbent stall limit** apply only to that subsequent exact solve per parent;
-the cut pass has neither a total nor a per-round time cap. Use a positive time
+the cut pass has no separate total-time cap, but each cut solve has a five-second
+solver limit and the pass has the round/stall limits above. Use a positive time
 limit to enable split attempts. Solves run sequentially using all workers.
 Stop/Skip preserve the best validated improving split, if any; otherwise the
 original parent is retained. No merging, takeover, polishing, or residual-ASU
@@ -340,7 +346,9 @@ scheduling state so other ASUs finish before a changed neighborhood is retried.
 can trigger a new sweep after peers finish; an exact `CACHED` hit does not.
 This scheduling rule is separate from cut reuse and is not an optimality claim.
 
-**Polish consolidated groups** is optional and off by default. It gives merged
+**Polish consolidated groups** is optional and on by default in the dashboard
+(the Python API default is off). It only applies when final consolidation is enabled
+and creates merged groups. It gives those merged
 groups one additional polish attempt using the final-polish budget and general
 incumbent stall limit. Replacements that release selected tracts are discarded.
 Any new contacts are consolidated afterward without starting another polish loop.
@@ -351,15 +359,15 @@ Set these before starting. Changing a control does not reconfigure a running sol
 
 | Parameter | Meaning and effect |
 | --- | --- |
-| CP-SAT strategy | **Partitioning strategy (potential multiple ASUs)** creates seeds, expands territories, jointly reoptimizes touching ASUs, and polishes groups. **Legacy single-ASU solve** builds candidates from remaining tracts one at a time; it can still produce multiple ASUs. **Split saved ASUs (joint model)** splits imported parents only when separated children capture strictly more combined unemployment. Legacy is currently the selected default. |
+| CP-SAT strategy | **Partitioning strategy (potential multiple ASUs)** creates seeds, expands territories, merges touching valid groups, and polishes ASUs. Joint touching optimization is a fallback. **Legacy single-ASU solve** reoptimizes imported groups, then builds candidates from remaining tracts; it can produce multiple ASUs. **Split saved ASUs (joint model)** splits imported parents only when separated children capture strictly more combined unemployment. Legacy is currently the selected default. |
 | UR threshold (τ) | Minimum aggregate rate as a **fraction**. Default `0.0645` means **6.45%**. Do not enter `6.45` here. |
 | Population threshold | Minimum combined population of a candidate. Default `10000`. |
 | Use saved ASUs as a warm start / Warm-start RDS | Upload a saved dashboard `.rds` (`sf` or data frame) containing `GEOID`/`geoid` and `asunum`/`asu_id`. Groups are matched to the current data by GEOID and validated before starting. Optional and off by default for Legacy and Partitioning; **mandatory for Split saved ASUs regardless of the checkbox**. |
 | Max ASUs | Limit used by the ASU creation loop. Default `30`. It is not a target count; fewer groups may be feasible and merges reduce the count. |
-| Solve time limit (sec) | Default `18000` is five hours. This is the budget for an individual main candidate window, **not a whole-run limit**. Use positive seconds. Partition expansion has a separate built-in 1800-second budget per solve, also used by default for final polishing. |
+| Solve time limit (sec) | Default `18000` is five hours per main candidate window, **not a whole-run limit**. Use positive seconds. Hint preparation and single-ASU cut passes add time. Partition expansion and final polishing use separate built-in 1800-second budgets per ASU; single-ASU expansion cut passes add time, while supernode polish cuts share the polish budget. |
 | Incumbent stall limit (sec) | Stops the applicable search after this long without improving its best solution. Default `300` is five minutes; `0` disables it. Bound improvements alone do not reset this timer. |
 | Total CP-SAT workers (detected cores - 2) | Threads available to CP-SAT; initialized from detected physical cores with a minimum of one. More workers use more CPU and may use more memory; they do not guarantee better results. |
-| Concurrent ASU solves | Maximum simultaneous main candidate solves. Default `1`. Main windows share the worker budget. Partition expansions are sequential and receive the full worker budget. |
+| Concurrent ASU solves | Maximum simultaneous main candidate solves, not a promised count. Default `1`. Disjoint main windows share the worker budget; the dashboard's all-remaining-tract window can leave only one window available. Expansion, polishing, imported Legacy reoptimization, and splits are sequential and use all workers. |
 | Relative gap (optional) | Allows earlier termination when the solution is close to its bound. `0.01` means approximately 1%. Blank leaves this optional tolerance unset. The gap concerns the current model, not proof of the best overall arrangement. |
 
 **Rate units differ between tabs:**
@@ -387,19 +395,20 @@ infeasibility.
 | COMPONENT_GLOBAL_CUT_BATCH | Adds all previously unseen invalid components from the returned candidate plus up to eight from intermediate candidates. Reports new component cuts and any optional regional groups added on small inputs. |
 | COMPONENT_GLOBAL_REPAIR / COMPONENT_GLOBAL_REPAIR_COMPLETE | Runs a short, targeted neighborhood search periodically or after stalled improvement, then resumes unrestricted global search. Only validated gains update the incumbent; local bounds are not global proof. |
 | PARTITION_BUILD | Searching a main candidate window using remaining tracts. |
-| STATEWIDE_JOINT_SEED / STATEWIDE_JOINT_SEED_COMPLETE | Preparing valid component seeds. Reports seed budget, status, valid seeds, free slots, and baseline unemployment. |
-| STATEWIDE_JOINT / STATEWIDE_JOINT_COMPLETE | One all-tract joint model. Reports group slots, assignment/flow variable estimates, workers, time limit, and final status, active groups, merges, unemployment, gain, and elapsed time. |
-| STATEWIDE_JOINT_MODEL | Reports the actual hint mode, hinted tract count, tightening setting, derived count bounds, graph components, and assignments fixed to zero. |
+| LEGACY_REOPTIMIZE / LEGACY_REOPTIMIZE_COMPLETE | Reopens a saved Legacy ASU with an unemployment floor and protected peers before searching for new groups. |
 | PARTITION_EXPANSION | Expanding seeds in assigned territories, one solve at a time. |
 | PARTITION_EXPANSION_COMPLETE | Summarizing that round. Rejected seeds did not produce valid ASUs; the whole run can continue. |
-| PARTITION_TOUCHING_JOINT / PARTITION_TOUCHING_JOINT_COMPLETE | Jointly reoptimizing a touching partition cluster with reachable unassigned tracts. Reports source stage, group/window size, budget/workers, movable roots, baseline unemployment, gain, deactivated slots, acceptance, and elapsed time. `CACHED` skips an unchanged attempted neighborhood, not a proof of optimality. |
-| PARTITION_BUILD_MERGE / PARTITION_COMBINE | Legacy touching-group combining; partitioning uses the joint check instead. |
+| PARTITION_TOUCHING_SAFE_UNION | Merges touching valid groups directly, preserving selected tracts and captured unemployment without a joint solve. |
+| PARTITION_TOUCHING_JOINT / PARTITION_TOUCHING_JOINT_COMPLETE | Fallback joint reoptimization with reachable unassigned tracts. `exact_flow` distinguishes cut-only from exact-flow-enabled attempts. `CACHED` skips a previously attempted neighborhood, not a proof of optimality. |
+| PARTITION_BUILD_MERGE / PARTITION_COMBINE | Touching-group bookkeeping; partitioning normally uses safe union before any fallback joint solve. |
 | FINAL_POLISH | Processes ASUs from lowest to highest total unemployment. After a merge, pending surviving ASUs finish their turns; the next pass recalculates unemployment from updated memberships. |
 | FINAL_POLISH_MERGE | Committing a merge and finishing remaining queued ASUs before restarting polishing. |
 | SINGLE_ASU_TAKEOVER / TAKEOVER_DONOR_REPAIR | Partitioning only. Runs flow-free graph cuts before the takeover flow solve, then repairs affected groups before accepting or rejecting the attempt. |
 | FINAL_RESIDUAL_CHECK | Checking remaining tract components near the end. |
 
 Stages may repeat or be skipped depending on the strategy and results.
+`COMPONENT_GLOBAL_*` entries describe retained backend/existing-job support,
+not a currently selectable dashboard strategy.
 
 Legacy single-ASU runs proceed to the final residual check after their ASU
 search passes; they do not run `SINGLE_ASU_TAKEOVER` or its donor repairs.
@@ -457,7 +466,7 @@ the active cycle and cut limits. Other cut passes retain their existing rules.
 Committed expansion assignments update the live ASU data, summary table, and
 map before polishing starts.
 
-Every stage includes `total_unemp` for committed statewide coverage,
+Enriched stage messages include `total_unemp` for committed coverage over the input,
 `checking_asus`, and `asus_remaining`. During polishing these are ASU IDs
 and the number still waiting in the current pass, excluding the current ASU.
 Joint checks list all participating IDs. Stage fields `asu`, `checking_asu`,
@@ -473,8 +482,9 @@ ASU queue report `checking_asus=none asus_remaining=NA`.
 
 Load your current input data and choose its states, tract year, and thresholds
 as usual. In the CP-SAT controls, enable **Use saved ASUs as a warm start**,
-upload the RDS file, and set **Max ASUs** to at least the saved group count
-(except for Component-first global, which has no count cap).
+upload the RDS file, and set **Max ASUs** to at least the saved group count.
+Split requires this upload regardless of the checkbox and needs extra slots
+to create children.
 The RDS is an assignment warm start, not a replacement for the current input
 data. Its geometry and economic columns are ignored; current population,
 employment, and the current neighbor graph determine validity.
@@ -503,7 +513,7 @@ searches may still use pruning because they have no saved candidate.
 In **Partitioning**, saved groups initialize existing assignments and remain
 subject to that strategy's later polishing, exchange, and merge rules.
 Max ASUs counts both imported and newly created groups in those strategies.
-In **Component-first global**, imported groups instead provide an incumbent
+In the retained **Component-first global** backend, imported groups instead provide an incumbent
 and a hint; all tracts remain globally reconsiderable and Max ASUs is ignored.
 
 The `WARM_START` stage reports imported ASUs, assigned tracts, and baseline
@@ -512,51 +522,53 @@ unemployment. The original RDS is never modified. The edit tab's existing
 
 Partitioning expands ASUs individually in sequence, using all workers and a
 1800-second budget per ASU. The joint multi-ASU expansion option has been
-removed from the dashboard. Touching-ASU joint checks still run after individual
-expansions; an accepted update restarts expansion before the next ASU.
+removed from the dashboard. Touching groups are checked after individual
+expansions; a safe union or accepted fallback update restarts expansion before
+the next ASU. Single-ASU cut passes add time to the expansion budget.
 
 ### Touching ASUs in partitioning
 
-Partitioning no longer automatically unions touching ASUs. With touching
-resolution enabled (`merge_adjacent=True`, the dashboard default), the whole
-connected cluster of touching ASUs is reoptimized jointly with **all reachable
-unassigned tracts**. Other ASUs and pending seeds are protected. This applies
-even when the experimental pooled-expansion checkbox is off; that checkbox
-controls initial territory batches, not the touching-cluster step.
+With touching resolution enabled (`merge_adjacent=True`, the dashboard default),
+partitioning first uses **safe union**: touching valid ASUs are merged directly.
+Their union stays connected, preserves population and the minimum aggregate
+rate, and retains every selected tract and the same total unemployment.
+`PARTITION_TOUCHING_SAFE_UNION` reports this operation. It avoids paying for a
+joint solve just to rediscover a legal merge. Disabling the optional final
+consolidation checkbox does not disable these earlier merges.
 
-The joint solver may exchange or drop tracts, move roots, and deactivate seed
-slots. Every surviving group must be connected, meet the population/rate
-requirements, respect any enabled tract limit, and retain at least one of its
-own seed tracts. The number of slots cannot increase. Combined unemployment
-is protected, but an individual ASU may shrink.
-
-An update is accepted if it captures more unemployment, or captures the same
-unemployment with fewer ASUs. This is an acceptance rule, not a guarantee the
-solver finds the fewest groups among equal-value solutions. Unchanged,
-invalid, or non-improving results keep the original ASUs separate; there is no
-automatic merge fallback. Accepted changes restart expansion or polishing
-with fresh territories/order. Late-stage changes receive the same check.
+Joint optimization remains a fallback path, not a required step for every
+contact. Its window includes the participating groups and reachable unassigned
+tracts; other ASUs and pending seeds are protected. It may exchange or drop
+tracts, move roots, or deactivate slots. Surviving groups must qualify and
+retain a tract from their seed. Updates require higher combined unemployment,
+or equal unemployment with fewer groups. That is not a proof of the best
+overall partition. An unsuccessful fallback leaves the input groups unchanged.
 
 Touching-ASU solves automatically enable small-separator cuts, seed-distance/
 cardinality constraints, and the connectivity cut pre-pass.
-The pre-pass uses at most eight rounds, 60 seconds, and 15% of the remaining
-joint budget; it does not add time to that budget. Only validated connected
-solutions are retained. Cuts carry into the final exact flow model.
+The pre-pass uses up to 50 rounds, ending earlier after 10 rounds without a
+better upper bound, 50 without higher valid unemployment, or another stopping
+condition. Its deadline is the smaller of 180 seconds and 15% of the remaining
+joint budget, with at most five solver seconds per round; it does not add time
+to the joint budget. Only validated connected solutions are retained. Cuts
+carry into the exact flow model when that follow-up is enabled.
 Finite usable upper bounds reported by the pre-pass are also carried forward
 as explicit objective constraints (conservatively rounded upward). The bound
 comes from the solver's bound, never a disconnected incumbent's objective.
 The log uses `PARTITION_TOUCHING_JOINT_MODEL` (`graph_cuts=True`),
 `PARTITION_TOUCHING_JOINT_CUT_PASS`, `_CUT_ROUND`, `_CUT_COMPLETE`, and `_FLOW`.
 
-Each cluster gets the expansion time limit during building and the polish time
-limit during polishing/late checks (falling back to expansion when polishing
-is disabled). Both are 1800 seconds in the dashboard. All configured workers,
-the custom portfolio, Stop/Skip, gap/stall settings, and incumbent previews
-apply. Identical attempted neighborhoods are not repeatedly solved; changed
-memberships, reachable tracts, or budgets allow another attempt. A zero budget
-disables that check. Large touching clusters can cost more than single-ASU
-expansions. Ordinary individual expansion/polish roots remain fixed within
-each solve; **roots move in the touching joint solve**.
+Fallback touching checks during expansion use the cut/capacity phase only,
+without an exact-flow follow-up. Exact-flow-enabled touching fallbacks share
+at most 180 seconds across the entire run (or the polish budget, if smaller),
+rather than receiving 1800 seconds per cluster. That allowance includes their
+pre-pass and preparation; it does not cap ordinary individual expansion or
+polishing. Each invocation attempts at most one neighborhood. Expansion uses
+at most two groups; later checks use at most three, with larger clusters broken
+into touching-pair neighborhoods. All workers and Stop/Skip remain available.
+Attempt caching and sweep deferral avoid repeated unchanged work; neither is
+an optimality certificate. Roots stay fixed in individual expansion/polish
+models but can move in the fallback joint model.
 
 **Skip during a touching solve** retains any eligible improvement, then defers
 that cluster until the other queued ASUs/candidate seeds have had a turn.
@@ -574,13 +586,14 @@ Live incumbent previews do not interrupt a solve to merge ASUs. Expansion,
 main-build, and polishing solves finish under their normal stopping conditions
 before touching checks use the returned selection. Stop/Skip and
 configured time, gap, and stall limits still apply. When a completed expansion
-leads to an accepted touching-joint update, expansion restarts before the next
+leads to a safe union or accepted touching-joint update, expansion restarts before the next
 stale solve. During polishing, pending ASUs are tracked by tract membership
 across merges and renumbering; the remaining queue finishes before a restart.
 
 If a later polish releases tracts that enlarge an earlier ASU's reachable
-window, that ASU can receive a follow-up solve even without a merge. Follow-ups
-use the same polish ordering and skip unchanged or merely smaller windows.
+window, or changes ownership within its supernode model, that ASU can receive
+a follow-up solve even without a merge. Follow-ups use the same polish ordering;
+unchanged or merely smaller windows do not trigger a retry unless ownership changes.
 The whole run allows at most three such follow-up rounds, with no shared
 time cap. Each ASU receives its normal configured per-ASU polish time limit;
 Stop/Skip and the five-second cut-round limit still apply.
@@ -596,9 +609,11 @@ and model preparation count toward the connected solve's time budget.
 Pastel fills identify committed ASUs; colors can repeat, so check the tooltip's
 ASU number. Grey indicates unassigned tracts. During supported searches,
 translucent green/red fills show proposed additions/removals relative to the
-starting selection. These are provisional previews, normally updated about
-every 60 seconds. Unchanged incumbents and bound updates need not repaint the
-map. Large-state maps may load after the log.
+starting selection. These are provisional previews, normally checked about
+every 60 seconds during longer solves; cut passes can report at round boundaries.
+Identical selections and candidates without a strict gain in valid unemployment
+are suppressed. Bound improvements alone do not repaint the map. Large-state
+maps may load after the log.
 
 | Run button | Effect |
 | --- | --- |
@@ -608,8 +623,10 @@ map. Large-state maps may load after the log.
 | Save log as... | Opens a save dialog for the complete log on your computer, during or after a run. |
 | Open log / Open folder | Opens the automatic log or folder on the computer running R. |
 
-Keep the browser session open while solving; ending the session terminates its
-solver process. Finish or stop the run before manual editing or saving results.
+CP-SAT jobs survive browser closes and disconnects; closing the log only hides it.
+Use **Stop Solve** to request termination and wait for the final result before
+manual editing or loading another file. A mid-run RDS save contains the currently
+committed assignments, not the search tree or temporary preview.
 
 ## Modify ASU Selections
 
@@ -627,7 +644,7 @@ tracts. The Selection Summary updates automatically.
 | Clear Highlights | Removes inspection highlights without changing assignments. |
 | Enter a GEOID / Select a Single Tract | Locates a tract by its 11-character GEOID, including leading zeros. |
 | Selection Summary table rows | Highlights those tracts for inspection. Table highlights are separate from the assignment selection. |
-| Reset to Initial Data | Restores the stored initialization/algorithm baseline and discards subsequent edits. Not a one-step Undo. Loading an RDS does not establish a new reset baseline. |
+| Reset to Initial Data | Restores the latest stored baseline and discards subsequent edits. Not a one-step Undo. Loading an RDS sets that file as the new reset baseline; initialization and Hunter passes also update the baseline. |
 
 **Add a tract to ASU 1:** clear selection, click the tract, enter `1`, then
 Update Selected Tracts. Select ASU 1 to inspect totals and regenerate the review.
@@ -642,7 +659,7 @@ select it and update its value to `0`.
 | --- | --- |
 | LSS / CSV Export Directory | Existing folder on the machine running R, used for LSS and summary CSV exports. RDS and log saves choose their own location. |
 | Save Data As... | Opens a save dialog to choose a folder and filename for current map data and assignments. The suggested filename is `saved_data.rds`. Cancel leaves the data unchanged. |
-| Load Data / Browse | Restores a saved `.rds` map for editing. It does not restore a running search or all dashboard settings. |
+| Load Data / Browse | Restores a saved dashboard `.rds` sf map for editing and sets the Reset baseline. It does not start optimization, resume a search tree, or restore all settings. Use Warm-start RDS when launching CP-SAT to reoptimize saved ASUs. |
 
 The native save dialog is available in supporting browsers such as Chrome and
 Edge over HTTPS or localhost. Other browsers and insecure remote HTTP sessions
@@ -651,9 +668,13 @@ to choose a destination each time. Saves go to your computer even when R runs
 in an EC2 container. Automatic run logs remain on the R server.
 
 Save after initialization and at editing milestones. After restoring an RDS,
-continue editing directly. Before LSS export, upload the matching workbook in
-Data Initialization to establish the correct state, which the export uses.
-Do not initialize again unless you intend to build a new result.
+continue editing directly. For LSS export from a saved single-state result,
+upload the matching single-state workbook **before** loading the RDS: workbook
+upload clears the current map, and LSS labels use its state setting. Do not
+initialize again unless you intend to build a new result. The current LSS
+exporter is not a nationwide per-state export workflow; a display-state filter
+does not filter its output. Retain nationwide results as RDS/CSV and prepare
+and verify state-specific exports separately.
 
 ## ASU Review and Finalization
 
@@ -661,7 +682,7 @@ Do not initialize again unless you intend to build a new result.
 | --- | --- |
 | ASU Unemployment Rate Threshold | Review threshold in **percent**, initially `6.45`. |
 | ASU Population Threshold | Review population threshold, initially `10000`. |
-| Generate ASU Summary | Recalculates the table. Run again after edits or threshold changes. |
+| Generate ASU Summary | Enables the review table. Once generated, it reacts to assignment edits, newly loaded data, and review-threshold changes. |
 | Generate LSS .txt File | Writes assigned tracts to `lss_batch_file.txt`. Does not filter out failed groups or submit the file. |
 | Create Summary CSV | Writes `ASU_Review_File.csv`, including unassigned tracts, for tract-level review. |
 
@@ -670,9 +691,9 @@ population, and connectivity. `asu_qualified` requires all three. TRUE passes;
 FALSE needs attention. Contiguity uses the dashboard neighbor graph, including
 its island-connection handling; inspect unusual geographic connections.
 
-For borderline rates, inspect aggregate unemployment and labor force: the
-current review calculation rounds to five decimal places before comparison
-and displays three. Use thresholds appropriate to your analysis and program
+For borderline rates, inspect aggregate unemployment and labor force: review
+uses the unrounded aggregate rate for qualification and displays three decimal
+places. Use thresholds appropriate to your analysis and program
 guidance. Export buttons write current assignments even without a refreshed
 summary. Review first and retain an RDS checkpoint. Repeated exports overwrite
 the same filenames in the active save directory.
@@ -763,8 +784,9 @@ this machine; it does not attach to jobs on another server.
   additional solves. Stop Solve requests completion with available results.
 - **An edit affects too many tracts:** updates use the whole selection, not just
   percentile or table highlights.
-- **Files are missing:** check Current save directory and the success dialog.
-  Files are saved where R runs, not automatically in browser Downloads.
+- **Files are missing:** RDS and Save log as downloads go to the browser's chosen
+  destination. LSS/CSV exports use Current save directory on the R server;
+  automatic job logs/checkpoints stay in the job folder. Check the success dialog.
 - **Reporting an issue:** retain the log and note the algorithm, strategy,
   state, boundary year, settings, and last stage.
 
