@@ -23,7 +23,7 @@ asu_job_prepare <- function(folder, data, python, module_dir, strategy, settings
   if (!length(modules) || !all(file.copy(modules, file.path(folder, 'python'))))
     stop('Could not snapshot solver modules')
   # Resolve package/dev helper locations without depending on a future session.
-  helper <- getSrcFilename(asu_service_checkpoints, full.names = TRUE)
+  helper <- utils::getSrcFilename(asu_service_checkpoints, full.names = TRUE)
   if (!length(helper) || !file.exists(helper)) {
     helper <- file.path(module_dir, '..', '..', 'R', 'solver_checkpoint.R')
   }

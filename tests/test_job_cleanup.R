@@ -1,4 +1,5 @@
-source('R/solver_jobs.R')
+source(if (file.exists("tests/helpers.R")) "tests/helpers.R" else "helpers.R")
+asu_test_source('R/solver_jobs.R')
 test_job_cleanup <- function() {
   root <- tempfile('job-cleanup-test-')
   dir.create(root)

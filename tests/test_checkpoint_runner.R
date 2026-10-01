@@ -1,6 +1,7 @@
+source(if (file.exists("tests/helpers.R")) "tests/helpers.R" else "helpers.R")
 # Execute the dashboard's actual generated runner and service its RDS requests.
-source("R/solver_checkpoint.R")
-source("R/solver_jobs.R")
+asu_test_source("R/solver_checkpoint.R")
+asu_test_source("R/solver_jobs.R")
 run_checkpoint_runner <- function() {
   python <- Sys.getenv("ASU_TEST_PYTHON")
   if (!nzchar(python)) {
@@ -11,7 +12,7 @@ run_checkpoint_runner <- function() {
   dir.create(folder)
   on.exit(unlink(folder, recursive=TRUE),add=TRUE)
   script <- file.path(folder,"dashboard.R")
-  knitr::purl("inst/shiny_app/ASU_Flexdashboard_mapgl.Rmd",output=script,quiet=TRUE)
+  knitr::purl(asu_test_asset("shiny_app/ASU_Flexdashboard_mapgl.Rmd"),output=script,quiet=TRUE)
   find_runner <- function(expr) {
     if (missing(expr)) return(NULL)
     if (is.call(expr) && identical(expr[[1]],as.name("<-")) &&
@@ -29,7 +30,7 @@ run_checkpoint_runner <- function() {
   for (name in all.vars(expr)) assign(name,1L,settings)
   for (name in c("df_csv","nb_json","out_json","progress_json","stop_file","skip_file"))
     assign(name,file.path(folder,name),settings)
-  settings$py_mod_path <- normalizePath("inst/python",winslash="/")
+  settings$py_mod_path <- normalizePath(asu_test_asset("python"),winslash="/")
   settings$run_dir <- normalizePath(folder,winslash="/")
   settings$input <- list(cpsat_final_consolidation=FALSE,cpsat_polish_consolidated_asus=FALSE)
   settings$partition_seed_strategy <- "connectivity_free"

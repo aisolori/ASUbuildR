@@ -1,6 +1,7 @@
+source(if (file.exists("tests/helpers.R")) "tests/helpers.R" else "helpers.R")
 # Integration: launcher R exits, yet solver logs, checkpoints and final RDS survive.
-source('R/solver_checkpoint.R')
-source('R/solver_jobs.R')
+asu_test_source('R/solver_checkpoint.R')
+asu_test_source('R/solver_jobs.R')
 test_solver_jobs <- function() {
   python <- Sys.getenv('ASU_TEST_PYTHON')
   if (!nzchar(python)) return(cat('SKIP detached integration: set ASU_TEST_PYTHON\n'))
@@ -15,7 +16,7 @@ test_solver_jobs <- function() {
     tract_ASU_emp=c(70L,70L), geometry=sf::st_sfc(polygon,polygon,crs=4326))
   rscript <- file.path(R.home('bin'), 'Rscript')
   if (.Platform$OS.type == 'windows') rscript <- paste0(rscript, '.exe')
-  module_dir <- normalizePath('inst/python', winslash='/')
+  module_dir <- normalizePath(asu_test_asset('python'), winslash='/')
   prepare <- function(strategy) {
     folder <- asu_job_run_dir()
     asu_job_prepare(folder, data, python, module_dir, strategy)
@@ -58,7 +59,9 @@ test_solver_jobs <- function() {
   launcher <- file.path(root, 'launcher.R')
   writeLines(c(
     paste0('.libPaths(', paste(deparse(.libPaths()), collapse=''), ')'),
-    paste0('source(', deparse(normalizePath('R/solver_jobs.R', winslash='/')), ')'),
+    if (file.exists('R/solver_jobs.R'))
+      paste0('source(', deparse(normalizePath('R/solver_jobs.R', winslash='/')), ')')
+    else 'asu_job_launch <- getFromNamespace("asu_job_launch", "ASUbuildR")',
     paste0('asu_job_launch(', deparse(folder), ')'),
     'quit(save="no")'
   ), launcher)

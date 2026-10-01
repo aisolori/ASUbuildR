@@ -27,7 +27,6 @@ Imports:
     flexdashboard,
     RColorBrewer,
     mapgl,
-    markdown,
     htmlwidgets,
     rmarkdown,
     stringr,
@@ -44,8 +43,10 @@ Imports:
     ps,
     rappdirs
 LinkingTo: Rcpp
-SystemRequirements: C++11; Pandoc (>= 1.12.3); Python (>= 3.9) with packages: ortools, numpy, pandas, networkx, openpyxl, python-igraph
+SystemRequirements: Pandoc (>= 1.12.3); Python (>= 3.9) with packages: ortools, numpy, pandas, networkx, openpyxl, python-igraph
 Suggests:
+  httpuv,
+  writexl,
   callr,
   chromote,
   freestiler,

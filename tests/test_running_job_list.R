@@ -1,7 +1,8 @@
+source(if (file.exists("tests/helpers.R")) "tests/helpers.R" else "helpers.R")
 # Listing filters inactive jobs without deleting their saved artifacts.
 test_running_job_list <- function() {
   env <- new.env(parent = globalenv())
-  sys.source('R/solver_jobs.R', envir = env)
+  asu_test_source('R/solver_jobs.R', envir = env)
   root <- tempfile('running-job-list-')
   dir.create(root)
   on.exit(unlink(root, recursive = TRUE))

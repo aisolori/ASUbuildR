@@ -1,10 +1,11 @@
-source('R/solver_jobs.R')
+source(if (file.exists("tests/helpers.R")) "tests/helpers.R" else "helpers.R")
+asu_test_source('R/solver_jobs.R')
 test_job_dashboard <- function() {
   script <- tempfile(fileext='.R')
   folder <- tempfile('job-viewer-')
   dir.create(folder)
   on.exit(unlink(c(script,folder), recursive=TRUE))
-  knitr::purl('inst/shiny_app/ASU_Flexdashboard_mapgl.Rmd',output=script,quiet=TRUE)
+  knitr::purl(asu_test_asset("shiny_app/ASU_Flexdashboard_mapgl.Rmd"),output=script,quiet=TRUE)
   expressions <- as.list(parse(script))
   lhs <- function(e) if (is.call(e) && identical(e[[1]],as.name('<-')))
     paste(deparse(e[[2]]),collapse='') else ''
@@ -69,7 +70,7 @@ test_job_dashboard()
 test_attach_navigation <- function() {
   script <- tempfile(fileext = '.R')
   on.exit(unlink(script))
-  knitr::purl('inst/shiny_app/ASU_Flexdashboard_mapgl.Rmd', output = script, quiet = TRUE)
+  knitr::purl(asu_test_asset("shiny_app/ASU_Flexdashboard_mapgl.Rmd"), output = script, quiet = TRUE)
   expressions <- as.list(parse(script))
   observers <- Filter(function(e)
     is.call(e) && identical(paste(deparse(e[[1]]), collapse = ''), 'shiny::observeEvent') &&

@@ -39,6 +39,7 @@ build_asu(
   use_buffer_asu_merge = FALSE,
   buffer_asu_merge_time_limit = NA_real_,
   final_asu_polish_time_limit = NA_real_,
+  bridge_pair = NULL,
   verbose = interactive(),
   parallel_asus = 1L,
   use_flow_first_search = FALSE,
@@ -181,6 +182,9 @@ the polish repeats until no new merge occurs. \code{NA_real_} uses
 
 
 
+
+\item{bridge_pair}{deprecated compatibility argument; ignored because the
+bridge-pair phase has been removed.}
 
 \item{verbose}{logical; print CP-SAT logs}
 

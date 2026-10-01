@@ -12,6 +12,7 @@
 ^ASUbuildR_[0-9.]+\.tar\.gz$
 ^test folder($|/)
 ^tools($|/)
+^tests/benchmark_
 ^temp_.*\.R$
 ~\$
 

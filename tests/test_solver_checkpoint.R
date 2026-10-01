@@ -1,5 +1,6 @@
-source("R/solver_checkpoint.R")
-source("R/read_asu_warm_start.R")
+source(if (file.exists("tests/helpers.R")) "tests/helpers.R" else "helpers.R")
+asu_test_source("R/solver_checkpoint.R")
+asu_test_source("R/read_asu_warm_start.R")
 run_checkpoint_tests <- function() {
   folder <- tempfile("checkpoint-test-")
   dir.create(folder)
