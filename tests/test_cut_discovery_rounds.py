@@ -76,7 +76,8 @@ class CutDiscoveryRoundsTest(unittest.TestCase):
                 self.stop_calls += 1
 
         with patch.object(solver.cp_model, "CpSolver", FakeSolver), \
-                patch.object(solver, "_configure_asu_solver_portfolio"), contextlib.redirect_stdout(output):
+                patch.object(solver, "_configure_asu_solver_portfolio"), \
+                patch.object(solver, "_configure_partition_cut_solver"), contextlib.redirect_stdout(output):
             result = solver._joint_connectivity_cut_pass(
                 model, [row], [roots], nb, np.full(n, 10), [[0]], valid,
                 deadline, 2, lambda: cancelled[0], log=True, objective=objective,

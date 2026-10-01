@@ -71,7 +71,7 @@ except Exception:
 
 
 # ---------- Helpers ----------
-_CUT_ROUND_SECONDS = 5.0
+_CUT_ROUND_SECONDS = 2.5
 
 
 def _configure_cut_round_params(params, seconds=None):
@@ -89,6 +89,40 @@ def _new_asu_solver():
     solver.parameters.symmetry_level = 3
     solver.parameters.symmetry_detection_deterministic_time_limit = 1.0
     return solver
+
+
+def _configure_partition_cut_solver(params, workers):
+    """Use a bounded portfolio for short partition connectivity-cut rounds.
+
+    At most 16 workers share each short solve. Keep LP, no-LP, bound-search,
+    and probing workers as the worker budget permits, using stock parameters
+    rather than the long flow solve's expensive custom probing variants.
+    Presolve and LP strengthening stay enabled, while symmetry detection and
+    both probing budgets are capped at .05 deterministic time. This does
+    not change SAT inprocessing or the configured wall-time limit; the caller
+    applies the cut-round deadline separately. Exact flow solves retain the
+    common ASU portfolio and the user's full worker count.
+    """
+    workers = min(16, max(1, int(workers)))
+    params.num_search_workers = workers
+    params.cp_model_presolve = True
+    params.linearization_level = 2
+    params.symmetry_level = 1
+    params.symmetry_detection_deterministic_time_limit = .05
+    params.cp_model_probing_level = 1
+    params.probing_deterministic_time_limit = .05
+    # CP presolve has a separate, much larger probing budget in newer builds.
+    if hasattr(params, "presolve_probing_deterministic_time_limit"):
+        params.presolve_probing_deterministic_time_limit = .05
+    params.extra_subsolvers.clear()
+    params.subsolvers.clear()
+    params.filter_subsolvers.clear()
+    params.ignore_subsolvers.clear()
+    params.subsolver_params.clear()
+    params.shared_tree_num_workers = 0
+    full_subsolvers = ["max_lp", "no_lp", "objective_lb_search", "probing"][:workers]
+    params.subsolvers.extend(full_subsolvers)
+    params.num_full_subsolvers = len(full_subsolvers)
 
 
 _stage_total_provider = ContextVar('asu_stage_total_provider', default=None)
@@ -196,7 +230,7 @@ class _ValidUnempStall:
     def __init__(self, baseline):
         self.best = baseline
         self.rounds = 0
-        self.limit = 50
+        self.limit = 30
 
     def observe(self, value):
         if value > self.best:
@@ -1465,7 +1499,7 @@ _ASU_FULL_SUBSOLVER_PATTERN = (
     "quick_restart_no_lp",
     "variables_shaving_no_lp",
     "max_lp",
-    "probing",
+    "portfolio_max_lp",
     "asu_probe_mega_deep",
 
     "reduced_costs",
@@ -3916,7 +3950,7 @@ def solve_one_asu_cpsat(
         _scout.parameters.max_time_in_seconds = _SCOUT_SECS
         _scout.parameters.log_search_progress = False
         _scout.parameters.cp_model_presolve = True
-        _scout.parameters.linearization_level = 1
+        _scout.parameters.linearization_level = 2
         _scout.parameters.cp_model_probing_level = 2
         _scout.parameters.cut_level = 1
         if configure_subsolvers:
@@ -4171,7 +4205,7 @@ def solve_one_asu_cpsat(
         solver.parameters.num_search_workers = max(1, int(workers))
         solver.parameters.log_search_progress = False  # silent; summary logged after loop
         solver.parameters.cp_model_presolve = True
-        solver.parameters.linearization_level = 1
+        solver.parameters.linearization_level = 2
         if configure_subsolvers:
             _configure_asu_solver_portfolio(
                 solver.parameters,
@@ -4469,7 +4503,7 @@ def solve_one_asu_cpsat(
             proof_solver.parameters.max_time_in_seconds = proof_remaining
             proof_solver.parameters.log_search_progress = bool(log)
             proof_solver.parameters.cp_model_presolve = True
-            proof_solver.parameters.linearization_level = 1
+            proof_solver.parameters.linearization_level = 2
             if configure_subsolvers:
                 _configure_asu_solver_portfolio(
                     proof_solver.parameters,
@@ -4701,7 +4735,7 @@ def solve_one_asu_cpsat(
                     params,
                     "asu_flow_capacity_hybrid",
                     search_branching=cp_model.PARTIAL_FIXED_SEARCH,
-                    linearization_level=1,
+                    linearization_level=2,
                     root_lp_iterations=25_000,
                     add_lp_constraints_lazily=False,
                     max_cut_rounds_at_level_zero=10,
@@ -5425,7 +5459,7 @@ def solve_one_asu_cpsat(
                 tie_solver.parameters.max_time_in_seconds = tie_stage_secs
                 tie_solver.parameters.log_search_progress = False
                 tie_solver.parameters.cp_model_presolve = True
-                tie_solver.parameters.linearization_level = 1
+                tie_solver.parameters.linearization_level = 2
                 if configure_subsolvers:
                     _configure_asu_solver_portfolio(
                         tie_solver.parameters,
@@ -6595,7 +6629,7 @@ def solve_local_repair(
     solver.parameters.max_time_in_seconds = float(time_limit)
     solver.parameters.log_search_progress = False
     solver.parameters.cp_model_presolve = True
-    solver.parameters.linearization_level = 1
+    solver.parameters.linearization_level = 2
     solver.parameters.random_seed = int(random_seed)
     _configure_asu_solver_portfolio(solver.parameters, num_workers)
 
@@ -6984,7 +7018,7 @@ def solve_connectivity_free_relaxation(
     solver.parameters.num_search_workers = max(1, int(workers))
     solver.parameters.max_time_in_seconds = max(0.01, float(time_limit))
     solver.parameters.cp_model_presolve = True
-    solver.parameters.linearization_level = 1
+    solver.parameters.linearization_level = 2
     solver.parameters.log_search_progress = False
     _configure_asu_solver_portfolio(solver.parameters, workers)
 
@@ -7448,6 +7482,55 @@ def _polish_attempt_key(root, selected, window, tau, pop_thresh, ownership=None)
     return key if ownership is None else key + (tuple(map(int, ownership)),)
 
 
+def _contract_profitable_polish_members(members, nb, u, employed, tau, donor_count):
+    """Contract only the mutual implications already present in polish.
+
+    Positive-profit, nonnegative-surplus neighbors imply one another. Donors
+    stay separate (and last) because their discounted profit is zero and their
+    identities participate in consolidation tie-breaking. Zero-profit corridor
+    nodes are deliberately not contracted or removed.
+    """
+    num, den = as_fraction_tau(tau)
+    free_count = len(members) - donor_count
+    owner = {v: i for i, group in enumerate(members) for v in group}
+    eligible = {
+        i for i, group in enumerate(members[:free_count])
+        if sum(int(u[v]) for v in group) > 0
+        and sum(den * int(u[v]) - num * int(employed[v]) for v in group) >= 0
+    }
+    visited, contracted = set(), []
+    for i in range(free_count):
+        if i in visited:
+            continue
+        visited.add(i)
+        queue = [i]
+        if i in eligible:
+            for j in queue:
+                for v in members[j]:
+                    for w in nb[v]:
+                        k = owner[w]
+                        if k in eligible and k not in visited:
+                            visited.add(k)
+                            queue.append(k)
+        contracted.append(sorted(v for j in queue for v in members[j]))
+    return contracted + members[free_count:]
+
+
+def _closed_polish_selection(selected, closure_edges):
+    """Complete a feasible selection under the model's profitable closure."""
+    implications = {}
+    for source, target in closure_edges:
+        implications.setdefault(source, []).append(target)
+    closed = set(selected)
+    queue = list(closed)
+    for source in queue:
+        for target in implications.get(source, ()):
+            if target not in closed:
+                closed.add(target)
+                queue.append(target)
+    return closed
+
+
 def _solve_supernode_polish(nb_local, u_g, E_g, P_g, tau, pop_thresh,
                            root_local, time_limit, workers, *, assignments,
                            asu_number, hint, rel_gap=None,
@@ -7458,13 +7541,15 @@ def _solve_supernode_polish(nb_local, u_g, E_g, P_g, tau, pop_thresh,
                            use_flow_capacity_hybrid_search=False,
                            deterministic_ties=True,
                            tie_break_rank=None, use_surplus_path_repair=True,
+                           use_profitable_contraction=True,
                            **unused_options):
     """Polish with optional whole donor ASUs; obj excludes already captured donors.
 
     Returns original local tract indices, never quotient-node indices. Donors
     must be complete connected valid ASUs within the supplied window. Selection
     of a donor contracts its whole connected subgraph and later absorbs it.
-    Quotient-graph cuts start at 10 rounds / 5 stalled upper-bound rounds.
+    Quotient-graph cuts start at 100 rounds / 25 stalled upper-bound rounds,
+    with earlier handoff after three rounds with no new cut, gain, or bound.
     Before separation, surplus, reduced-cost path, conditional objective,
     separator, distance/count, and bridge-block bounds prune unreachable nodes.
     Adaptive surplus-priced path repair supplies feasible hints during cuts,
@@ -7499,6 +7584,11 @@ def _solve_supernode_polish(nb_local, u_g, E_g, P_g, tau, pop_thresh,
         return fallback
     members = [[i] for i, label in enumerate(assignments)
                if label <= 0 or label == asu_number] + donors
+    uncontracted_nodes = len(members)
+    # Tiny models solve cheaply already; avoid rebuilding their quotient.
+    if use_profitable_contraction and uncontracted_nodes >= 64:
+        members = _contract_profitable_polish_members(
+            members, nb_local, u_g, E_g, tau, len(donors))
     n = len(members)
     owner = {node: group for group, nodes in enumerate(members) for node in nodes}
     root = owner[root_local]
@@ -7652,11 +7742,7 @@ def _solve_supernode_polish(nb_local, u_g, E_g, P_g, tau, pop_thresh,
     conditional_active = _lagrangian_conditional_bounds(
         active_profit, active_q, {active_root}
     )
-    conditional_rows = 0
-    for node, bound in zip(active, conditional_active):
-        if node != root and bound < upper:
-            model.Add(objective <= int(bound)).OnlyEnforceIf(x[node])
-            conditional_rows += 1
+    conditional_bounds = dict(zip(active, map(int, conditional_active)))
 
     # Connect node reachability to positive q actually selected, not merely to
     # all optimistic q in the window.
@@ -7686,24 +7772,30 @@ def _solve_supernode_polish(nb_local, u_g, E_g, P_g, tau, pop_thresh,
             quotient, profit, q, root, fixed_zero
         )
     )
-    reduced_coefficients_safe = (
-        abs(int(reduced_den)) * max(abs(baseline), abs(upper)) < 2**62
-        and abs(int(reduced_upper)) < 2**62
-    )
-    if reduced_coefficients_safe:
-        model.Add(int(reduced_den) * objective <= int(reduced_upper))
-    reduced_path_rows = 0
+    # For binary x and integer z, d*z + D*x <= U is equivalent to
+    # z <= floor(U/d) and x => z <= floor((U-D)/d). Combine that second
+    # bound with the conditional Lagrangian bound. Interpolating the two
+    # integer endpoints keeps a strong linear row without large d coefficients.
+    if reduced_den > 0:
+        upper = min(upper, int(reduced_upper) // int(reduced_den))
+        if upper < baseline:
+            return fallback
+        model.Add(objective <= upper)
+    reduced_path_rows = conditional_rows = objective_bound_rows = 0
     for node in active:
+        if node == root:
+            continue
+        bound = conditional_bounds[node]
         distance = reduced_distance[node]
-        if (reduced_coefficients_safe and distance and
-                abs(int(reduced_den)) * max(abs(baseline), abs(upper))
-                + abs(int(distance)) < 2**62 and
-                abs(int(reduced_upper)) < 2**62):
-            model.Add(
-                int(reduced_den) * objective + int(distance) * x[node]
-                <= int(reduced_upper)
-            )
-            reduced_path_rows += 1
+        path_bound = upper
+        if reduced_den > 0 and distance is not None:
+            path_bound = (int(reduced_upper) - int(distance)) // int(reduced_den)
+        if min(bound, path_bound) < upper:
+            reduced_path_rows += int(path_bound < bound)
+            conditional_rows += int(bound <= path_bound)
+            bound = max(baseline - 1, min(bound, path_bound))
+            model.Add(objective + (upper - bound) * x[node] <= upper)
+            objective_bound_rows += 1
 
     # Rate-only cardinality and graph distance are cheap projections of the
     # eventual flow formulation and tighten every flow-free separation round.
@@ -7734,17 +7826,33 @@ def _solve_supernode_polish(nb_local, u_g, E_g, P_g, tau, pop_thresh,
     )
     for node, separator in separator_implications:
         model.AddBoolOr([x[node].Not()] + [x[cut] for cut in separator])
+    separator_activations = []
     for index, (separator, affected, k_bound) in enumerate(separator_bounds):
         activation = model.NewBoolVar(f'polish_separator_{index}')
         model.Add(activation <= sum(x[cut] for cut in separator))
         model.Add(sum(x[node] for node in affected) <= int(k_bound) * activation)
+        separator_activations.append((activation, separator))
 
     closure_edges = _profitable_closure_edges(quotient, profit, q)
     for neighbor, profitable in closure_edges:
         model.Add(x[neighbor] <= x[profitable])
-    model.AddHint(objective, baseline)
-    for i in range(n):
-        model.AddHint(x[i], int(i in selected_hint))
+    def refresh_polish_hint(target_model, groups):
+        # An economic/connectivity incumbent may omit a profitable neighbor
+        # required by closure. Add those nodes before completing all auxiliaries.
+        closed = _closed_polish_selection(groups[0], closure_edges)
+        values = {x[i].Index(): int(i in closed) for i in range(n)}
+        values[objective.Index()] = sum(profit[i] for i in closed)
+        values[positive_q_selected.Index()] = sum(max(0, q[i]) for i in closed)
+        values[selected_count.Index()] = len(closed)
+        for activation, separator in separator_activations:
+            values[activation.Index()] = int(any(i in closed for i in separator))
+        target_model.ClearHints()
+        for index, variable in enumerate(target_model.Proto().variables):
+            if len(variable.domain) == 2 and variable.domain[0] == variable.domain[1]:
+                values[index] = int(variable.domain[0])
+        for index, value in values.items():
+            target_model.AddHint(target_model.GetIntVarFromProtoIndex(index), int(value))
+
     if log:
         _stage_print(f'[STAGE] FINAL_POLISH_SUPERNODES asu={asu_number} '
                      f'tracts={len(assignments)} model_nodes={n} donors={len(donors)} '
@@ -7756,6 +7864,8 @@ def _solve_supernode_polish(nb_local, u_g, E_g, P_g, tau, pop_thresh,
                      f'surplus_path_rows={surplus_path_rows} '
                      f'reduced_path_rows={reduced_path_rows} '
                      f'conditional_rows={conditional_rows} distance_rows={distance_rows} '
+                     f'objective_bound_rows={objective_bound_rows} '
+                     f'contracted_nodes={uncontracted_nodes - n} '
                      f'separator_rows={len(separator_implications) + len(separator_bounds)} '
                      f'closure_rows={len(closure_edges)} lagrangian_price={reduced_price}',
                      flush=True)
@@ -7796,6 +7906,7 @@ def _solve_supernode_polish(nb_local, u_g, E_g, P_g, tau, pop_thresh,
 
     cut_model = model
     root_rows = [[model.NewConstant(int(i == root)) for i in range(n)]]
+    refresh_polish_hint(cut_model, [selected_hint])
     seen_cuts = set()
     cycle, cut_round_limit, cut_stall_limit = 1, 100, 25
     flow_stall_limit = incumbent_stall_seconds
@@ -7825,7 +7936,8 @@ def _solve_supernode_polish(nb_local, u_g, E_g, P_g, tau, pop_thresh,
             seen_cuts=seen_cuts, initial_upper_bound=upper if cycle > 1 else None,
             stage_prefix='FINAL_POLISH_SUPERNODES', proof_out=cut_proof, bound_out=cut_bounds,
             round_seconds=_CUT_ROUND_SECONDS, stop_on_new_cuts=False,
-            repair_candidate=repair_cut_candidate if use_surplus_path_repair else None)
+            repair_candidate=repair_cut_candidate if use_surplus_path_repair else None,
+            refresh_hint=refresh_polish_hint)
         if cut_bounds and cut_bounds[0] is not None:
             upper = min(upper, cut_bounds[0])
         selected_hint = set(best[0])
@@ -7845,10 +7957,7 @@ def _solve_supernode_polish(nb_local, u_g, E_g, P_g, tau, pop_thresh,
             # Fix the proved primary optimum while completing the flow model for
             # the existing deterministic consolidation/surplus/size tie-breaks.
             model.Add(objective == best_obj)
-        model.ClearHints()
-        model.AddHint(objective, best_obj)
-        for i in range(n):
-            model.AddHint(x[i], int(i in selected_hint))
+        refresh_polish_hint(model, [selected_hint])
         # Only the clone receives flows. The base keeps every cut and bound
         # and remains flow-free for the next separation cycle. Variables retain
         # their indices in a clone, so x/objective/root_rows address both models.
@@ -7902,7 +8011,8 @@ def _solve_supernode_polish(nb_local, u_g, E_g, P_g, tau, pop_thresh,
         def direction_cap(node):
             return max(0, flow_limit - root_distances[node])
 
-        hints = _spanning_tree_flows(sorted(selected_hint), quotient, root)
+        hints = _spanning_tree_flows(
+            sorted(_closed_polish_selection(selected_hint, closure_edges)), quotient, root)
         net = [[] for _ in range(n)]
         for i in range(n):
             if i % 128 == 0:
@@ -8060,10 +8170,7 @@ def _solve_supernode_polish(nb_local, u_g, E_g, P_g, tau, pop_thresh,
                 return fallback
             cut_model.Add(objective >= best_obj)
             cut_model.Add(objective <= upper)
-            cut_model.ClearHints()
-            cut_model.AddHint(objective, best_obj)
-            for i in range(n):
-                cut_model.AddHint(x[i], int(i in selected_hint))
+            refresh_polish_hint(cut_model, [selected_hint])
             cycle += 1
             cut_round_limit *= 2
             cut_stall_limit *= 2
@@ -8490,7 +8597,9 @@ def _joint_connectivity_cut_pass(model, x, root_rows, nb, u,
                                  proof_out=None, bound_stall_only=False, bound_out=None,
                                  seen_cuts=None, initial_upper_bound=None,
                                  repair_candidate=None, round_seconds=_CUT_ROUND_SECONDS,
-                                 objective_floor=None, stop_on_new_cuts=False):
+                                 objective_floor=None, stop_on_new_cuts=False,
+                                 no_progress_round_limit=3, cut_sample_limit=8,
+                                 cut_rows_per_round=128, refresh_hint=None):
     """Solve/add root-aware cuts before flows; never publish disconnected groups.
 
     For v in C: x[v] <= sum(root[C]) + sum(x[boundary(C)]). A connected
@@ -8499,6 +8608,13 @@ def _joint_connectivity_cut_pass(model, x, root_rows, nb, u,
     bound_stall_only removes early connected-feasible and no-new-cut exits,
     but respects the supplied round/cut caps and the fixed 50-round valid
     unemployment stall limit. Only strict valid gains reset that counter.
+    In that mode, consecutive rounds without new cuts, a strict connected
+    incumbent gain, or a tighter certified bound hand off to exact flow.
+    Set no_progress_round_limit to None or zero to disable this handoff.
+    Bounded callback samples and the final response contribute new cuts.
+    refresh_hint(model, groups) can provide complete caller-specific hints;
+    otherwise strict gains replace stale auxiliaries with partial x/objective
+    hints. Neither cuts nor hints mutate the model during Solve.
     Proof, cancellation, invalidity,
     and deadline still stop.
     Every round has a five-second solver limit (or a shorter supplied deadline).
@@ -8514,12 +8630,38 @@ def _joint_connectivity_cut_pass(model, x, root_rows, nb, u,
     best_obj = sum(int(u[unit].sum()) for unit in best)
     seen = seen_cuts if seen_cuts is not None else set()
     rows, rounds, status_name = 0, 0, "DISABLED"
+    no_progress = 0
+    no_progress_limit = (max(0, int(no_progress_round_limit))
+                         if bound_stall_only and no_progress_round_limit else 0)
+    sample_limit = max(0, int(cut_sample_limit))
+    round_row_limit = max(1, int(cut_rows_per_round))
     bound_stall = _UpperBoundStall(upper_bound_stall_rounds)
     valid_stall = _ValidUnempStall(best_obj)
     stop_reason = None
     proved_connected_optimal = False
     cached = None
     reused, stored = 0, 0
+
+    def update_hint():
+        if refresh_hint is not None:
+            refresh_hint(model, best)
+            return
+        # Roots, counts, and activity from the old assignment can conflict with
+        # the new x values. Replace them with a consistent partial hint.
+        model.ClearHints()
+        if isinstance(objective, cp_model.IntVar):
+            model.AddHint(objective, best_obj)
+        for row, unit in zip(x, best):
+            selected = set(unit)
+            for i, var in enumerate(row):
+                model.AddHint(var, int(i in selected))
+
+    def solver_metric(engine, method):
+        try:
+            return getattr(engine, method)()
+        except (AttributeError, TypeError, ValueError, RuntimeError):
+            return "NA"
+
     if cut_cache is not None:
         global_nodes = list(range(len(nb))) if global_nodes is None else list(global_nodes)
         cached = cut_cache.window(global_nodes, nb)
@@ -8552,6 +8694,8 @@ def _joint_connectivity_cut_pass(model, x, root_rows, nb, u,
               f"baseline_unemp={best_obj} time_limit={max(0, deadline-started):.3f}s "
               f"max_rounds={max_rounds} cut_limit={cut_limit} workers={workers} "
               f"valid_unemp_stall_limit={valid_stall.limit} "
+              f"no_progress_limit={no_progress_limit} sample_limit={sample_limit} "
+              f"round_cut_limit={round_row_limit} "
               f"round_time_limit={min(_CUT_ROUND_SECONDS, math.inf if round_seconds is None else round_seconds):.3f}s "
               "stop_on_new_cuts=False", flush=True)
     round_number = 0
@@ -8564,10 +8708,15 @@ def _joint_connectivity_cut_pass(model, x, root_rows, nb, u,
             break
         scout = _new_asu_solver()
         scout.parameters.num_search_workers = max(1, int(workers))
-        _configure_asu_solver_portfolio(scout.parameters, workers)
         _configure_cut_round_params(
             scout.parameters, remaining if round_seconds is None else min(round_seconds, remaining))
+        if bound_stall_only:
+            _configure_partition_cut_solver(scout.parameters, workers)
+        else:
+            _configure_asu_solver_portfolio(scout.parameters, workers)
         done, interrupted = threading.Event(), []
+        previous_best, previous_bound = best_obj, upper_bound
+        round_budget = min(round_row_limit, cut_limit - rows)
 
         class CutDiscovery(cp_model.CpSolverSolutionCallback):
             def __init__(self):
@@ -8576,6 +8725,9 @@ def _joint_connectivity_cut_pass(model, x, root_rows, nb, u,
                 self.detached = 0
                 self.best = None
                 self.best_obj = best_obj
+                self.sampled = set()
+                self.cut_keys = set()
+                self.solutions = 0
 
             def on_solution_callback(self):
                 reason = cancellation()
@@ -8585,13 +8737,23 @@ def _joint_connectivity_cut_pass(model, x, root_rows, nb, u,
                     self.StopSearch()
                     return
                 groups = [[i for i, var in enumerate(row) if self.BooleanValue(var)] for row in x]
+                self.solutions += 1
                 if valid_candidate(groups):
                     value = sum(int(u[unit].sum()) for unit in groups)
                     if value >= self.best_obj:
                         self.best, self.best_obj = groups, value
-                elif not self.cuts:
-                    self.cuts, self.detached = _joint_new_connectivity_cuts(
-                        groups, root_rows, nb, u, self.BooleanValue, seen, cut_limit - rows)
+                elif (len(self.sampled) < sample_limit and len(self.cuts) < round_budget
+                      and time.monotonic() < deadline):
+                    sample = tuple(tuple(unit) for unit in groups)
+                    if sample not in self.sampled:
+                        self.sampled.add(sample)
+                        cuts, detached = _joint_new_connectivity_cuts(
+                            groups, root_rows, nb, u, self.BooleanValue,
+                            seen | self.cut_keys, round_budget - len(self.cuts))
+                        self.cuts.extend(cuts)
+                        self.cut_keys.update((k, target, region)
+                                             for k, target, region, _ in cuts)
+                        self.detached = max(self.detached, detached)
                 # Keep searching after discovering cuts; retain connected
                 # improvements without mutating the live model.
 
@@ -8613,53 +8775,48 @@ def _joint_connectivity_cut_pass(model, x, root_rows, nb, u,
             done.set()
             watcher.join()
         rounds = round_number
+        reason = cancellation()
+        if reason and not interrupted:
+            interrupted.append(reason)
         status_name = interrupted[0] if interrupted else scout.StatusName(status)
         round_end = interrupted[0] if interrupted else "SOLVER_RETURNED"
         if discovery.best is not None and discovery.best_obj >= best_obj:
             best, best_obj = discovery.best, discovery.best_obj
-            if objective is not None:
+            if objective is not None and best_obj > previous_best:
                 model.Add(objective >= best_obj)
             if report is not None:
                 report([i for unit in best for i in unit], best_obj)
-        if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-            if bound_stall_only and status == cp_model.UNKNOWN and not interrupted:
-                bound = scout.BestObjectiveBound()
-                if (objective is not None and math.isfinite(bound)
-                        and max(best_obj, objective_floor or 0) <= bound < 2**53):
-                    candidate_bound = math.ceil(bound)
-                    if upper_bound is None or candidate_bound < upper_bound:
-                        upper_bound = candidate_bound
-                        model.Add(objective <= upper_bound)
-                stalled = bound_stall.observe(upper_bound)
-                valid_stalled = valid_stall.observe(best_obj)
-                if log:
-                    _stage_print(f'[STAGE] {stage_prefix}_CUT_ROUND round={round_number} '
-                                 f'status={status_name} round_end={round_end} upper_bound={upper_bound} '
-                                 f'upper_bound_stall={bound_stall.rounds}/{upper_bound_stall_rounds} '
-                                 f'valid_unemp={best_obj} valid_unemp_stall={valid_stall.rounds}/{valid_stall.limit}',
-                                 flush=True)
-                if not stalled and not valid_stalled:
-                    continue
-                stop_reason = 'UPPER_BOUND_STALL' if stalled else 'VALID_UNEMP_STALL'
+        has_solution = status in (cp_model.OPTIMAL, cp_model.FEASIBLE)
+        if not has_solution and not (
+                bound_stall_only and status == cp_model.UNKNOWN and not interrupted):
+            if best_obj > previous_best:
+                update_hint()
             break
-        groups = [[i for i, var in enumerate(row) if scout.BooleanValue(var)] for row in x]
-        connected = valid_candidate(groups)
-        value = sum(int(u[unit].sum()) for unit in groups)
+        groups = ([[i for i, var in enumerate(row) if scout.BooleanValue(var)] for row in x]
+                  if has_solution else None)
+        connected = bool(has_solution and valid_candidate(groups))
+        value = sum(int(u[unit].sum()) for unit in groups) if has_solution else None
         # This is an upper bound on the relaxation, hence also on every
         # connected solution. Never substitute the relaxed incumbent value.
         # Round upward conservatively; ignore unusable/default response bounds.
         bound = scout.BestObjectiveBound()
         if (objective is not None and math.isfinite(bound)
-                and max(value, best_obj) <= bound < 2**53):
+                and max(value or 0, best_obj, objective_floor or 0) <= bound < 2**53):
             candidate_bound = math.ceil(bound)
             if upper_bound is None or candidate_bound < upper_bound:
                 upper_bound = candidate_bound
                 model.Add(objective <= upper_bound)
         if connected and value >= best_obj:
+            old_best = best_obj
             best, best_obj = groups, value
+            if objective is not None and best_obj > old_best:
+                model.Add(objective >= best_obj)
             if report is not None:
                 report([i for unit in best for i in unit], value)
-        if not connected and not interrupted and repair_candidate is not None:
+        if best_obj > previous_best:
+            update_hint()
+        if (has_solution and not connected and not interrupted
+                and repair_candidate is not None and time.monotonic() < deadline):
             repaired = repair_candidate(groups, best)
             reason = cancellation()
             if reason:
@@ -8672,12 +8829,7 @@ def _joint_connectivity_cut_pass(model, x, root_rows, nb, u,
                     best, best_obj = repaired, repaired_value
                     if objective is not None:
                         model.Add(objective >= best_obj)
-                        model.ClearHints()
-                        model.AddHint(objective, best_obj)
-                        for row, unit in zip(x, best):
-                            selected = set(unit)
-                            for i, var in enumerate(row):
-                                model.AddHint(var, int(i in selected))
+                    update_hint()
                     if report is not None:
                         report([i for unit in best for i in unit], best_obj)
                     if log:
@@ -8690,16 +8842,21 @@ def _joint_connectivity_cut_pass(model, x, root_rows, nb, u,
             # flow model and also matches its best possible objective.
             proved_connected_optimal = True
         added, detached = 0, 0
-        if not interrupted:
+        if not interrupted and time.monotonic() < deadline:
             cuts = []
-            if discovery.cuts:
-                cuts, detached = discovery.cuts, discovery.detached
-            elif not connected:
-                cuts, detached = _joint_new_connectivity_cuts(
-                    groups, root_rows, nb, u, scout.BooleanValue, seen, cut_limit - rows)
+            detached = discovery.detached
+            # Prioritize the final relaxed incumbent even when earlier samples
+            # filled the callback budget; the merged row batch stays bounded.
+            if has_solution and not connected:
+                cuts, final_detached = _joint_new_connectivity_cuts(
+                    groups, root_rows, nb, u, scout.BooleanValue, seen, round_budget)
+                detached = max(detached, final_detached)
+            cuts.extend(discovery.cuts)
             for k, target, region, boundary in cuts:
                 key = (k, target, region)
-                if key in seen or rows >= cut_limit:
+                if added >= round_budget or time.monotonic() >= deadline:
+                    break
+                if key in seen:
                     continue
                 seen.add(key)
                 model.Add(x[k][target] <= sum(root_rows[k][v] for v in region)
@@ -8709,6 +8866,10 @@ def _joint_connectivity_cut_pass(model, x, root_rows, nb, u,
                 if cached is not None:
                     stored += int(cut_cache.remember(
                         cached, global_nodes[target], [global_nodes[v] for v in region]))
+        bound_improved = (upper_bound is not None
+                          and (previous_bound is None or upper_bound < previous_bound))
+        made_progress = added > 0 or best_obj > previous_best or bound_improved
+        no_progress = 0 if made_progress else no_progress + 1
         if log:
             _stage_print(f"[STAGE] {stage_prefix}_CUT_ROUND round={round_number} "
                   f"status={status_name} round_end={round_end} relaxed_unemp={value} connected={connected} "
@@ -8716,7 +8877,18 @@ def _joint_connectivity_cut_pass(model, x, root_rows, nb, u,
                   f"valid_unemp={best_obj} upper_bound={upper_bound} "
                   f"upper_bound_stall={bound_stall.rounds}/{upper_bound_stall_rounds} "
                   f"valid_unemp_stall={valid_stall.rounds}/{valid_stall.limit} "
+                  f"no_progress={no_progress}/{no_progress_limit} "
+                  f"callback_solutions={discovery.solutions} cut_samples={len(discovery.sampled)} "
+                  f"solver_workers={scout.parameters.num_search_workers} "
+                  f"solver_wall={solver_metric(scout, 'WallTime')} "
+                  f"solver_branches={solver_metric(scout, 'NumBranches')} "
+                  f"solver_conflicts={solver_metric(scout, 'NumConflicts')} "
                   f"elapsed={time.monotonic()-started:.3f}s", flush=True)
+        if interrupted or proved_connected_optimal:
+            break
+        if no_progress_limit and no_progress >= no_progress_limit:
+            stop_reason = "NO_PROGRESS"
+            break
         if (upper_bound_stall_rounds is not None
                 and bound_stall.rounds >= max(1, int(upper_bound_stall_rounds))):
             stop_reason = "UPPER_BOUND_STALL"
@@ -8724,8 +8896,7 @@ def _joint_connectivity_cut_pass(model, x, root_rows, nb, u,
         if valid_stall.rounds >= valid_stall.limit:
             stop_reason = "VALID_UNEMP_STALL"
             break
-        if (interrupted or proved_connected_optimal
-                or (not bound_stall_only and (connected or not added))):
+        if not bound_stall_only and (connected or not added):
             break
     else:
         stop_reason = 'ROUND_LIMIT'
@@ -10347,7 +10518,7 @@ def solve_asu_graph_cut_only(
         solver.parameters.num_search_workers = max(1, int(workers))
         solver.parameters.log_search_progress = False
         solver.parameters.cp_model_presolve = True
-        solver.parameters.linearization_level = 1
+        solver.parameters.linearization_level = 2
         _configure_asu_solver_portfolio(solver.parameters, workers)
 
         _configure_cut_round_params(solver.parameters, remaining)

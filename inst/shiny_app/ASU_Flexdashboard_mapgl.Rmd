@@ -40,16 +40,17 @@ table.dataTable td {
 
 <script>
 (function registerAsuTooltipState() {
-  if (!window.Shiny || !window.HTMLWidgets) {
+  if (!window.Shiny || !window.Shiny.addCustomMessageHandler ||
+      !window.HTMLWidgets || !window.HTMLWidgets.find) {
     window.setTimeout(registerAsuTooltipState, 50);
     return;
   }
   if (window._asuTooltipStateHandlerInstalled) return;
-  window._asuTooltipStateHandlerInstalled = true;
   window._asuTooltipState = window._asuTooltipState || {};
   window._asuTooltipInstallTimers = window._asuTooltipInstallTimers || {};
 
-  window.Shiny.addCustomMessageHandler("asu-show-initial-asu", function() {
+  window.Shiny.addCustomMessageHandler("asu-show-initial-asu", function(message) {
+    // Shiny requires exactly one declared argument, even for an empty message.
     // Use flexdashboard navigation so tab activation, URL and resize agree.
     window.FlexDashboardUtils.showPage("#section-load-initial-asu");
   });
@@ -73,13 +74,17 @@ table.dataTable td {
   function installTooltip(mapId) {
     var widget = window.HTMLWidgets.find("#" + mapId);
     var map = widget && widget.getMap ? widget.getMap() : null;
-    if (!map || !map.getLayer || !map.getLayer("basemap")) {
+    // getStyle() safely returns undefined before a style exists; getLayer()
+    // does not. Do not wait for isStyleLoaded(): unrelated source tiles can
+    // still be loading while the tract layer is already visible and interactive.
+    if (!map || !map.getStyle || !map.getStyle() ||
+        !map.getLayer || !map.getLayer("basemap") ||
+        !window.maplibregl || !window.maplibregl.Popup) {
       return false;
     }
     if (map._asuDynamicTooltipInstalled) return true;
-    map._asuDynamicTooltipInstalled = true;
 
-    var popup = new maplibregl.Popup({
+    var popup = new window.maplibregl.Popup({
       closeButton: false,
       closeOnClick: false,
       maxWidth: "400px"
@@ -106,11 +111,17 @@ table.dataTable td {
       map.getCanvas().style.cursor = "";
       popup.remove();
     });
+    map._asuDynamicTooltipInstalled = true;
     return true;
   }
 
   function ensureTooltip(mapId) {
-    if (installTooltip(mapId) || window._asuTooltipInstallTimers[mapId]) return;
+    if (installTooltip(mapId)) {
+      window.clearInterval(window._asuTooltipInstallTimers[mapId]);
+      delete window._asuTooltipInstallTimers[mapId];
+      return;
+    }
+    if (window._asuTooltipInstallTimers[mapId]) return;
     window._asuTooltipInstallTimers[mapId] = window.setInterval(function() {
       if (installTooltip(mapId)) {
         window.clearInterval(window._asuTooltipInstallTimers[mapId]);
@@ -128,13 +139,10 @@ table.dataTable td {
     });
     ensureTooltip(mapId);
   });
-  // A state switch replaces the widget after its assignment message may have
-  // arrived. Attach the tooltip to the new map as soon as its layers are ready.
-  window.jQuery(document).on("shiny:value.asuTooltip", function(event) {
-    if (event.name === "initial_map" || event.name === "edit_map") {
-      window.setTimeout(function() { ensureTooltip(event.name); }, 0);
-    }
-  });
+  // Render hooks run after MapLibre replaces the old map. shiny:value runs
+  // before rendering and can still expose the previous widget instance.
+  window._asuEnsureTooltip = ensureTooltip;
+  window._asuTooltipStateHandlerInstalled = true;
 })();
 </script>
 
@@ -597,6 +605,19 @@ tract_tooltip <- function() {
     "<strong>Tract Unemployment Rate: </strong>", mapgl::number_format(mapgl::get_column("tract_ASU_urate"), style = "decimal", maximum_fraction_digits = 2), "%<br>",
     "<strong>Tract Unemployment: </strong>", mapgl::number_format(mapgl::get_column("tract_ASU_unemp"), style = "decimal", maximum_fraction_digits = 0), "<br>"
   )
+}
+
+attach_tract_tooltip <- function(map) {
+  htmlwidgets::onRender(map, "function(el) {
+    function attach() {
+      if (!window._asuEnsureTooltip) {
+        window.setTimeout(attach, 50);
+        return;
+      }
+      window._asuEnsureTooltip(el.id);
+    }
+    attach();
+  }")
 }
 
 # Keep dynamic ASU values in a small browser-side lookup used by both map
@@ -2135,7 +2156,8 @@ output$initial_map <- mapgl::renderMaplibre({
       fill_opacity = 0.25,
       fill_antialias = FALSE,
       visibility = "none"
-    )
+    ) |>
+    attach_tract_tooltip()
 }) |>
   shiny::bindCache(map_revision(), cache = "session")
 ```
@@ -2308,7 +2330,8 @@ output$edit_map <- mapgl::renderMaplibre({
       fill_color = "black",
       fill_opacity = 0.8,
       visibility = "none"
-    )
+    ) |>
+    attach_tract_tooltip()
 }) |>
   shiny::bindCache(map_revision(), cache = "session")
 

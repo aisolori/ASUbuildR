@@ -17,7 +17,8 @@ run_browser_dashboard_tests <- function() {
   names <- vapply(expressions, lhs, character(1))
   first <- which(names == "available_display_states")
   last <- which(names == "map_source")
-  helpers <- expressions[names %in% c("ASU_COLORS", "asu_palette", "calculate_tract_colors")]
+  helpers <- expressions[names %in% c("ASU_COLORS", "asu_palette", "calculate_tract_colors",
+                                    "attach_tract_tooltip")]
   renders <- expressions[names %in% c("output$initial_map", "output$edit_map")]
   stopifnot(length(first) == 1, length(last) == 1, length(renders) == 2)
   square <- function(x) sf::st_polygon(list(matrix(c(x,0,x+.01,0,x+.01,.01,x,.01,x,0),ncol=2,byrow=TRUE)))
@@ -48,6 +49,11 @@ run_browser_dashboard_tests <- function() {
     stopifnot(length(initial$x$sources)==1L,
               !grepl("FeatureCollection",output$initial_map),
               all(vapply(initial$x$layers,function(x) identical(x$source,"tracts-source"),logical(1))))
+    for (map_output in list(initial, jsonlite::fromJSON(output$edit_map, simplifyVector=FALSE))) {
+      stopifnot(length(map_output$jsHooks$render) == 1L,
+                grepl("window._asuEnsureTooltip(el.id)",
+                      map_output$jsHooks$render[[1L]]$code, fixed=TRUE))
+    }
     stopifnot("ALL" %in% available_display_states())
     first_source <- map_source()$source
     edited <- fixture; edited$asunum[1] <- 3L

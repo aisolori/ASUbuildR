@@ -32,7 +32,7 @@ class SupernodePolishTest(unittest.TestCase):
         self.assertFalse(any(v.name.startswith('polish_flow_')
                              for model in models for v in model.Proto().variables))
 
-    def test_25_stalled_bound_rounds_reset_on_improvement_even_without_new_cuts(self):
+    def test_no_progress_rounds_reset_on_bound_improvement_even_without_new_cuts(self):
         bounds = [30, 30] + [29] * 26
         cut_models, flow_models, reports = [], [], []
         real_solve = solver.cp_model.CpSolver.Solve
@@ -54,15 +54,15 @@ class SupernodePolishTest(unittest.TestCase):
             result = self.solve([10, 5, 20], [0, 0, 0], [1, -1, 2],
                                 deterministic_ties=False, log=True,
                                 incumbent_report_callback=lambda selected, value: reports.append((selected, value)))
-        self.assertEqual(len(cut_models), 28)
+        self.assertEqual(len(cut_models), 6)
         self.assertEqual(len(flow_models), 1)
         self.assertEqual((result.obj, result.status), (15, 'OPTIMAL'))
         self.assertIn(([0, 1, 2], 15), reports)
-        self.assertIn('upper_bound_stall=25/25', output.getvalue())
-        self.assertIn('stop_reason=UPPER_BOUND_STALL', output.getvalue())
+        self.assertIn('no_progress=3/3', output.getvalue())
+        self.assertIn('stop_reason=NO_PROGRESS', output.getvalue())
         self.assertIn('bound_carried_to_flow=True', output.getvalue())
 
-    def test_disconnected_or_unknown_rounds_wait_for_bound_stall(self):
+    def test_disconnected_or_unknown_rounds_handoff_after_no_progress(self):
         for unknown in (False, True):
             with self.subTest(unknown=unknown):
                 cut_models, flow_models = [], []
@@ -86,7 +86,7 @@ class SupernodePolishTest(unittest.TestCase):
                 with patch.object(solver.cp_model.CpSolver, 'Solve', new=capture):
                     result = self.solve([10, 0, 5, 20], [0, 10, 0, 0], [1, -1, -1, 2],
                                         deterministic_ties=False)
-                self.assertEqual(len(cut_models), 26)  # Baseline + 25 stalled rounds.
+                self.assertEqual(len(cut_models), 4)  # Initial bound/cuts + three stalls.
                 self.assertEqual(len(flow_models), 1)
                 self.assertEqual((result.obj, result.status), (15, 'OPTIMAL'))
                 if not unknown:
