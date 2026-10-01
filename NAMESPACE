@@ -2,6 +2,7 @@ export(launch_ASUbuildR)
 useDynLib(ASUbuildR, .registration = TRUE)
 importFrom(Rcpp, sourceCpp)
 importFrom(htmlwidgets, onRender)
+importFrom(markdown, markdownToHTML)
 
 # Core Shiny ecosystem - import everything to avoid issues
 import(shiny)
