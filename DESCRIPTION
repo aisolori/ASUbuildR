@@ -1,7 +1,7 @@
 Package: ASUbuildR
 Type: Package
 Title: A Shiny Interface for Constructing Areas of Substantial Unemployment
-Version: 0.6.42
+Version: 0.6.52
 Authors@R: c(
     person("David", "Schmidt", email = "deschmidt@detr.nv.gov", role = c("aut", "cre")),
     person("Antonio", "Solorio", email = "aisolorio@detr.nv.gov", role = c("aut", "ctb")),
@@ -28,6 +28,7 @@ Imports:
     RColorBrewer,
     mapgl,
     markdown,
+    htmlwidgets,
     rmarkdown,
     stringr,
     sf,
@@ -40,10 +41,13 @@ Imports:
     crayon,
     Rcpp,
     processx,
+    ps,
     rappdirs
 LinkingTo: Rcpp
 SystemRequirements: C++11; Pandoc (>= 1.12.3); Python (>= 3.9) with packages: ortools, numpy, pandas, networkx, openpyxl, python-igraph
 Suggests:
+  callr,
+  chromote,
   freestiler,
   knitr,
   rprojroot

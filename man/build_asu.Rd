@@ -34,19 +34,19 @@ build_asu(
   connectivity_free_time_limit = 10,
   harvest_connectivity_free_asus = FALSE,
   harvest_all_connectivity_free_components = FALSE,
+  partition_seed_strategy = "connectivity_free",
   standalone_expansion_time_limit = 30,
   use_buffer_asu_merge = FALSE,
   buffer_asu_merge_time_limit = NA_real_,
   final_asu_polish_time_limit = NA_real_,
-  max_nodes_per_asu = NA_integer_,
-  exact_nodes_per_asu = NA_integer_,
-  combine_capped_asus = TRUE,
-  combine_time_limit = NA_integer_,
   verbose = interactive(),
   parallel_asus = 1L,
   use_flow_first_search = FALSE,
   use_tract_capacity_search = FALSE,
-  use_flow_capacity_hybrid_search = FALSE
+  use_flow_capacity_hybrid_search = FALSE,
+  expansion_incumbent_stall_seconds = NA_real_,
+  final_consolidation = TRUE,
+  polish_consolidated_asus = FALSE
 )
 }
 \arguments{
@@ -57,6 +57,23 @@ build_asu(
 \item{tau}{numeric unemployment rate threshold (e.g. 0.0645)}
 
 \item{pop_thresh}{integer population threshold}
+
+\item{final_consolidation}{Merge touching partition ASUs after all search,
+preserving selected tracts (default TRUE).}
+
+\item{polish_consolidated_asus}{Optionally polish consolidated groups without
+releasing selected tracts, then consolidate new contacts (default FALSE).}
+
+\item{expansion_incumbent_stall_seconds}{Seconds without incumbent improvement
+before finishing partition repair/expansion. NA inherits the solver default;
+zero disables the limit. Does not change final polishing.}
+
+\item{partition_seed_strategy}{Seed method: \code{"connectivity_free"} (default)
+or \code{"surplus_prune"}. Surplus pruning enables full-graph partitioning,
+removes lowest-surplus tracts while preserving population, and allows splits
+only when all resulting components meet the population threshold. Each is then pruned independently toward the rate threshold. Retained components
+are repaired with pruned tracts excluded; only valid seeds enter outward
+expansion and polishing. No unrestricted fallback runs if repair yields none.}
 
 \item{max_asus}{max number of ASUs to carve}
 
@@ -134,8 +151,7 @@ replaced. Touching expanded ASUs are merged and expansion is rerun until
 stable; zero commits standalone components without initial expansion}
 
 \item{use_buffer_asu_merge}{logical; after the touching-ASU combine phase
-(independent of \code{max_nodes_per_asu}/\code{combine_capped_asus} and
-\code{harvest_connectivity_free_asus}), also group and pool ASUs that touch
+(independent of \code{harvest_connectivity_free_asus}), also group and pool ASUs that touch
 directly or share a common "buffer" ASU neighbor (at most one other ASU
 apart) -- including that buffer -- into one CP-SAT combine solve per
 group, mirroring the touching-ASU combine phase's window-expansion and
@@ -144,7 +160,7 @@ merge can create fresh touches/shared buffers}
 
 \item{buffer_asu_merge_time_limit}{optional seconds; CP-SAT time limit for
 each buffer-ASU-merge combine solve (\code{NA_real_} falls back to
-\code{combine_time_limit}, then \code{time_limit}, the default)}
+\code{time_limit}, the default)}
 
 \item{final_asu_polish_time_limit}{optional seconds for each final sequential
 CP-SAT solve over one committed ASU plus every currently unassigned tract,
@@ -158,28 +174,13 @@ available to later ASUs. New touching ASUs are merged transitively and
 the polish repeats until no new merge occurs. \code{NA_real_} uses
 \code{standalone_expansion_time_limit}, and zero disables the final polish}
 
-\item{max_nodes_per_asu}{optional integer cap on the number of tracts per
-ASU (\code{NA_integer_} disables the cap, the default). When set, ASUs are
-built up to this size, then touching capped ASUs are combined and
-re-solved (uncapped) via CP-SAT in a final improvement pass -- see
-\code{combine_capped_asus}}
 
-\item{exact_nodes_per_asu}{optional integer; when set, forces every ASU
-built during the main loop to select exactly this many tracts instead of
-at most \code{max_nodes_per_asu} (\code{NA_integer_} disables it, the default;
-takes precedence over \code{max_nodes_per_asu} when both are set). Intended
-for the legacy single-ASU-at-a-time build to test whether fixing the
-tract count speeds up the search; the combine and buffer-merge phases are
-force-disabled whenever it is set}
 
-\item{combine_capped_asus}{logical; when \code{max_nodes_per_asu} is set,
-combine touching capped ASUs and improve them via an uncapped CP-SAT
-re-solve after the main build loop finishes. Ignored if
-\code{max_nodes_per_asu} is \code{NA}}
 
-\item{combine_time_limit}{optional seconds; CP-SAT time limit used
-specifically for the uncapped combine/re-solve pass (\code{NA_integer_} uses
-\code{time_limit}, the default)}
+
+
+
+
 
 \item{verbose}{logical; print CP-SAT logs}
 
